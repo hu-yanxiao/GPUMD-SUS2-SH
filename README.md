@@ -12,6 +12,8 @@ This repository is an overlay on top of upstream GPUMD, not a full GPUMD fork. I
 - Default LUT spacing: `dr = 1.0e-4 A`, matching the LAMMPS table convention
 - Runtime LUT controls: `sus2_lut_dr=...`, `sus2_lut_span=...`, `SUS2_GPUMD_LUT_DR`, `SUS2_GPUMD_LUT_SPAN`
 - Optional memory-saving reverse-gradient workspace: `sus2_grad_float=1` or `SUS2_GPUMD_GRAD_FLOAT=1`
+- Optimized l3k3 path: automatic when `alpha_index_basic` has the standard l3k3 rank layout
+- Experimental product-graph controls: `sus2_fused_graph=...`, `sus2_local_product_graph=...`
 - Supported radial basis types:
   - `RBJacobi_sss`, `RBJacobi_sss_lmp`
   - `RBJacobi_sss_noweight`, `RBJacobi_sss_noweight_lmp`
@@ -87,6 +89,16 @@ export SUS2_GPUMD_FLOAT=1
 
 This stores SUS2 moments and reverse gradients in float, evaluates local moment arithmetic in float, and still writes GPUMD energy/force/virial outputs to the existing double arrays.
 
+To disable or probe the current safe fast paths:
+
+```text
+potential p.mtp Cu Zr sus2_float=1 sus2_l3k3_force_grad_cache=0
+potential p.mtp Cu Zr sus2_float=1 sus2_fused_graph=0
+potential p.mtp Cu Zr sus2_float=1 sus2_local_product_graph=1
+```
+
+`sus2_local_product_graph=1` is kept as an experimental model-topology path. It preserves the same product DAG and reverse-mode chain rule, but on the tested Cu-Zr l3k3 model it was slower because the local per-thread graph workspace increased register/local-memory pressure.
+
 ## Codegen Cache
 
 The topology code generator uses a persistent cache:
@@ -122,6 +134,7 @@ Chebyshev_sss load smoke: GPUMD_RC=0, LUT=65002, dr=0.0001 A
 l4k3 codegen cache miss: 158.16 s
 l4k3 codegen cache hit: 0.19 s
 l3k3 98k grad-float test: 4.357e6 -> 5.195e6 atom-step/s, GPU process memory 4124 -> 3366 MiB
+Cu-Zr l3k3 1.024M sus2_float opt pass: 1.24453e7 -> 1.69611e7 atom-step/s, GPU process memory about 9.6 GiB
 ```
 
 More detailed notes are in [docs/sus2-gpumd-v1.1-porting-notes.md](docs/sus2-gpumd-v1.1-porting-notes.md).

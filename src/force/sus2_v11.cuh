@@ -85,6 +85,12 @@ private:
   bool use_pairwise_no_atomic_force_ = false;
   bool use_l3k3_basic_fastpath_ = false;
   bool use_const_alpha_times_ = false;
+  bool use_const_scalar_moments_ = false;
+  bool use_const_float_coeffs_ = false;
+  bool use_fused_energy_backward_ = true;
+  bool use_fused_graph_ = true;
+  bool use_local_product_graph_ = false;
+  bool use_l3k3_force_grad_cache_ = true;
   bool use_float_moment_grads_ = false;
   bool use_float_moments_ = false;
 

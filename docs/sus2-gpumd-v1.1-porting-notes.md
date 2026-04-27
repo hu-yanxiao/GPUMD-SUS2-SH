@@ -938,3 +938,102 @@ sus2_float:
 ```
 
 The NEP-like float path should remain opt-in until each target model passes a first-frame energy/force/virial comparison against the default double path.
+
+## Cu-Zr l3k3 NEP-Like Optimization Pass
+
+Date: 2026-04-28
+
+Target system and reference paths:
+
+```text
+model = /work/phy-weigw/hyx/cu-zr/7.5/lmp/bench_npt2000_dt1fs_latest_iface/p.mtp
+atoms = 1,024,000
+ensemble = npt_mttk
+steps = 2000
+time_step = 1 fs
+GPUMD-SUS2 path = /work/phy-weigw/20260321_Test/GPUMD-SUS2-v1.1-work-codex
+```
+
+The optimization kept the SUS2 v1.1 mathematical expression unchanged. The accepted changes are storage/order optimizations of the same forward product DAG and reverse-mode chain rule:
+
+```text
+1. constant-memory uint16 scalar moment mapping
+2. constant-memory float shift/species/moment coefficients in sus2_float mode
+3. fused site-energy-gradient plus product-backward path
+4. l3k3 center basic-gradient cache in the force kernel
+5. l3k3 tensor-polynomial aggregation for rank 0/1/2/3 force derivatives
+```
+
+Static first-frame old/new check against the pre-pass binary:
+
+```text
+directory = /work/phy-weigw/20260321_Test/GPUMD-SUS2-v1.1-work-codex/codex_smoke/cuzr_sus2_opt1_old_new_static_20260428
+atoms = 2304
+force_mae = 3.92e-7 eV/A
+force_rmse = 5.27e-7 eV/A
+force_max = 2.58e-6 eV/A
+thermo_max = 4.05e-5
+```
+
+Short 200-step 1.024M profile after the accepted pass:
+
+```text
+directory = /work/phy-weigw/20260321_Test/GPUMD-SUS2-v1.1-work-codex/codex_bench/cuzr_sus2_opt1_profile_1m_200step_20260428
+speed = 1.67943e7 atom-step/s
+representative avg_ms:
+  neighbor = 3.72-5.86
+  zero = 2.25
+  basic = 9.95
+  product graph = 20.10
+  force = 20.48
+```
+
+Full 2000-step result:
+
+```text
+directory = /work/phy-weigw/20260321_Test/GPUMD-SUS2-v1.1-work-codex/codex_bench/cuzr_l3k3_1m_sus2_opt_final_npt2000_20260428/sus2_float
+run_seconds = 120.747
+wall_seconds = 126
+speed = 1.69611e7 atom-step/s
+GPU process memory = about 9636 MiB
+```
+
+Reference comparisons on the same Cu-Zr 1.024M setup:
+
+```text
+previous GPUMD-SUS2 sus2_float = 1.24453e7 atom-step/s
+optimized GPUMD-SUS2 sus2_float = 1.69611e7 atom-step/s
+speedup_vs_previous = 1.36x
+
+native GPUMD NEP = 1.86685e7 atom-step/s
+optimized_sus2_vs_nep = 90.9%
+
+LAMMPS single A100 SUS2 baseline = 2.10322e6 atom-step/s
+optimized_gpumd_sus2_vs_lammps = 8.06x
+```
+
+Rejected or non-default experiments from this pass:
+
+```text
+fused full product graph:
+  mathematically correct
+  speed essentially unchanged
+  kept because it reduces launch count but does not reduce global-memory traffic
+
+local per-atom product graph:
+  mathematically correct
+  zero step improved from about 2.25 ms to 0.04 ms
+  product graph worsened from about 20.1 ms to 23.9 ms
+  speed dropped to 1.6303e7 atom-step/s
+  kept only behind sus2_local_product_graph=1
+
+kBlockSize = 256:
+  mathematically correct
+  force worsened from about 20.5 ms to 23.3 ms
+  speed dropped to 1.60575e7 atom-step/s
+  reverted to kBlockSize = 128
+```
+
+Interpretation:
+
+The remaining gap to native NEP is no longer basic-moment construction. It is mainly product-DAG traffic and force contraction. A future model-specific fast path should not simply move the whole product DAG into a large per-thread local array; that spills and becomes slower. The better direction is an AOT or cached generated kernel that recognizes the concrete multiplication graph and emits a register-aware packed product/reverse plan, ideally writing only the basic gradients needed by the force kernel without exceeding register pressure.
