@@ -1037,3 +1037,101 @@ kBlockSize = 256:
 Interpretation:
 
 The remaining gap to native NEP is no longer basic-moment construction. It is mainly product-DAG traffic and force contraction. A future model-specific fast path should not simply move the whole product DAG into a large per-thread local array; that spills and becomes slower. The better direction is an AOT or cached generated kernel that recognizes the concrete multiplication graph and emits a register-aware packed product/reverse plan, ideally writing only the basic gradients needed by the force kernel without exceeding register pressure.
+
+## General Tensor Basic-Gradient Cache Up To l4k4
+
+Date: 2026-04-28
+
+The first cached-gradient implementation was hand-written for the exact `l3k3` layout:
+
+```text
+L = 3
+K = 3
+radial_funcs_count = 12
+alpha_index_basic_count = 60
+```
+
+This pass generalized the same math to standard tensor layouts up to `l4k4` without changing the SUS2 expression:
+
+```text
+L <= 4
+K <= 4
+radial_funcs_count = K * (L + 1)
+basic_per_group = C(L + 3, 3)
+alpha_index_basic_count = K * basic_per_group
+```
+
+The detector verifies that `alpha_index_basic` is ordered by group, then rank, then Cartesian exponents:
+
+```text
+for group = 0..K-1:
+  for rank = 0..L:
+    mu = group * (L + 1) + rank
+    for a = rank..0:
+      for b = rank-a..0:
+        c = rank-a-b
+        alpha_index_basic includes (mu, a, b, c)
+```
+
+The mathematical contraction remains:
+
+```text
+B_{i,p} = sum_j phi_p(r_ij)
+g_{i,p} = dE_i / dB_{i,p}
+dE_i/dr_ij = sum_p g_{i,p} * d phi_p(r_ij)/dr_ij
+```
+
+The optimization is only that `g_{i,p}` is loaded once per center atom and reused across all neighbors. Exact `l3k3` still uses the earlier hand-aggregated rank-0/1/2/3 implementation. Other standard tensor layouts, including `l2k3`, `l4k3`, and `l4k4`, use the generic cached tensor derivative path.
+
+Runtime controls:
+
+```text
+sus2_tensor_force_grad_cache=0/1
+SUS2_GPUMD_TENSOR_FORCE_GRAD_CACHE=0/1
+```
+
+The old `sus2_l3k3_force_grad_cache` and `SUS2_GPUMD_L3K3_FORCE_GRAD_CACHE` names remain accepted aliases.
+
+Correctness checks used the same binary with tensor cache on/off:
+
+```text
+directory = /work/phy-weigw/20260321_Test/GPUMD-SUS2-v1.1-work-codex/codex_smoke/tensor_l4k4_cache_parity_20260428
+
+l3k3 Cu-Zr:
+  force_mae = 3.9344e-7 eV/A
+  force_rmse = 5.2721e-7 eV/A
+  force_max = 2.5928e-6 eV/A
+  thermo_max = 4.1244e-5
+
+l4k3 MA/Laguerre:
+  force_mae = 7.4612e-7 eV/A
+  force_rmse = 1.3103e-6 eV/A
+  force_max = 9.9093e-6 eV/A
+  thermo_max = 6.4100e-5
+
+l4k4 drug/Chebyshev:
+  force_mae = 8.0854e-7 eV/A
+  force_rmse = 1.2315e-6 eV/A
+  force_max = 5.7220e-6 eV/A
+  thermo_max = 5.0864e-7
+```
+
+Performance check on a 98,304-atom `l4k3` MA/Laguerre case, 100 NPT steps:
+
+```text
+directory = /work/phy-weigw/20260321_Test/GPUMD-SUS2-v1.1-work-codex/codex_bench/tensor_l4k3_98k_cache_profile_20260428
+
+cache off:
+  speed = 1.50229e6 atom-step/s
+  force ~= 18.8 ms
+
+cache on:
+  speed = 1.75504e6 atom-step/s
+  force ~= 9.1 ms
+
+speedup = 1.17x
+```
+
+Interpretation:
+
+The generic path gives non-`l3k3` tensor models the same center-gradient reuse benefit while preserving the exact formula. The current generic `l4` implementation is intentionally conservative; future model-specific code generation can specialize the rank-4 polynomial contraction more aggressively, but this pass establishes the correct and guarded general path up to the current expected maximum `l4k4`.

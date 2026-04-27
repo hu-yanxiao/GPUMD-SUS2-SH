@@ -28,6 +28,9 @@ constexpr int kSus2MaxConstAlphaTimes = 6000;
 constexpr int kSus2MaxConstScalarMoments = 2048;
 constexpr int kSus2MaxConstSpecies = 128;
 constexpr int kSus2LocalGraphMaxMoments = 640;
+constexpr int kSus2MaxTensorRank = 4;
+constexpr int kSus2MaxTensorGroups = 4;
+constexpr int kSus2MaxTensorBasic = 140;
 constexpr double kLaguerreMinRho = 1.0e-8;
 constexpr double kLaguerrePositiveParamFloor = 1.0e-6;
 
@@ -106,11 +109,21 @@ struct SUS2DeviceModel {
   const int* alpha_moment_mapping;
   const float* lut_vals;
   const float* lut_ders;
-  bool use_l3k3_basic_fastpath;
+  bool use_tensor_basic_fastpath;
+  int tensor_l;
+  int tensor_k;
+  int tensor_basic_per_group;
   bool use_const_alpha_times;
   bool use_const_scalar_moments;
   bool use_const_float_coeffs;
   bool use_float_model_params;
+};
+
+struct TensorBasicLayout {
+  bool enabled = false;
+  int l = 0;
+  int k = 0;
+  int basic_per_group = 0;
 };
 
 [[noreturn]] void sus2_input_error(const std::string& message)
@@ -617,30 +630,50 @@ void compress_active_moment_dag(SUS2HostModel& model)
   model.alpha_moments_count = active_count;
 }
 
-bool has_l3k3_alpha_basic_layout(const SUS2HostModel& model)
+int tensor_basic_count_per_group(int l)
 {
-  if (model.radial_funcs_count != 12 || model.alpha_basic_count != 60 || model.max_rank != 3) {
-    return false;
+  return (l + 1) * (l + 2) * (l + 3) / 6;
+}
+
+TensorBasicLayout detect_tensor_alpha_basic_layout(const SUS2HostModel& model)
+{
+  TensorBasicLayout layout;
+  const int l = model.max_rank;
+  if (l < 0 || l > kSus2MaxTensorRank || model.radial_funcs_count % (l + 1) != 0) {
+    return layout;
+  }
+
+  const int k = model.radial_funcs_count / (l + 1);
+  const int basic_per_group = tensor_basic_count_per_group(l);
+  if (k <= 0 || k > kSus2MaxTensorGroups ||
+      model.alpha_basic_count != k * basic_per_group) {
+    return layout;
   }
 
   int basic = 0;
-  for (int group = 0; group < 3; ++group) {
-    for (int rank = 0; rank <= 3; ++rank) {
-      const int mu = group * 4 + rank;
+  for (int group = 0; group < k; ++group) {
+    for (int rank = 0; rank <= l; ++rank) {
+      const int mu = group * (l + 1) + rank;
       for (int a = rank; a >= 0; --a) {
         for (int b = rank - a; b >= 0; --b) {
           const int c = rank - a - b;
           const int offset = basic * 4;
           if (model.alpha_basic[offset + 0] != mu || model.alpha_basic[offset + 1] != a ||
               model.alpha_basic[offset + 2] != b || model.alpha_basic[offset + 3] != c) {
-            return false;
+            return layout;
           }
           ++basic;
         }
       }
     }
   }
-  return basic == model.alpha_basic_count;
+  if (basic == model.alpha_basic_count) {
+    layout.enabled = true;
+    layout.l = l;
+    layout.k = k;
+    layout.basic_per_group = basic_per_group;
+  }
+  return layout;
 }
 
 bool can_pack_alpha_times_u16(const SUS2HostModel& model)
@@ -983,21 +1016,27 @@ bool parse_fused_energy_backward(
   return use_fused;
 }
 
-bool parse_l3k3_force_grad_cache(
+bool parse_tensor_force_grad_cache(
   const SUS2HostModel& model,
   int num_potential_options,
   const char** potential_options)
 {
   bool use_cache = true;
-  const char* env = std::getenv("SUS2_GPUMD_L3K3_FORCE_GRAD_CACHE");
+  const char* env = std::getenv("SUS2_GPUMD_TENSOR_FORCE_GRAD_CACHE");
   if (env != nullptr) {
-    use_cache = parse_bool_value(env, "SUS2_GPUMD_L3K3_FORCE_GRAD_CACHE");
+    use_cache = parse_bool_value(env, "SUS2_GPUMD_TENSOR_FORCE_GRAD_CACHE");
+  }
+  const char* old_env = std::getenv("SUS2_GPUMD_L3K3_FORCE_GRAD_CACHE");
+  if (old_env != nullptr) {
+    use_cache = parse_bool_value(old_env, "SUS2_GPUMD_L3K3_FORCE_GRAD_CACHE");
   }
 
   const int option_begin = std::min(num_potential_options, model.species_count);
   for (int i = option_begin; i < num_potential_options; ++i) {
     const std::string option = potential_options[i] == nullptr ? "" : potential_options[i];
-    if (starts_with(option, "sus2_l3k3_force_grad_cache=") ||
+    if (starts_with(option, "sus2_tensor_force_grad_cache=") ||
+        starts_with(option, "tensor_force_grad_cache=") ||
+        starts_with(option, "sus2_l3k3_force_grad_cache=") ||
         starts_with(option, "l3k3_force_grad_cache=")) {
       const size_t eq = option.find('=');
       use_cache = parse_bool_value(option.substr(eq + 1), option.substr(0, eq));
@@ -1532,6 +1571,91 @@ __device__ __forceinline__ void compute_sus2_edge_derivative_l3k3_cached(
   }
 }
 
+template <typename RealT, int MaxBasic>
+__device__ __forceinline__ void compute_sus2_edge_derivative_tensor_cached(
+  const SUS2DeviceModel& model,
+  int center_type,
+  int neighbor_type,
+  RealT dx,
+  RealT dy,
+  RealT dz,
+  RealT r,
+  const RealT* basic_grads,
+  RealT& dEx,
+  RealT& dEy,
+  RealT& dEz)
+{
+  if (model.alpha_basic_count > MaxBasic) {
+    dEx = static_cast<RealT>(0.0);
+    dEy = static_cast<RealT>(0.0);
+    dEz = static_cast<RealT>(0.0);
+    return;
+  }
+
+  const int pair = center_type * model.species_count + neighbor_type;
+
+  RealT mu_val[32];
+  RealT mu_der[32];
+  interp_radial_vals_ders(model, pair, r, mu_val, mu_der);
+
+  RealT x_pow[kSus2MaxTensorRank + 1];
+  RealT y_pow[kSus2MaxTensorRank + 1];
+  RealT z_pow[kSus2MaxTensorRank + 1];
+  RealT inv_r_pow[kSus2MaxTensorRank + 1];
+  x_pow[0] = static_cast<RealT>(1.0);
+  y_pow[0] = static_cast<RealT>(1.0);
+  z_pow[0] = static_cast<RealT>(1.0);
+  inv_r_pow[0] = static_cast<RealT>(1.0);
+  const RealT inv_r = static_cast<RealT>(1.0) / r;
+  for (int rank = 1; rank <= model.tensor_l; ++rank) {
+    x_pow[rank] = x_pow[rank - 1] * dx;
+    y_pow[rank] = y_pow[rank - 1] * dy;
+    z_pow[rank] = z_pow[rank - 1] * dz;
+    inv_r_pow[rank] = inv_r_pow[rank - 1] * inv_r;
+  }
+
+  dEx = static_cast<RealT>(0.0);
+  dEy = static_cast<RealT>(0.0);
+  dEz = static_cast<RealT>(0.0);
+
+  for (int group = 0; group < model.tensor_k; ++group) {
+    int basic = group * model.tensor_basic_per_group;
+    const int mu_base = group * (model.tensor_l + 1);
+    for (int rank = 0; rank <= model.tensor_l; ++rank) {
+      const int mu = mu_base + rank;
+      const RealT inv_dist_pow = mu_val[mu] * inv_r_pow[rank];
+      const RealT radial_der_over_r =
+        (mu_der[mu] * inv_r_pow[rank] -
+         static_cast<RealT>(rank) * inv_dist_pow * inv_r) *
+        inv_r;
+
+      for (int a = rank; a >= 0; --a) {
+        for (int b = rank - a; b >= 0; --b) {
+          const int c = rank - a - b;
+          const RealT geom = x_pow[a] * y_pow[b] * z_pow[c];
+          RealT jac_x = geom * radial_der_over_r * dx;
+          RealT jac_y = geom * radial_der_over_r * dy;
+          RealT jac_z = geom * radial_der_over_r * dz;
+          if (a != 0) {
+            jac_x += inv_dist_pow * static_cast<RealT>(a) * x_pow[a - 1] * y_pow[b] * z_pow[c];
+          }
+          if (b != 0) {
+            jac_y += inv_dist_pow * static_cast<RealT>(b) * x_pow[a] * y_pow[b - 1] * z_pow[c];
+          }
+          if (c != 0) {
+            jac_z += inv_dist_pow * static_cast<RealT>(c) * x_pow[a] * y_pow[b] * z_pow[c - 1];
+          }
+          const RealT basic_grad = basic_grads[basic];
+          dEx += basic_grad * jac_x;
+          dEy += basic_grad * jac_y;
+          dEz += basic_grad * jac_z;
+          ++basic;
+        }
+      }
+    }
+  }
+}
+
 template <typename GradT, typename RealT>
 __device__ __forceinline__ void compute_sus2_edge_derivative(
   int N,
@@ -1548,7 +1672,7 @@ __device__ __forceinline__ void compute_sus2_edge_derivative(
   RealT& dEy,
   RealT& dEz)
 {
-  if (model.use_l3k3_basic_fastpath) {
+  if (model.use_tensor_basic_fastpath && model.tensor_l == 3 && model.tensor_k == 3) {
     compute_sus2_edge_derivative_l3k3<GradT, RealT>(
       N, model, center_atom, center_type, neighbor_type, dx, dy, dz, r, grads, dEx, dEy, dEz);
     return;
@@ -1652,7 +1776,7 @@ static __global__ void gpu_compute_basic_moments(
     const int type_j = type[j];
     const int pair = type_i * model.species_count + type_j;
 
-    if (model.use_l3k3_basic_fastpath) {
+    if (model.use_tensor_basic_fastpath && model.tensor_l == 3 && model.tensor_k == 3) {
       add_l3k3_basic_moments(N, model, i, pair, dx, dy, dz, r, moments);
       continue;
     }
@@ -1781,6 +1905,92 @@ static __global__ void gpu_compute_basic_moments_l3k3_accum(
 
 #pragma unroll
   for (int basic = 0; basic < 60; ++basic) {
+    moments[static_cast<size_t>(basic) * N + i] = acc[basic];
+  }
+}
+
+template <typename RealT, int MaxBasic>
+static __global__ void gpu_compute_basic_moments_tensor_accum(
+  int N,
+  Box box,
+  double cutoff_square,
+  bool use_cached_displacements,
+  SUS2DeviceModel model,
+  const int* type,
+  const int* neighbor_count,
+  const int* neighbor_atoms,
+  const double* neighbor_dx,
+  const double* neighbor_dy,
+  const double* neighbor_dz,
+  const double* x,
+  const double* y,
+  const double* z,
+  RealT* moments)
+{
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= N || model.alpha_basic_count > MaxBasic) {
+    return;
+  }
+
+  RealT acc[MaxBasic];
+  for (int basic = 0; basic < MaxBasic; ++basic) {
+    acc[basic] = static_cast<RealT>(0.0);
+  }
+
+  const int type_i = type[i];
+  const int count = neighbor_count[i];
+
+  for (int nbr = 0; nbr < count; ++nbr) {
+    const size_t edge = static_cast<size_t>(nbr) * N + i;
+    const int j = neighbor_atoms[edge];
+    RealT dx;
+    RealT dy;
+    RealT dz;
+    load_sus2_edge_displacement(
+      use_cached_displacements, N, box, edge, i, j, neighbor_dx, neighbor_dy, neighbor_dz, x, y, z, dx, dy, dz);
+    const RealT r2 = dx * dx + dy * dy + dz * dz;
+    if (r2 >= static_cast<RealT>(cutoff_square)) {
+      continue;
+    }
+    const RealT r = sqrt(r2);
+    const int pair = type_i * model.species_count + type[j];
+
+    RealT mu_val[32];
+    interp_radial_vals_ders(model, pair, r, mu_val, static_cast<RealT*>(nullptr));
+
+    RealT x_pow[kSus2MaxTensorRank + 1];
+    RealT y_pow[kSus2MaxTensorRank + 1];
+    RealT z_pow[kSus2MaxTensorRank + 1];
+    RealT inv_r_pow[kSus2MaxTensorRank + 1];
+    x_pow[0] = static_cast<RealT>(1.0);
+    y_pow[0] = static_cast<RealT>(1.0);
+    z_pow[0] = static_cast<RealT>(1.0);
+    inv_r_pow[0] = static_cast<RealT>(1.0);
+    const RealT inv_r = static_cast<RealT>(1.0) / r;
+    for (int rank = 1; rank <= model.tensor_l; ++rank) {
+      x_pow[rank] = x_pow[rank - 1] * dx;
+      y_pow[rank] = y_pow[rank - 1] * dy;
+      z_pow[rank] = z_pow[rank - 1] * dz;
+      inv_r_pow[rank] = inv_r_pow[rank - 1] * inv_r;
+    }
+
+    for (int group = 0; group < model.tensor_k; ++group) {
+      int basic = group * model.tensor_basic_per_group;
+      const int mu_base = group * (model.tensor_l + 1);
+      for (int rank = 0; rank <= model.tensor_l; ++rank) {
+        const RealT radial = mu_val[mu_base + rank] * inv_r_pow[rank];
+        for (int a = rank; a >= 0; --a) {
+          for (int b = rank - a; b >= 0; --b) {
+            const int c = rank - a - b;
+            acc[basic] += radial * x_pow[a] * y_pow[b] * z_pow[c];
+            ++basic;
+          }
+        }
+      }
+    }
+  }
+
+  for (int basic = 0; basic < model.alpha_basic_count; ++basic) {
     moments[static_cast<size_t>(basic) * N + i] = acc[basic];
   }
 }
@@ -2365,6 +2575,109 @@ static __global__ void gpu_compute_forces_l3k3_cached_grads(
   virial_tmp[i + 8 * N] += static_cast<float>(s_zy);
 }
 
+template <typename GradT, typename RealT, int MaxBasic>
+static __global__ void gpu_compute_forces_tensor_cached_grads(
+  int N,
+  Box box,
+  double cutoff_square,
+  bool use_cached_displacements,
+  SUS2DeviceModel model,
+  const int* type,
+  const int* neighbor_count,
+  const int* neighbor_atoms,
+  const double* neighbor_dx,
+  const double* neighbor_dy,
+  const double* neighbor_dz,
+  const double* x,
+  const double* y,
+  const double* z,
+  const GradT* grads,
+  float* force_tmp,
+  float* virial_tmp)
+{
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= N || model.alpha_basic_count > MaxBasic) {
+    return;
+  }
+
+  const int type_i = type[i];
+  const RealT center_coeff = sus2_species_coeff<RealT>(model, type_i);
+  RealT basic_grads[MaxBasic];
+  for (int basic = 0; basic < model.alpha_basic_count; ++basic) {
+    basic_grads[basic] =
+      static_cast<RealT>(load_sus2_grad(grads, N, basic, i)) * center_coeff;
+  }
+
+  const int count = neighbor_count[i];
+
+  RealT fx_self = static_cast<RealT>(0.0);
+  RealT fy_self = static_cast<RealT>(0.0);
+  RealT fz_self = static_cast<RealT>(0.0);
+  RealT s_xx = static_cast<RealT>(0.0);
+  RealT s_yy = static_cast<RealT>(0.0);
+  RealT s_zz = static_cast<RealT>(0.0);
+  RealT s_xy = static_cast<RealT>(0.0);
+  RealT s_xz = static_cast<RealT>(0.0);
+  RealT s_yz = static_cast<RealT>(0.0);
+  RealT s_yx = static_cast<RealT>(0.0);
+  RealT s_zx = static_cast<RealT>(0.0);
+  RealT s_zy = static_cast<RealT>(0.0);
+
+  for (int nbr = 0; nbr < count; ++nbr) {
+    const size_t edge = static_cast<size_t>(nbr) * N + i;
+    const int j = neighbor_atoms[edge];
+    RealT dx;
+    RealT dy;
+    RealT dz;
+    load_sus2_edge_displacement(
+      use_cached_displacements, N, box, edge, i, j, neighbor_dx, neighbor_dy, neighbor_dz, x, y, z, dx, dy, dz);
+    const RealT r2 = dx * dx + dy * dy + dz * dz;
+    if (r2 >= static_cast<RealT>(cutoff_square)) {
+      continue;
+    }
+    const RealT r = sqrt(r2);
+    const int type_j = type[j];
+
+    RealT dEx = static_cast<RealT>(0.0);
+    RealT dEy = static_cast<RealT>(0.0);
+    RealT dEz = static_cast<RealT>(0.0);
+    compute_sus2_edge_derivative_tensor_cached<RealT, MaxBasic>(
+      model, type_i, type_j, dx, dy, dz, r, basic_grads, dEx, dEy, dEz);
+
+    fx_self += dEx;
+    fy_self += dEy;
+    fz_self += dEz;
+
+    atomicAdd(force_tmp + j, static_cast<float>(-dEx));
+    atomicAdd(force_tmp + j + N, static_cast<float>(-dEy));
+    atomicAdd(force_tmp + j + 2 * N, static_cast<float>(-dEz));
+
+    s_xx -= dEx * dx;
+    s_yy -= dEy * dy;
+    s_zz -= dEz * dz;
+    s_xy -= dEx * dy;
+    s_xz -= dEx * dz;
+    s_yz -= dEy * dz;
+    s_yx -= dEy * dx;
+    s_zx -= dEz * dx;
+    s_zy -= dEz * dy;
+  }
+
+  atomicAdd(force_tmp + i, static_cast<float>(fx_self));
+  atomicAdd(force_tmp + i + N, static_cast<float>(fy_self));
+  atomicAdd(force_tmp + i + 2 * N, static_cast<float>(fz_self));
+
+  virial_tmp[i + 0 * N] += static_cast<float>(s_xx);
+  virial_tmp[i + 1 * N] += static_cast<float>(s_yy);
+  virial_tmp[i + 2 * N] += static_cast<float>(s_zz);
+  virial_tmp[i + 3 * N] += static_cast<float>(s_xy);
+  virial_tmp[i + 4 * N] += static_cast<float>(s_xz);
+  virial_tmp[i + 5 * N] += static_cast<float>(s_yz);
+  virial_tmp[i + 6 * N] += static_cast<float>(s_yx);
+  virial_tmp[i + 7 * N] += static_cast<float>(s_zx);
+  virial_tmp[i + 8 * N] += static_cast<float>(s_zy);
+}
+
 template <typename GradT, typename RealT>
 static __global__ void gpu_compute_forces_pairwise_no_atomic(
   int N,
@@ -2496,7 +2809,11 @@ SUS2_V11::SUS2_V11(
   alpha_scalar_moments_ = host_model.alpha_scalar_moments;
   max_rank_ = host_model.max_rank;
   rc = host_model.max_dist;
-  use_l3k3_basic_fastpath_ = has_l3k3_alpha_basic_layout(host_model);
+  const TensorBasicLayout tensor_layout = detect_tensor_alpha_basic_layout(host_model);
+  use_tensor_basic_fastpath_ = tensor_layout.enabled;
+  tensor_l_ = tensor_layout.l;
+  tensor_k_ = tensor_layout.k;
+  tensor_basic_per_group_ = tensor_layout.basic_per_group;
   use_const_alpha_times_ = can_pack_alpha_times_u16(host_model);
   use_const_scalar_moments_ = can_pack_scalar_moments_u16(host_model);
 
@@ -2521,8 +2838,8 @@ SUS2_V11::SUS2_V11(
   use_fused_graph_ = parse_fused_graph(host_model, num_potential_options, potential_options);
   use_local_product_graph_ =
     parse_local_product_graph(host_model, num_potential_options, potential_options);
-  use_l3k3_force_grad_cache_ =
-    parse_l3k3_force_grad_cache(host_model, num_potential_options, potential_options);
+  use_tensor_force_grad_cache_ =
+    parse_tensor_force_grad_cache(host_model, num_potential_options, potential_options);
   use_local_product_graph_ = use_local_product_graph_ && use_float_moments_ &&
                              alpha_moments_count_ <= kSus2LocalGraphMaxMoments;
   use_const_float_coeffs_ = use_float_moments_ &&
@@ -2636,8 +2953,11 @@ SUS2_V11::SUS2_V11(
   if (use_pairwise_no_atomic_force_) {
     printf("SUS2 v1.1 GPUMD force mode: pairwise no-atomic for large-box neighbor lists.\n");
   }
-  if (use_l3k3_basic_fastpath_) {
-    printf("SUS2 v1.1 GPUMD basic/force fast path: l3k3 alpha_index_basic layout.\n");
+  if (use_tensor_basic_fastpath_) {
+    printf(
+      "SUS2 v1.1 GPUMD basic/force fast path: tensor l%dk%d alpha_index_basic layout.\n",
+      tensor_l_,
+      tensor_k_);
   }
   if (use_const_alpha_times_) {
     printf("SUS2 v1.1 GPUMD product-rule table: constant-memory uint16 alpha_index_times.\n");
@@ -2658,8 +2978,8 @@ SUS2_V11::SUS2_V11(
     printf(
       "SUS2 v1.1 GPUMD product graph path: local per-atom graph workspace, write basic gradients only.\n");
   }
-  if (use_l3k3_basic_fastpath_ && use_l3k3_force_grad_cache_) {
-    printf("SUS2 v1.1 GPUMD force path: cached l3k3 center basic gradients.\n");
+  if (use_tensor_basic_fastpath_ && use_tensor_force_grad_cache_) {
+    printf("SUS2 v1.1 GPUMD force path: cached tensor center basic gradients.\n");
   }
   printf(
     "SUS2 v1.1 GPUMD precision mode: %s.\n",
@@ -2890,7 +3210,7 @@ void SUS2_V11::compute(
 
   profile_t = profile_start();
   if (use_local_product_graph) {
-    if (!use_l3k3_basic_fastpath_) {
+    if (!use_tensor_basic_fastpath_) {
       CHECK(gpuMemset(moment_vals_float_.data(), 0, basic_moment_size * sizeof(float)));
     }
   } else {
@@ -2933,14 +3253,19 @@ void SUS2_V11::compute(
     alpha_moment_mapping_.data(),
     lut_vals_.data(),
     lut_ders_.data(),
-    use_l3k3_basic_fastpath_,
+    use_tensor_basic_fastpath_,
+    tensor_l_,
+    tensor_k_,
+    tensor_basic_per_group_,
     use_const_alpha_times_,
     use_const_scalar_moments_,
     use_const_float_coeffs_,
     use_float_moments_};
 
   profile_t = profile_start();
-  if (use_l3k3_basic_fastpath_) {
+  const bool use_exact_l3k3_tensor = use_tensor_basic_fastpath_ && tensor_l_ == 3 && tensor_k_ == 3;
+
+  if (use_exact_l3k3_tensor) {
     if (use_float_moments_) {
       gpu_compute_basic_moments_l3k3_accum<float><<<grid_size, kBlockSize>>>(
         num_atoms,
@@ -2975,6 +3300,48 @@ void SUS2_V11::compute(
         position.data() + num_atoms,
         position.data() + 2 * num_atoms,
         moment_vals_.data());
+    }
+  } else if (use_tensor_basic_fastpath_) {
+    if (use_float_moments_) {
+      if (alpha_basic_count_ <= 40) {
+        gpu_compute_basic_moments_tensor_accum<float, 40><<<grid_size, kBlockSize>>>(
+          num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(),
+          neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(),
+          neighbor_dz_.data(), position.data(), position.data() + num_atoms,
+          position.data() + 2 * num_atoms, moment_vals_float_.data());
+      } else if (alpha_basic_count_ <= 80) {
+        gpu_compute_basic_moments_tensor_accum<float, 80><<<grid_size, kBlockSize>>>(
+          num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(),
+          neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(),
+          neighbor_dz_.data(), position.data(), position.data() + num_atoms,
+          position.data() + 2 * num_atoms, moment_vals_float_.data());
+      } else {
+        gpu_compute_basic_moments_tensor_accum<float, kSus2MaxTensorBasic><<<grid_size, kBlockSize>>>(
+          num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(),
+          neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(),
+          neighbor_dz_.data(), position.data(), position.data() + num_atoms,
+          position.data() + 2 * num_atoms, moment_vals_float_.data());
+      }
+    } else {
+      if (alpha_basic_count_ <= 40) {
+        gpu_compute_basic_moments_tensor_accum<double, 40><<<grid_size, kBlockSize>>>(
+          num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(),
+          neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(),
+          neighbor_dz_.data(), position.data(), position.data() + num_atoms,
+          position.data() + 2 * num_atoms, moment_vals_.data());
+      } else if (alpha_basic_count_ <= 80) {
+        gpu_compute_basic_moments_tensor_accum<double, 80><<<grid_size, kBlockSize>>>(
+          num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(),
+          neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(),
+          neighbor_dz_.data(), position.data(), position.data() + num_atoms,
+          position.data() + 2 * num_atoms, moment_vals_.data());
+      } else {
+        gpu_compute_basic_moments_tensor_accum<double, kSus2MaxTensorBasic><<<grid_size, kBlockSize>>>(
+          num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(),
+          neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(),
+          neighbor_dz_.data(), position.data(), position.data() + num_atoms,
+          position.data() + 2 * num_atoms, moment_vals_.data());
+      }
     }
   } else {
     if (use_float_moments_) {
@@ -3151,28 +3518,40 @@ void SUS2_V11::compute(
     }
   }
 
+#define SUS2_LAUNCH_TENSOR_CACHED_FORCE(GRAD_T, REAL_T, GRADS_PTR) \
+  do { \
+    if (use_exact_l3k3_tensor) { \
+      gpu_compute_forces_l3k3_cached_grads<GRAD_T, REAL_T><<<grid_size, kBlockSize>>>( \
+        num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(), \
+        neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(), \
+        neighbor_dz_.data(), position.data(), position.data() + num_atoms, \
+        position.data() + 2 * num_atoms, GRADS_PTR, force_tmp_.data(), virial_tmp_.data()); \
+    } else if (alpha_basic_count_ <= 40) { \
+      gpu_compute_forces_tensor_cached_grads<GRAD_T, REAL_T, 40><<<grid_size, kBlockSize>>>( \
+        num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(), \
+        neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(), \
+        neighbor_dz_.data(), position.data(), position.data() + num_atoms, \
+        position.data() + 2 * num_atoms, GRADS_PTR, force_tmp_.data(), virial_tmp_.data()); \
+    } else if (alpha_basic_count_ <= 80) { \
+      gpu_compute_forces_tensor_cached_grads<GRAD_T, REAL_T, 80><<<grid_size, kBlockSize>>>( \
+        num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(), \
+        neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(), \
+        neighbor_dz_.data(), position.data(), position.data() + num_atoms, \
+        position.data() + 2 * num_atoms, GRADS_PTR, force_tmp_.data(), virial_tmp_.data()); \
+    } else { \
+      gpu_compute_forces_tensor_cached_grads<GRAD_T, REAL_T, kSus2MaxTensorBasic><<<grid_size, kBlockSize>>>( \
+        num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(), \
+        neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(), \
+        neighbor_dz_.data(), position.data(), position.data() + num_atoms, \
+        position.data() + 2 * num_atoms, GRADS_PTR, force_tmp_.data(), virial_tmp_.data()); \
+    } \
+  } while (0)
+
   profile_t = profile_start();
   if (!use_pairwise_no_atomic_force) {
     if (use_float_moments_) {
-      if (use_l3k3_basic_fastpath_ && use_l3k3_force_grad_cache_) {
-        gpu_compute_forces_l3k3_cached_grads<float, float><<<grid_size, kBlockSize>>>(
-          num_atoms,
-          box,
-          rc * rc,
-          use_cached_neighbor_displacements_,
-          model,
-          type.data(),
-          neighbor_count_.data(),
-          neighbor_atom_.data(),
-          neighbor_dx_.data(),
-          neighbor_dy_.data(),
-          neighbor_dz_.data(),
-          position.data(),
-          position.data() + num_atoms,
-          position.data() + 2 * num_atoms,
-          moment_grads_float_.data(),
-          force_tmp_.data(),
-          virial_tmp_.data());
+      if (use_tensor_basic_fastpath_ && use_tensor_force_grad_cache_) {
+        SUS2_LAUNCH_TENSOR_CACHED_FORCE(float, float, moment_grads_float_.data());
       } else {
         gpu_compute_forces<float, float><<<grid_size, kBlockSize>>>(
           num_atoms,
@@ -3189,30 +3568,13 @@ void SUS2_V11::compute(
           position.data(),
           position.data() + num_atoms,
           position.data() + 2 * num_atoms,
-          moment_grads_float_.data(),
-          force_tmp_.data(),
-          virial_tmp_.data());
+        moment_grads_float_.data(),
+        force_tmp_.data(),
+        virial_tmp_.data());
       }
     } else if (use_float_moment_grads_) {
-      if (use_l3k3_basic_fastpath_ && use_l3k3_force_grad_cache_) {
-        gpu_compute_forces_l3k3_cached_grads<float, double><<<grid_size, kBlockSize>>>(
-          num_atoms,
-          box,
-          rc * rc,
-          use_cached_neighbor_displacements_,
-          model,
-          type.data(),
-          neighbor_count_.data(),
-          neighbor_atom_.data(),
-          neighbor_dx_.data(),
-          neighbor_dy_.data(),
-          neighbor_dz_.data(),
-          position.data(),
-          position.data() + num_atoms,
-          position.data() + 2 * num_atoms,
-          moment_grads_float_.data(),
-          force_tmp_.data(),
-          virial_tmp_.data());
+      if (use_tensor_basic_fastpath_ && use_tensor_force_grad_cache_) {
+        SUS2_LAUNCH_TENSOR_CACHED_FORCE(float, double, moment_grads_float_.data());
       } else {
         gpu_compute_forces<float, double><<<grid_size, kBlockSize>>>(
           num_atoms,
@@ -3231,28 +3593,11 @@ void SUS2_V11::compute(
           position.data() + 2 * num_atoms,
           moment_grads_float_.data(),
           force_tmp_.data(),
-          virial_tmp_.data());
+        virial_tmp_.data());
       }
     } else {
-      if (use_l3k3_basic_fastpath_ && use_l3k3_force_grad_cache_) {
-        gpu_compute_forces_l3k3_cached_grads<double, double><<<grid_size, kBlockSize>>>(
-          num_atoms,
-          box,
-          rc * rc,
-          use_cached_neighbor_displacements_,
-          model,
-          type.data(),
-          neighbor_count_.data(),
-          neighbor_atom_.data(),
-          neighbor_dx_.data(),
-          neighbor_dy_.data(),
-          neighbor_dz_.data(),
-          position.data(),
-          position.data() + num_atoms,
-          position.data() + 2 * num_atoms,
-          moment_grads_.data(),
-          force_tmp_.data(),
-          virial_tmp_.data());
+      if (use_tensor_basic_fastpath_ && use_tensor_force_grad_cache_) {
+        SUS2_LAUNCH_TENSOR_CACHED_FORCE(double, double, moment_grads_.data());
       } else {
         gpu_compute_forces<double, double><<<grid_size, kBlockSize>>>(
           num_atoms,
@@ -3324,6 +3669,7 @@ void SUS2_V11::compute(
     }
     GPU_CHECK_KERNEL
   }
+#undef SUS2_LAUNCH_TENSOR_CACHED_FORCE
   profile_stop(profile_force, profile_t);
 
   profile_t = profile_start();

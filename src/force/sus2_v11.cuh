@@ -56,6 +56,9 @@ private:
   int alpha_moments_count_ = 0;
   int alpha_scalar_moments_ = 0;
   int max_rank_ = 0;
+  int tensor_l_ = 0;
+  int tensor_k_ = 0;
+  int tensor_basic_per_group_ = 0;
   int lut_size_ = 0;
   int neighbor_capacity_ = 512;
   double lut_inv_dr_ = 0.0;
@@ -83,14 +86,14 @@ private:
   Neighbor neighbor_cache_;
   bool use_cached_neighbor_displacements_ = false;
   bool use_pairwise_no_atomic_force_ = false;
-  bool use_l3k3_basic_fastpath_ = false;
+  bool use_tensor_basic_fastpath_ = false;
   bool use_const_alpha_times_ = false;
   bool use_const_scalar_moments_ = false;
   bool use_const_float_coeffs_ = false;
   bool use_fused_energy_backward_ = true;
   bool use_fused_graph_ = true;
   bool use_local_product_graph_ = false;
-  bool use_l3k3_force_grad_cache_ = true;
+  bool use_tensor_force_grad_cache_ = true;
   bool use_float_moment_grads_ = false;
   bool use_float_moments_ = false;
 
