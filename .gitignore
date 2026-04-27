@@ -1,0 +1,25 @@
+# Build products
+*.o
+*.a
+*.so
+*.dylib
+src/gpumd
+
+# Codegen products and cache
+codegen_cache/
+codex_codegen/
+
+# Runtime outputs
+movie.xyz
+thermo.out
+restart.out
+dump*.xyz
+*.log
+*.out
+*.err
+
+# Local editor/system files
+.DS_Store
+.vscode/
+.idea/
+

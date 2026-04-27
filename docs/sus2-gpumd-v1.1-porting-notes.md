@@ -1,0 +1,783 @@
+# SUS2 v1.1 GPUMD Porting Notes
+
+Date: 2026-04-26 to 2026-04-27
+
+## Goal
+
+Start from SUS2 v1.1 inference first, keep the tabulated radial-basis advantage, and evaluate/implement a GPUMD force backend without touching the existing SUS2 developer baseline.
+
+## Remote Project Path
+
+Clean GPUMD-SUS2 worktree:
+
+```bash
+/work/phy-weigw/20260321_Test/GPUMD-SUS2-v1.1-work-codex
+```
+
+Clean GPUMD binary compiled during environment check:
+
+```bash
+/work/phy-weigw/20260321_Test/GPUMD-SUS2-v1.1-work-codex/src/gpumd
+```
+
+Source origin:
+
+```bash
+https://github.com/brucefan1983/GPUMD.git
+```
+
+Initial clean commit checked out:
+
+```bash
+ff9b0dd Merge pull request #1466 from duanzaixu/gitpr
+```
+
+## Toolchain
+
+Preferred A100 build modules:
+
+```bash
+module purge
+module load gcc/12.2.0 cuda/12.4 cmake/3.25.2
+```
+
+Observed versions:
+
+```bash
+gcc 12.2.0
+nvcc 12.4.131
+cmake 3.25.2
+```
+
+Clean GPUMD build command, using low login-node CPU pressure:
+
+```bash
+cd /work/phy-weigw/20260321_Test/GPUMD-SUS2-v1.1-work-codex/src
+make -j2 gpumd CUDA_ARCH=-arch=sm_80 > ../build_gpumd_sm80.log 2>&1
+```
+
+This produced a working `src/gpumd` binary for A100 `sm_80`.
+
+## Runtime Smoke Test
+
+Smoke directory:
+
+```bash
+/work/phy-weigw/20260321_Test/GPUMD-SUS2-v1.1-work-codex/codex_smoke/gpumd_static
+```
+
+Robust LSF script:
+
+```bash
+/work/phy-weigw/20260321_Test/GPUMD-SUS2-v1.1-work-codex/codex_smoke/gpumd_static/smoke_a100_safe.lsf
+```
+
+Successful job:
+
+```bash
+3616901
+```
+
+Queue and node:
+
+```bash
+gpu-phy-zhangwq
+b05u08g
+NVIDIA A100-SXM4-80GB
+```
+
+The official GPUMD NEP smoke case completed with `GPUMD_RC=0`.
+
+Important script lesson: avoid `set -u` for LSF GPU scripts unless every scheduler variable is guarded. On `gpu-phy-zhangwq`, `CUDA_VISIBLE_DEVICES` can be unset even when a GPU is allocated, and GPUMD still sees the assigned A100 through the scheduler environment. Use `${CUDA_VISIBLE_DEVICES:-unset}` in diagnostics.
+
+## Existing Reference Prototype
+
+There is an older dirty reference tree:
+
+```bash
+/work/phy-weigw/apps/gpumd
+```
+
+Do not overwrite it. It contains an early `SUS2_MTP` prototype and user/generated test artifacts. It is useful as a reference only.
+
+The prototype already adds `MTP` parsing in GPUMD and has files such as:
+
+```bash
+src/force/sus2_mtp.cu
+src/force/sus2_mtp.cuh
+src/force/sus2_mtp_generated.inc
+```
+
+Current limitations of that prototype:
+
+- It targets `version=1.1.0` but is not a general v1.1 reader.
+- It is effectively single-species.
+- It assumes fixed `l2k2` dimensions and `RBChebyshev_sss`.
+- It hardcodes moment/radial sizes instead of reading arbitrary SUS2 model dimensions.
+
+## SUS2 v1.1 Implementation Status
+
+Implemented experimental SUS2 v1.1 backend files in the clean GPUMD worktree:
+
+```bash
+src/force/sus2_v11.cu
+src/force/sus2_v11.cuh
+src/force/force.cu
+src/model/read_xyz.cu
+```
+
+Current supported target:
+
+- `version = 1.1.0`
+- `radial_basis_type = RBJacobi_sss_lmp`
+- Dynamic model dimensions read from the `.mtp` file.
+- Radial basis values and derivatives are pretabulated in a GPU LUT.
+- GPUMD `run.in` uses the model symbols after the potential file, for example:
+
+```bash
+potential p1.1.mtp H C N I Pb
+```
+
+GPUMD itself still reads the first token `MTP` from the SUS2 model file to select this backend.
+
+## MA/Jacobi v1.1 Correctness Case
+
+The first real v1.1 validation case uses the previous MA/Jacobi benchmark:
+
+```bash
+/work/phy-weigw/hyx/ma/l3k3/jacobi/benchmark_lmp/p1.1.mtp
+/work/phy-weigw/hyx/ma/l3k3/jacobi/benchmark_lmp/data.in
+```
+
+Parity test directory:
+
+```bash
+/work/phy-weigw/20260321_Test/GPUMD-SUS2-v1.1-work-codex/codex_smoke/ma_v11_parity
+```
+
+Reference method:
+
+- GPUMD: `time_step 0`, `run 1`, `dump_force 1`.
+- LAMMPS: CPU `sus2mtp`, `run 0`, `dump custom ... fx fy fz`.
+- Comparison script: `compare_ma_gpumd_lammps.py`.
+
+Clean build and parity result after the multi-image neighbor fix:
+
+```text
+atoms = 192
+energy_gpumd_eV = -8.2216971022999996e+02
+energy_lammps_eV = -8.2216971000000001e+02
+energy_diff_eV = -2.2999995508143911e-07
+energy_diff_meV_per_atom = -1.1979164327158287e-06
+force_mae_eV_A = 1.1169451700354228e-07
+force_rmse_eV_A = 1.8504171572672147e-07
+force_max_abs_eV_A = 8.0230331420128032e-07
+```
+
+Important lesson: the MA cell has a short z dimension, and the SUS2 cutoff is slightly larger than half the box thickness. A simple minimum-image neighbor list gave nonzero but wrong results:
+
+```text
+energy_diff_meV_per_atom ~= 1.36
+force_mae_eV_A ~= 6.3e-3
+```
+
+The correct GPUMD-SUS2 neighbor path must store each neighbor edge's actual periodic-image displacement `dx, dy, dz`, not only the neighbor atom id. Otherwise multiple periodic images of the same atom collapse onto the minimum image and one image contribution is lost.
+
+## MA/Jacobi v1.1 Virial/Stress Parity
+
+Stress parity directory:
+
+```bash
+/work/phy-weigw/20260321_Test/GPUMD-SUS2-v1.1-work-codex/codex_smoke/ma_v11_virial_parity
+```
+
+Reference method:
+
+- GPUMD: `time_step 0`, `run 1`, `dump_thermo 1`, zero velocities in `model.xyz`.
+- LAMMPS: CPU `sus2mtp`, `run 0`, `compute pressure NULL virial`.
+- Comparison script: `compare_ma_gpumd_lammps_virial.py`.
+
+Clean parity result after the hybrid neighbor-list implementation:
+
+```text
+energy_diff_eV = -2.2999995508143911e-07
+stress_order = xx yy zz xy xz yz
+stress_gpumd_GPa = 1.4690688041 1.4783693494 1.9406601283 0.001504167978 -0.023581090475 -0.020751830916
+stress_lammps_GPa = 1.4690687 1.4783692 1.9406597 0.0015041466 -0.023581077 -0.020751841
+stress_mae_GPa = 1.2112283333565120e-07
+stress_rmse_GPa = 1.9032355850115235e-07
+stress_max_abs_GPa = 4.2829999991056411e-07
+```
+
+The stress agreement is at numerical-noise level, so the sign/order convention for virial stress is consistent with the LAMMPS SUS2 reference for this case.
+
+## 98k Atom NPT Performance Smoke
+
+Benchmark directory:
+
+```bash
+/work/phy-weigw/20260321_Test/GPUMD-SUS2-v1.1-work-codex/codex_bench/ma_98k_npt
+```
+
+Source data:
+
+```bash
+/work/phy-weigw/hyx/ma/l3k3/jacobi/benchmark_lmp/bench_npt2000_latest_iface_100k/data_98304.in
+```
+
+GPUMD NPT settings were translated from the LAMMPS benchmark:
+
+- `time_step 0.5` fs, matching LAMMPS `timestep 0.0005` ps.
+- `velocity 200 seed 9174`.
+- `ensemble npt_mttk temp 200 200 aniso 0.0001 0.0001 tperiod 100 pperiod 1000`.
+- `dump_thermo 100`, `run 2000`.
+
+Short 10-step smoke:
+
+```text
+job = 3617026
+atoms = 98304
+steps = 10
+speed = 58398.4 atom-step/s
+```
+
+Pre-optimization full 2000-step run:
+
+```text
+job = 3617029
+atoms = 98304
+steps = 2000
+run_seconds = 3202.01
+speed = 61401.4 atom-step/s
+```
+
+This run completed normally with finite thermo output, but it exposed a severe performance issue that was later traced to the wrong neighbor-list path.
+
+## Hybrid Neighbor Strategy
+
+The current implementation uses two neighbor paths:
+
+- Before choosing a path, explicitly initialize `box.thickness_x/y/z = volume / area_{x/y/z}`. This matches the NEP logic and avoids reading uninitialized thickness values.
+- If any periodic box thickness is smaller than `2 * cutoff`, use the verified multi-image O(N^2) path and store each edge's actual periodic-image displacement `dx, dy, dz`, so duplicate periodic images are not lost.
+- Otherwise use GPUMD's cached large-box neighbor path: `Neighbor::find_neighbor_global(rc, ...)` followed by `Neighbor::find_local_neighbor_from_global(rc, ...)`. Large-box SUS2 kernels store neighbor ids only and recompute the minimum-image displacement inside the kernels.
+
+This preserves the small-cell correctness case while making the 98k atom NPT smoke feasible.
+
+## First GPUMD-SUS2 Optimization Pass
+
+Date: 2026-04-27
+
+Implemented low-risk GPU-path optimizations while keeping the SUS2 mathematical expression unchanged:
+
+- Large-box path no longer stores per-edge `dx, dy, dz`; it stores neighbor ids only and recomputes the minimum-image displacement inside the kernels. Small-box/multi-image path still stores the exact image displacement to preserve duplicate-image correctness.
+- Radial LUT values and derivatives are stored as `float` on device and converted back to `double` in the arithmetic path. The model expression and moment arithmetic remain double.
+- Large-box force accumulation uses a direct no-atomic center-thread path. For each edge `i -> j`, the thread computes the same chain-rule objects as the old implementation but accumulates `D_i(r_ij) - D_j(r_ji)` into atom `i`, avoiding force atomics. The small-box path still uses the original cached-displacement atomic route.
+
+Correctness checks:
+
+```text
+small-box 192-atom parity:
+energy_diff_meV_per_atom = -3.1250024790097086e-07
+force_mae_eV_A = 1.8212621905130897e-07
+force_max_abs_eV_A = 1.0163574218902127e-06
+stress_mae_GPa = 1.2125895000285095e-07
+stress_max_abs_GPa = 2.4909999996047816e-07
+```
+
+```text
+large-box 192-atom force parity, box doubled without replicating atoms:
+energy_diff_meV_per_atom = 1.4635416434316539e-05
+force_mae_eV_A = 3.4390296550870349e-07
+force_max_abs_eV_A = 5.1308822630602435e-06
+```
+
+Performance checks on the 98,304-atom NPT case:
+
+```text
+previous 10-step smoke speed = 58398.4 atom-step/s
+first f12-gather trial speed = 58176.5 atom-step/s
+direct no-atomic 10-step speed = 58300.3 atom-step/s
+direct no-atomic 100-step speed = 60983.3 atom-step/s
+previous 2000-step full speed = 61401.4 atom-step/s
+```
+
+Conclusion from this intermediate pass: removing large-box force atomics alone did not improve performance because the job was still taking the wrong neighbor path. The direct no-atomic force kernel also computes both center derivatives inside each atom thread, which doubles the expensive SUS2 edge-derivative work relative to a directed-edge atomic accumulation.
+
+## Large-Box Neighbor and Force Bottleneck Fix
+
+Date: 2026-04-27
+
+Profiling before the fix showed that the 98k atom NPT run was dominated by neighbor construction:
+
+```text
+SUS2_PROFILE calls=100 avg_ms:
+neighbor = 1568.08 ms
+neighbor_global = 0
+neighbor_local = 0
+measured_total = 1605 ms
+speed ~= 6.12e4 atom-step/s
+```
+
+The zero `neighbor_global/local` timers were the clue: the 98k large-box run was not entering the GPUMD cached neighbor path. Root cause: `box.thickness_x/y/z` were used before being initialized, so they effectively looked like zero and the code always selected the small-box multi-image fallback.
+
+Fixes:
+
+- Initialize `box.thickness_x/y/z` explicitly before the small-box/large-box decision.
+- Keep exact cached displacements only for the small-box multi-image path.
+- Use GPUMD's global neighbor cache plus local cutoff filter for large boxes.
+- Change the default large-box force path back to directed-edge atomic accumulation. This computes each directed SUS2 derivative once. The older no-atomic pairwise path is retained only as an experiment behind `SUS2_GPUMD_PAIRWISE_NO_ATOMIC_FORCE=1`.
+
+Final correctness checks after the neighbor and force fixes:
+
+```text
+small-box 192-atom parity:
+energy_diff_meV_per_atom = -3.1250024790097086e-07
+force_mae_eV_A = 1.8550532338051470e-07
+force_max_abs_eV_A = 1.0163574218902127e-06
+```
+
+```text
+large-box 192-atom force parity, box doubled without replicating atoms:
+energy_diff_meV_per_atom = 1.4635416434316539e-05
+force_mae_eV_A = 3.4235210590389136e-07
+force_max_abs_eV_A = 5.1308822630602435e-06
+```
+
+```text
+stress parity:
+stress_mae_GPa = 1.2125895000285095e-07
+stress_max_abs_GPa = 2.4909999996047816e-07
+```
+
+98k atom NPT profiling after the thickness fix but before restoring directed-edge atomic force:
+
+```text
+SUS2_PROFILE calls=30 avg_ms:
+neighbor = 0.189057 ms
+neighbor_global = 0.030497 ms
+neighbor_local = 0.153407 ms
+force = 24.818870 ms
+measured_total = 50.941961 ms
+speed = 1.90776e6 atom-step/s
+```
+
+98k atom NPT profiling after restoring directed-edge atomic force:
+
+```text
+SUS2_PROFILE calls=30 avg_ms:
+neighbor = 0.187716 ms
+neighbor_global = 0.029334 ms
+neighbor_local = 0.153527 ms
+force = 11.521814 ms
+measured_total = 37.619717 ms
+speed = 2.56215e6 atom-step/s
+```
+
+Final 2000-step 98k atom NPT performance run:
+
+```text
+job = 3617310
+atoms = 98304
+steps = 2000
+run_seconds = 75.7826
+wall_seconds = 83
+speed = 2.59437e6 atom-step/s
+```
+
+Net result on this case: `6.14014e4 -> 2.59437e6 atom-step/s`, about `42.3x` faster than the pre-fix GPUMD-SUS2 run. This is also above the earlier single-A100 LAMMPS Kokkos SUS2 reference for the same 98k-scale MA benchmark, which was about `1.99e6 atom-step/s`.
+
+## L3K3 Fast Path and Product-Rule Table Optimization
+
+Date: 2026-04-27
+
+Implemented a second low-risk optimization pass for the remaining non-neighbor bottlenecks:
+
+- Added an `l3k3` `alpha_index_basic` fast path. When the model has the standard 12-radial, rank-0/1/2/3 grouped layout, GPUMD-SUS2 directly evaluates the 20 Cartesian monomials per `k` group instead of interpreting `(mu,a,b,c)` tuples for every edge.
+- Added a matching `l3k3` force-derivative fast path. It directly expands the rank-0/1/2/3 geometric derivatives while keeping the same radial values and chain rule as the generic implementation.
+- Packed `alpha_index_times` into a `uint16` constant-memory table when all moment ids and multipliers fit. For the MA/Jacobi model, `alpha_index_times_count = 5230`, moment ids are `0..2023`, and multipliers are at most `6`, so this path is valid. This reduces repeated product-rule index loads in forward/backward moment propagation.
+- Replaced large zero-fill kernels/thrust fills with `gpuMemset` for `moment_vals`, `moment_grads`, `force_tmp`, and `virial_tmp`.
+
+All fast paths are guarded. If a model does not match the `l3k3` layout or cannot pack product rules into `uint16`, the implementation falls back to the generic v1.1 path.
+
+Correctness checks after this pass:
+
+```text
+small-box 192-atom parity:
+energy_diff_meV_per_atom = -3.1250024790097086e-07
+force_mae_eV_A = 1.8290885714458053e-07
+force_max_abs_eV_A = 1.2547760009917752e-06
+```
+
+```text
+large-box 192-atom force parity, box doubled without replicating atoms:
+energy_diff_meV_per_atom = 1.4635416434316539e-05
+force_mae_eV_A = 3.4216217523721834e-07
+force_max_abs_eV_A = 5.1308822630602435e-06
+```
+
+```text
+stress parity:
+stress_mae_GPa = 1.2125895000285095e-07
+stress_max_abs_GPa = 2.4909999996047816e-07
+```
+
+98k atom NPT profiling after this pass:
+
+```text
+SUS2_PROFILE calls=30 avg_ms:
+neighbor = 0.184859 ms
+zero = 1.702167 ms
+basic = 5.461010 ms
+forward = 4.449905 ms
+energy_grad = 1.433769 ms
+backward = 9.711979 ms
+force = 3.799738 ms
+accumulate = 0.021658 ms
+measured_total = 26.765085 ms
+```
+
+Final 2000-step 98k atom NPT performance run after this pass:
+
+```text
+job = 3617375
+atoms = 98304
+steps = 2000
+run_seconds = 54.0395
+wall_seconds = 61
+speed = 3.63823e6 atom-step/s
+```
+
+Incremental result over the previous fixed-neighbor/force version: `2.59437e6 -> 3.63823e6 atom-step/s`, about `1.40x` faster. Net result over the original correctness-first GPUMD-SUS2 implementation: `6.14014e4 -> 3.63823e6 atom-step/s`, about `59.3x` faster.
+
+Million-scale single-A100 run using a `2x2x3` replication of the 98k MA/Jacobi cell:
+
+```text
+directory = /work/phy-weigw/20260321_Test/GPUMD-SUS2-v1.1-work-codex/codex_bench/ma_1m_npt/full_2000_1179648
+job = 3617387
+atoms = 1179648
+steps = 2000
+run_seconds = 678.141
+wall_seconds = 689
+speed = 3.47907e6 atom-step/s
+```
+
+This completed normally on one A100 with the same NPT settings as the 98k case. The 1.18M atom speed is close to the 98k speed, so the optimized GPUMD-SUS2 v1.1 path shows good large-system throughput on this benchmark.
+
+## L3K3 Basic-Moment Local Accumulation
+
+Date: 2026-04-27
+
+Implemented a third optimization pass for the `basic` kernel. The earlier `l3k3` fast path still updated the 60 basic moments in global memory for every neighbor edge. The new path accumulates all 60 basic moments in thread-local storage for each center atom and writes each basic moment to global memory once after the neighbor loop.
+
+This keeps the same mathematical expression and the same radial table values, but removes most repeated global read-modify-write traffic from the basic-moment construction.
+
+Correctness checks after this pass:
+
+```text
+small-box 192-atom parity:
+energy_diff_meV_per_atom = -3.1250024790097086e-07
+force_mae_eV_A = 1.8117595912034688e-07
+force_max_abs_eV_A = 1.2547760009917752e-06
+```
+
+```text
+large-box 192-atom force parity, box doubled without replicating atoms:
+energy_diff_meV_per_atom = 1.4635416434316539e-05
+force_mae_eV_A = 3.4258052259474612e-07
+force_max_abs_eV_A = 5.1308822630602435e-06
+```
+
+```text
+stress parity:
+stress_mae_GPa = 1.2125895000285095e-07
+stress_max_abs_GPa = 2.4909999996047816e-07
+```
+
+98k atom NPT profiling after this pass:
+
+```text
+SUS2_PROFILE calls=30 avg_ms:
+neighbor = 0.183532 ms
+zero = 1.702933 ms
+basic = 1.139293 ms
+forward = 4.448650 ms
+energy_grad = 1.431435 ms
+backward = 9.708696 ms
+force = 3.795585 ms
+accumulate = 0.021382 ms
+measured_total = 22.431506 ms
+```
+
+The important change is:
+
+```text
+basic ~= 5.46 ms -> 1.14 ms
+```
+
+Final 2000-step 98k atom NPT performance run after this pass:
+
+```text
+job = 3617431
+atoms = 98304
+steps = 2000
+run_seconds = 45.6732
+wall_seconds = 53
+speed = 4.30466e6 atom-step/s
+```
+
+Final 2000-step 1.18M atom NPT performance run after this pass:
+
+```text
+directory = /work/phy-weigw/20260321_Test/GPUMD-SUS2-v1.1-work-codex/codex_bench/ma_1m_npt/full_2000_1179648_l3k3_basic_accum
+job = 3617432
+atoms = 1179648
+steps = 2000
+run_seconds = 579.121
+wall_seconds = 590
+speed = 4.07393e6 atom-step/s
+```
+
+Incremental results over the previous pass:
+
+```text
+98k: 3.63823e6 -> 4.30466e6 atom-step/s, about 1.18x faster
+1.18M: 3.47907e6 -> 4.07393e6 atom-step/s, about 1.17x faster
+```
+
+Net result over the original correctness-first GPUMD-SUS2 implementation:
+
+```text
+98k: 6.14014e4 -> 4.30466e6 atom-step/s, about 70.1x faster
+```
+
+The remaining bottleneck is now dominated by reverse product-rule propagation:
+
+```text
+backward ~= 9.7 ms
+forward ~= 4.45 ms
+force ~= 3.8 ms
+zero ~= 1.7 ms
+basic ~= 1.1 ms
+```
+
+Splitting constant-memory `alpha_index_times` into dedicated forward/backward kernels was tested and did not materially improve beyond the existing constant table path. The bottleneck is therefore mostly the global-memory traffic and dependency structure of the moment DAG rather than product-rule branch overhead.
+
+Further meaningful gains likely require deeper moment-DAG work, such as changing the per-atom forward/backward propagation strategy or reducing global `N * alpha_moments_count` memory traffic. Those changes are more invasive than the current safe fast paths.
+
+## Next Implementation Direction
+
+The single-GPU correctness and 98k-scale performance path is now validated for the MA/Jacobi v1.1 model. Next work should focus on:
+
+1. Expand v1.1 reader coverage beyond `RBJacobi_sss_lmp` if needed.
+2. Optimize the moment calculation path further: reduce full `N * alpha_moments_count` global memory traffic, fuse kernels where practical, and avoid repeated scans over all basic moments for every neighbor.
+3. Add direct performance comparisons against LAMMPS for the same MA model and more sizes.
+4. Only after single-GPU performance is acceptable, consider GPUMD multi-GPU scaling.
+
+## Laguerre l4k3 Reader And Codegen Probe
+
+Date: 2026-04-27
+
+Reference model:
+
+```bash
+/work/phy-weigw/hyx/ma/laguerre-l4k3/current.mtp
+```
+
+The GPUMD-SUS2 v1.1 reader was expanded beyond the original Jacobi-only path:
+
+- Added `RBLaguerre_log1p`, `RBLaguerre_log1p_lmp`, `RBLaguerre_log1p_noenv`, `RBLaguerre_log1p_noenv_lmp`, `RBLaguerre_log1p_pos`, and `RBLaguerre_log1p_pos_lmp` host LUT generation.
+- Added `RBJacobi_sss`, `RBJacobi_sss_lmp`, `RBJacobi_sss_noweight`, and `RBJacobi_sss_noweight_lmp` as accepted Jacobi v1.1 inference types.
+- Added `RBChebyshev_sss` and `RBChebyshev_sss_lmp` host LUT generation.
+- The interface still does not cover every historical SUS2 radial basis type, such as Shapeev, old Chebyshev variants, Bessel, or Taylor.
+
+LUT control:
+
+- Default now matches the LAMMPS table convention: `dr = 1.0e-4 A`, implemented as `lut_span = ceil(cutoff / 1.0e-4)`.
+- Runtime controls now exist via environment variables `SUS2_GPUMD_LUT_SPAN` and `SUS2_GPUMD_LUT_DR`.
+- `run.in` potential-line controls also work after the required model species symbols, for example:
+
+```text
+potential /work/phy-weigw/hyx/ma/laguerre-l4k3/current.mtp H C N I Pb sus2_lut_span=2000
+potential /work/phy-weigw/hyx/ma/laguerre-l4k3/current.mtp H C N I Pb sus2_lut_dr=0.00325
+```
+
+The GPUMD xyz reader now takes exactly `species_count` symbols from the SUS2 `potential` line and ignores later SUS2 options, so options are not mistaken for element names.
+
+Smoke tests after rebuilding `src/gpumd` with `gcc/12.2.0 cuda/12.4 sm_80`:
+
+```text
+Laguerre l4k3 load smoke:
+directory = /work/phy-weigw/20260321_Test/GPUMD-SUS2-v1.1-work-codex/codex_smoke/laguerre_l4k3_load
+job = 3617553
+GPUMD_RC = 0
+radial_type = RBLaguerre_log1p
+species = 5
+radial = 15
+basics = 105
+moments = 4065
+scalars = 1767
+LUT = 2002
+dr = 0.00325 A
+```
+
+```text
+Jacobi l3k3 compatibility smoke:
+directory = /work/phy-weigw/20260321_Test/GPUMD-SUS2-v1.1-work-codex/codex_smoke/ma_v11_parity
+job = 3617554
+GPUMD_RC = 0
+radial_type = RBJacobi_sss_lmp
+LUT = 200002
+dr = 3.25e-05 A
+l3k3 fast path = enabled
+constant uint16 alpha_index_times = enabled
+```
+
+After switching the default LUT spacing to `1.0e-4 A`, Chebyshev and large MA/Jacobi smoke tests were repeated:
+
+```text
+Chebyshev_sss load smoke:
+directory = /work/phy-weigw/20260321_Test/GPUMD-SUS2-v1.1-work-codex/codex_smoke/chebyshev_sss_load
+job = 3617704
+GPUMD_RC = 0
+radial_type = RBChebyshev_sss
+species = 2
+radial = 12
+basics = 60
+moments = 514
+scalars = 349
+LUT = 65002
+dr = 0.0001 A
+```
+
+```text
+1.18M atom MA/Jacobi NPT2000, new default LUT spacing:
+directory = /work/phy-weigw/20260321_Test/GPUMD-SUS2-v1.1-work-codex/codex_bench/ma_1m_npt/full_2000_1179648_lut1e4
+job = 3617705
+atoms = 1179648
+steps = 2000
+LUT = 65002
+dr = 0.0001 A
+run_seconds = 572.288
+wall_seconds = 579
+speed = 4.12257e6 atom-step/s
+```
+
+Previous same-case reference with the old dense LUT was:
+
+```text
+directory = /work/phy-weigw/20260321_Test/GPUMD-SUS2-v1.1-work-codex/codex_bench/ma_1m_npt/full_2000_1179648_l3k3_basic_accum
+job = 3617432
+LUT = 200002
+run_seconds = 579.121
+wall_seconds = 590
+speed = 4.07393e6 atom-step/s
+```
+
+The new LAMMPS-style default table density is therefore slightly faster in this 1.18M atom run:
+
+```text
+speed change = 4.07393e6 -> 4.12257e6 atom-step/s, about +1.19%
+run-time change = 579.121 s -> 572.288 s, about -1.18%
+```
+
+Product-graph code generation probe:
+
+```text
+tool = /work/phy-weigw/20260321_Test/GPUMD-SUS2-v1.1-work-codex/tools/sus2_v11_codegen.py
+model = /work/phy-weigw/hyx/ma/laguerre-l4k3/current.mtp
+hash = d42a91c26f5253168e83e30294f3238e458b0e265febd3923b644500a783b67a
+L = 4
+k_count = 3
+alpha_basic_count = 105
+alpha_basic layout = l4k3 matched
+alpha_times_count = 18245
+active DAG compression = no inactive product moments
+```
+
+Generated full product-graph CUDA core result:
+
+```text
+out_dir = /work/phy-weigw/20260321_Test/GPUMD-SUS2-v1.1-work-codex/codex_codegen/laguerre_l4k3_chunk512
+chunk_size = 512 product rules per noinline device chunk
+source_size = 5.40 MB
+object_size = 8.16 MB
+compile_seconds = 160.62
+```
+
+The codegen tool now prints activity progress during `nvcc/ptxas`, controlled by `--progress-interval`. A repeated l4k3 chunk512 compile with visible progress produced:
+
+```text
+out_dir = /work/phy-weigw/20260321_Test/GPUMD-SUS2-v1.1-work-codex/codex_codegen/laguerre_l4k3_chunk512_progress
+progress_interval = 20 s
+progress_log = /work/phy-weigw/20260321_Test/GPUMD-SUS2-v1.1-work-codex/codex_codegen/laguerre_l4k3_chunk512_progress.log
+compile_seconds = 160.17
+object_size = 8.16 MB
+```
+
+Example progress lines:
+
+```text
+[sus2-codegen] nvcc/ptxas working | [#...................] elapsed=20.0s
+[sus2-codegen] nvcc/ptxas working / [##..................] elapsed=40.0s
+[sus2-codegen] nvcc/ptxas working - [###.................] elapsed=60.1s
+```
+
+The codegen tool now also has a persistent topology cache. Default cache location from the GPUMD-SUS2 work root is:
+
+```bash
+codegen_cache/sus2_v11
+```
+
+It can be overridden with:
+
+```bash
+SUS2_CODEGEN_CACHE_DIR=/path/to/cache
+tools/sus2_v11_codegen.py ... --cache-dir /path/to/cache
+```
+
+Cache key policy:
+
+- Includes: `version`, `L`, `scaling_map`, `radial_funcs_count`, `alpha_index_basic`, compressed `alpha_index_times`, compressed `alpha_moment_mapping`, and compressed active moment count.
+- Excludes: `species_count`, element names, radial coefficients, scaling coefficients, shift/species/moment coefficients, and `radial_basis_type`.
+- This matches the current generated core scope, which is the product/moment topology core rather than radial evaluation.
+
+Cache miss/hit test on the Laguerre l4k3 model:
+
+```text
+model = /work/phy-weigw/hyx/ma/laguerre-l4k3/current.mtp
+cache_key = 4c5cba1e8d377067c527bf0df43c381ae32866adcad1208b2d802a6079ff0c44
+cache_dir = /work/phy-weigw/20260321_Test/GPUMD-SUS2-v1.1-work-codex/codegen_cache/sus2_v11/4c5cba1e8d377067c527bf0df43c381ae32866adcad1208b2d802a6079ff0c44
+miss_compile_seconds = 158.16
+hit_elapsed_seconds = 0.19
+object_size = 8.16 MB
+```
+
+Cache entry files:
+
+```text
+generated.cu
+generated.o
+metadata.json
+build.log
+```
+
+A synthetic topology-only probe changed `species_count` from 5 to 7 and changed `radial_basis_type` from `RBLaguerre_log1p` to `RBChebyshev_sss` while keeping the same alpha topology. It hit the same cache key and completed in about `0.17 s`, confirming that element/radial-type metadata is not part of this product-graph cache key.
+
+An actual Cu-Zr l4k3 model did not hit the Laguerre l4k3 cache because its final scalar mapping/product graph is smaller:
+
+```text
+Cu-Zr l4k3 alpha_basic_count = 105
+Cu-Zr l4k3 alpha_times_count = 3172
+Cu-Zr l4k3 alpha_scalar_moments = 535
+cache_key = 68c932d007dcb70c46d0875eb82e573887780b26a2c630e9cd4d2ed7900001bc
+```
+
+This is expected: same l4k3 basic basis does not guarantee the same final scalar graph.
+
+Conclusion: automatic topology recognition and model-specific CUDA generation are feasible, but a complete l4k3 `alpha_index_times` graph is too large for startup-time JIT if fully baked into one cubin. Treat this as an AOT/cache path, or specialize only the cheaper and clearly profitable parts first, especially `alpha_index_basic`/force derivative kernels. Keep `alpha_index_times` on the constant-table path until a lower-compile-cost graph strategy is designed.
+
+Current element-pair LUT status:
+
+- The implementation still builds LUTs for all `species_count * species_count` model pairs.
+- Skipping unused element pairs is mathematically safe for a concrete simulation, but GPUMD currently constructs the potential before the atom type vector is passed into `SUS2_V11`, so it does not yet know which pairs are unused at construction time.
+- The right next design is lazy LUT construction on first `compute()` after seeing the actual type vector, or an explicit active-pair mask/cache keyed by the species present in `model.xyz`.
