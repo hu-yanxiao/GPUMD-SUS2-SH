@@ -6,31 +6,62 @@ Date: 2026-04-26 to 2026-04-27
 
 Start from SUS2 v1.1 inference first, keep the tabulated radial-basis advantage, and evaluate/implement a GPUMD force backend without touching the existing SUS2 developer baseline.
 
-## Remote Project Path
+## Current Three-Way Sync State
 
-Clean GPUMD-SUS2 worktree:
+Local clean GPUMD-SUS2 worktree:
+
+```bash
+/Users/hu-yanxiao/Projects/SUS2MLIP/.codex_tmp/gpumd-sus2-clean-wt
+```
+
+GitHub private repository:
+
+```bash
+https://github.com/hu-yanxiao/GPUMD-SUS2
+```
+
+Current GitHub branch:
+
+```bash
+main
+```
+
+Server runtime/build tree:
 
 ```bash
 /work/phy-weigw/20260321_Test/GPUMD-SUS2-v1.1-work-codex
 ```
 
-Clean GPUMD binary compiled during environment check:
+Server GPUMD binary:
 
 ```bash
 /work/phy-weigw/20260321_Test/GPUMD-SUS2-v1.1-work-codex/src/gpumd
 ```
 
-Source origin:
+Upstream GPUMD reference:
 
 ```bash
 https://github.com/brucefan1983/GPUMD.git
 ```
 
-Initial clean commit checked out:
+Initial upstream commit used as the base:
 
 ```bash
 ff9b0dd Merge pull request #1466 from duanzaixu/gitpr
 ```
+
+Important synchronization rule:
+
+1. Treat the local clean worktree as the authority for GitHub commits and pushes.
+2. Treat the server tree as the build/runtime mirror used for A100 tests and production benchmark runs.
+3. For a persistent GPUMD-SUS2 code update, commit it locally, push it to `hu-yanxiao/GPUMD-SUS2`, sync the same source files to the server tree, rebuild `src/gpumd`, and verify file hashes across local/GitHub/server.
+4. Do not consider a GPUMD-SUS2 update complete until the local clean worktree, GitHub `main`, and the server runtime tree agree on the relevant source files.
+5. Do not upload benchmark outputs, `codex_bench/`, `codex_smoke/`, build logs, or codegen caches unless they are intentionally promoted to documentation or test fixtures.
+
+Server git note:
+
+- The server has `origin` set to `https://github.com/hu-yanxiao/GPUMD-SUS2.git` and `upstream` set to `https://github.com/brucefan1983/GPUMD.git`.
+- The GitHub repository is private, and the server currently has no GitHub credentials. In practice, push/pull should be done from the local clean worktree; server updates should be mirrored over SSH/rsync.
 
 ## Toolchain
 
