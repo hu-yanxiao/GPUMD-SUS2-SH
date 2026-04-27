@@ -781,3 +781,129 @@ Current element-pair LUT status:
 - The implementation still builds LUTs for all `species_count * species_count` model pairs.
 - Skipping unused element pairs is mathematically safe for a concrete simulation, but GPUMD currently constructs the potential before the atom type vector is passed into `SUS2_V11`, so it does not yet know which pairs are unused at construction time.
 - The right next design is lazy LUT construction on first `compute()` after seeing the actual type vector, or an explicit active-pair mask/cache keyed by the species present in `model.xyz`.
+
+## Optional Float Moment-Gradient Workspace
+
+Implemented an experimental switch that keeps forward moments in double precision but stores the reverse-mode moment-gradient workspace in float:
+
+```text
+potential p.mtp H C N I Pb sus2_grad_float=1
+```
+
+or:
+
+```bash
+export SUS2_GPUMD_GRAD_FLOAT=1
+```
+
+The default remains double:
+
+```text
+SUS2 v1.1 GPUMD moment-gradient workspace: double.
+```
+
+The float mode prints:
+
+```text
+SUS2 v1.1 GPUMD moment-gradient workspace: float.
+```
+
+Test directory:
+
+```text
+/work/phy-weigw/20260321_Test/GPUMD-SUS2-v1.1-work-codex/codex_bench/ma_l3k3_98k_gradfloat_20260427
+```
+
+MA l3k3, 98304 atoms, one A100, NPT 2000 steps, `time_step 0.5 fs`:
+
+```text
+double workspace:
+  run_seconds = 45.1244
+  wall_seconds = 49
+  speed = 4.35702e6 atom-step/s
+  GPUMD process GPU memory peak = 4124 MiB
+
+float gradient workspace:
+  run_seconds = 37.8451
+  wall_seconds = 42
+  speed = 5.19508e6 atom-step/s
+  GPUMD process GPU memory peak = 3366 MiB
+```
+
+Observed change:
+
+```text
+speedup = 1.192x
+run-time reduction = 16.1%
+GPU process memory reduction = 758 MiB
+```
+
+Static 98k consistency check:
+
+```text
+directory = /work/phy-weigw/20260321_Test/GPUMD-SUS2-v1.1-work-codex/codex_bench/ma_l3k3_98k_gradfloat_static_20260427
+energy_diff_eV = 0.0
+force_mae_eV_A = 1.3093445e-5
+force_rmse_eV_A = 2.0695372e-5
+force_max_abs_eV_A = 1.0588951e-4
+```
+
+For l4k3 million-atom runs, the expected memory saving is much larger because the saved half of `moment_grads` scales as:
+
+```text
+alpha_moments_count * N * 4 bytes
+```
+
+For `alpha_moments_count=4065` and `N=995328`, this is about `15.5 GiB` saved compared with double gradients, while preserving double forward moments.
+
+## Optional NEP-Like Float Moment Path
+
+Implemented a second experimental switch that follows NEP's mixed-precision strategy more closely:
+
+```text
+potential p.mtp H C N I Pb sus2_float=1
+```
+
+or:
+
+```bash
+export SUS2_GPUMD_FLOAT=1
+```
+
+This mode implies float reverse gradients and additionally stores forward moments, fitted scalar coefficients used inside the device kernel, and local moment/force arithmetic in float. GPUMD positions and final potential/force/virial arrays remain double.
+
+The first-frame check is the hard correctness gate because later MD trajectories diverge chaotically. Static 98k MA l3k3 result versus default double:
+
+```text
+directory = /work/phy-weigw/20260321_Test/GPUMD-SUS2-v1.1-work-codex/codex_bench/ma_l3k3_98k_nepfloat_static_20260427
+energy_diff_eV = 0.25911
+energy_diff_meV_per_atom = 0.00264
+force_mae_eV_A = 1.5548e-5
+force_rmse_eV_A = 2.5351e-5
+force_max_abs_eV_A = 2.8420e-4
+```
+
+NPT 2000-step 98k MA l3k3 performance on one A100 after rebuilding the same binary:
+
+```text
+directory = /work/phy-weigw/20260321_Test/GPUMD-SUS2-v1.1-work-codex/codex_bench/ma_l3k3_98k_nepfloat_npt2000_20260427
+
+double:
+  run_seconds = 44.8793
+  speed = 4.38082e6 atom-step/s
+  GPUMD process GPU memory peak = 4124 MiB
+
+grad_float:
+  run_seconds = 38.6276
+  speed = 5.08983e6 atom-step/s
+  GPUMD process GPU memory peak = 3366 MiB
+  speedup_vs_double = 1.162x
+
+sus2_float:
+  run_seconds = 30.3050
+  speed = 6.48763e6 atom-step/s
+  GPUMD process GPU memory peak = 2608 MiB
+  speedup_vs_double = 1.481x
+```
+
+The NEP-like float path should remain opt-in until each target model passes a first-frame energy/force/virial comparison against the default double path.

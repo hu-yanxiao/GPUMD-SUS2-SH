@@ -63,6 +63,9 @@ private:
   GPU_Vector<double> shift_coeffs_;
   GPU_Vector<double> species_coeffs_;
   GPU_Vector<double> moment_coeffs_;
+  GPU_Vector<float> shift_coeffs_float_;
+  GPU_Vector<float> species_coeffs_float_;
+  GPU_Vector<float> moment_coeffs_float_;
   GPU_Vector<int> alpha_basic_;
   GPU_Vector<int> alpha_times_;
   GPU_Vector<int> alpha_moment_mapping_;
@@ -83,8 +86,10 @@ private:
   bool use_l3k3_basic_fastpath_ = false;
   bool use_const_alpha_times_ = false;
   bool use_float_moment_grads_ = false;
+  bool use_float_moments_ = false;
 
   GPU_Vector<double> moment_vals_;
+  GPU_Vector<float> moment_vals_float_;
   GPU_Vector<double> moment_grads_;
   GPU_Vector<float> moment_grads_float_;
   GPU_Vector<float> force_tmp_;

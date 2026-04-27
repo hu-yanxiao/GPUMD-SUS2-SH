@@ -129,7 +129,42 @@ export SUS2_GPUMD_GRAD_FLOAT=1
 
 Only the reverse-gradient workspace is changed to float; forward moments remain double. On the tested l3k3 98k MA case, this improved speed from `4.357e6` to `5.195e6 atom-step/s` and reduced GPUMD process GPU memory from about `4124 MiB` to `3366 MiB`.
 
-## 7. Supported Radial Basis Types
+## 7. Optional NEP-Like Float Moment Path
+
+For a more aggressive NEP-inspired mixed-precision test, enable:
+
+```text
+potential p.mtp H C N I Pb sus2_float=1
+```
+
+or:
+
+```bash
+export SUS2_GPUMD_FLOAT=1
+```
+
+This implies float reverse gradients and additionally stores forward moments, fitted scalar coefficients used by the kernel, and local moment/force arithmetic in float. GPUMD positions and final potential/force/virial arrays remain double.
+
+Static first-frame 98k MA l3k3 check versus default double:
+
+```text
+energy_diff = 0.25911 eV total = 0.0026 meV/atom
+force_MAE = 1.55e-5 eV/A
+force_RMSE = 2.54e-5 eV/A
+force_max_abs = 2.84e-4 eV/A
+```
+
+NPT 2000-step 98k MA l3k3 performance on one A100:
+
+```text
+double:      4.381e6 atom-step/s, 4124 MiB GPUMD process peak
+grad_float:  5.090e6 atom-step/s, 3366 MiB GPUMD process peak
+sus2_float:  6.488e6 atom-step/s, 2608 MiB GPUMD process peak
+```
+
+The `sus2_float=1` path is experimental and should be accepted only after first-frame energy/force/virial checks for the target model.
+
+## 8. Supported Radial Basis Types
 
 The current GPUMD-SUS2 v1.1 overlay supports:
 

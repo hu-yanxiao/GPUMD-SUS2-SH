@@ -73,6 +73,20 @@ export SUS2_GPUMD_GRAD_FLOAT=1
 
 This keeps the SUS2 forward moment values in double precision but stores the reverse-mode moment-gradient workspace in float. The default remains double.
 
+To test the more aggressive NEP-like float path:
+
+```text
+potential p.mtp H C N I Pb sus2_float=1
+```
+
+or:
+
+```bash
+export SUS2_GPUMD_FLOAT=1
+```
+
+This stores SUS2 moments and reverse gradients in float, evaluates local moment arithmetic in float, and still writes GPUMD energy/force/virial outputs to the existing double arrays.
+
 ## Codegen Cache
 
 The topology code generator uses a persistent cache:

@@ -29,6 +29,7 @@ Local working copy used to prepare this overlay:
 - The GPUMD `potential` line provides the element symbols after the model filename.
 - Supported radial basis types use lookup tables by default with `dr = 1.0e-4 A`.
 - `sus2_grad_float=1` or `SUS2_GPUMD_GRAD_FLOAT=1` switches the reverse-mode moment-gradient workspace from double to float; default remains double.
+- `sus2_float=1` or `SUS2_GPUMD_FLOAT=1` switches to an experimental NEP-like float path for SUS2 moments, reverse gradients, fitted scalar coefficients in the device kernel, and local arithmetic while retaining double GPUMD output arrays.
 - Unused element-pair tables are not built unless the model and run-time element mapping require them.
 - Product-graph codegen is cached by topology, so models with the same multiplication graph can reuse compiled artifacts even if element identities or coefficients differ.
 
