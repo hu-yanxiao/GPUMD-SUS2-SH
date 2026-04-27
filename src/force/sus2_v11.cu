@@ -868,6 +868,44 @@ int parse_lut_span(
   return lut_span;
 }
 
+bool parse_bool_value(const std::string& value, const std::string& option_name)
+{
+  std::string lower = value;
+  std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  if (lower == "1" || lower == "true" || lower == "yes" || lower == "on") {
+    return true;
+  }
+  if (lower == "0" || lower == "false" || lower == "no" || lower == "off") {
+    return false;
+  }
+  sus2_input_error("SUS2 GPUMD boolean option " + option_name + " must be one of 0/1/true/false/on/off.");
+}
+
+bool parse_float_moment_grads(
+  const SUS2HostModel& model,
+  int num_potential_options,
+  const char** potential_options)
+{
+  bool use_float = false;
+  const char* env = std::getenv("SUS2_GPUMD_GRAD_FLOAT");
+  if (env != nullptr) {
+    use_float = parse_bool_value(env, "SUS2_GPUMD_GRAD_FLOAT");
+  }
+
+  const int option_begin = std::min(num_potential_options, model.species_count);
+  for (int i = option_begin; i < num_potential_options; ++i) {
+    const std::string option = potential_options[i] == nullptr ? "" : potential_options[i];
+    if (starts_with(option, "sus2_grad_float=") || starts_with(option, "grad_float=") ||
+        starts_with(option, "sus2_moment_grad_float=")) {
+      const size_t eq = option.find('=');
+      use_float = parse_bool_value(option.substr(eq + 1), option.substr(0, eq));
+    }
+  }
+  return use_float;
+}
+
 int periodic_image_range(int pbc, double cutoff, double thickness)
 {
   if (pbc != 1) {
@@ -1103,6 +1141,19 @@ __device__ __forceinline__ void add_l3k3_basic_moments(
 #undef SUS2_ADD_L3K3_MOMENT
 }
 
+template <typename GradT>
+__device__ __forceinline__ double load_sus2_grad(const GradT* grads, int N, int moment, int atom)
+{
+  return static_cast<double>(grads[static_cast<size_t>(moment) * N + atom]);
+}
+
+template <typename GradT>
+__device__ __forceinline__ void add_sus2_grad(GradT* grads, size_t index, double value)
+{
+  grads[index] = static_cast<GradT>(static_cast<double>(grads[index]) + value);
+}
+
+template <typename GradT>
 __device__ __forceinline__ void compute_sus2_edge_derivative_l3k3(
   int N,
   const SUS2DeviceModel& model,
@@ -1113,7 +1164,7 @@ __device__ __forceinline__ void compute_sus2_edge_derivative_l3k3(
   double dy,
   double dz,
   double r,
-  const double* grads,
+  const GradT* grads,
   double& dEx,
   double& dEy,
   double& dEz)
@@ -1142,7 +1193,7 @@ __device__ __forceinline__ void compute_sus2_edge_derivative_l3k3(
 #define SUS2_ACCUM_L3K3_DERIV(BASIC, GEOM, DGX, DGY, DGZ, INV_SCALED, RAD_COMMON) \
   do { \
     const double basic_grad = \
-      grads[static_cast<size_t>(BASIC) * N + center_atom] * center_coeff; \
+      load_sus2_grad(grads, N, BASIC, center_atom) * center_coeff; \
     const double common = (GEOM) * (RAD_COMMON); \
     dEx += basic_grad * (common * dx + (INV_SCALED) * (DGX)); \
     dEy += basic_grad * (common * dy + (INV_SCALED) * (DGY)); \
@@ -1189,6 +1240,7 @@ __device__ __forceinline__ void compute_sus2_edge_derivative_l3k3(
 #undef SUS2_ACCUM_L3K3_DERIV
 }
 
+template <typename GradT>
 __device__ __forceinline__ void compute_sus2_edge_derivative(
   int N,
   const SUS2DeviceModel& model,
@@ -1199,13 +1251,13 @@ __device__ __forceinline__ void compute_sus2_edge_derivative(
   double dy,
   double dz,
   double r,
-  const double* grads,
+  const GradT* grads,
   double& dEx,
   double& dEy,
   double& dEz)
 {
   if (model.use_l3k3_basic_fastpath) {
-    compute_sus2_edge_derivative_l3k3(
+    compute_sus2_edge_derivative_l3k3<GradT>(
       N, model, center_atom, center_type, neighbor_type, dx, dy, dz, r, grads, dEx, dEy, dEz);
     return;
   }
@@ -1258,7 +1310,7 @@ __device__ __forceinline__ void compute_sus2_edge_derivative(
     if (c != 0) {
       jac_z += inv_dist_pow * static_cast<double>(c) * x_pow[a] * y_pow[b] * z_pow[c - 1];
     }
-    const double basic_grad = grads[static_cast<size_t>(basic) * N + center_atom] * center_coeff;
+    const double basic_grad = load_sus2_grad(grads, N, basic, center_atom) * center_coeff;
     dEx += basic_grad * jac_x;
     dEy += basic_grad * jac_y;
     dEz += basic_grad * jac_z;
@@ -1485,12 +1537,13 @@ static __global__ void gpu_forward_times_const_u16(int N, SUS2DeviceModel model,
   }
 }
 
+template <typename GradT>
 static __global__ void gpu_site_energy_init_grad(
   int N,
   SUS2DeviceModel model,
   const int* type,
   const double* moments,
-  double* grads,
+  GradT* grads,
   double* potential)
 {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1505,12 +1558,13 @@ static __global__ void gpu_site_energy_init_grad(
     const double coeff = model.moment_coeffs[idx];
     site_energy += coeff * moments[static_cast<size_t>(moment_id) * N + i] *
                    model.species_coeffs[type_i];
-    grads[static_cast<size_t>(moment_id) * N + i] += coeff;
+    add_sus2_grad(grads, static_cast<size_t>(moment_id) * N + i, coeff);
   }
   potential[i] += site_energy;
 }
 
-static __global__ void gpu_backward_times(int N, SUS2DeviceModel model, const double* moments, double* grads)
+template <typename GradT>
+static __global__ void gpu_backward_times(int N, SUS2DeviceModel model, const double* moments, GradT* grads)
 {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= N) {
@@ -1533,19 +1587,18 @@ static __global__ void gpu_backward_times(int N, SUS2DeviceModel model, const do
       mult = model.alpha_times[t * 4 + 2];
       dst = model.alpha_times[t * 4 + 3];
     }
-    const double gdst = grads[static_cast<size_t>(dst) * N + i] * static_cast<double>(mult);
-    grads[static_cast<size_t>(src1) * N + i] +=
-      gdst * moments[static_cast<size_t>(src0) * N + i];
-    grads[static_cast<size_t>(src0) * N + i] +=
-      gdst * moments[static_cast<size_t>(src1) * N + i];
+    const double gdst = load_sus2_grad(grads, N, dst, i) * static_cast<double>(mult);
+    add_sus2_grad(grads, static_cast<size_t>(src1) * N + i, gdst * moments[static_cast<size_t>(src0) * N + i]);
+    add_sus2_grad(grads, static_cast<size_t>(src0) * N + i, gdst * moments[static_cast<size_t>(src1) * N + i]);
   }
 }
 
+template <typename GradT>
 static __global__ void gpu_backward_times_const_u16(
   int N,
   SUS2DeviceModel model,
   const double* moments,
-  double* grads)
+  GradT* grads)
 {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= N) {
@@ -1557,14 +1610,13 @@ static __global__ void gpu_backward_times_const_u16(
     const int src1 = static_cast<int>(c_sus2_alpha_times_u16[offset + 1]);
     const int mult = static_cast<int>(c_sus2_alpha_times_u16[offset + 2]);
     const int dst = static_cast<int>(c_sus2_alpha_times_u16[offset + 3]);
-    const double gdst = grads[static_cast<size_t>(dst) * N + i] * static_cast<double>(mult);
-    grads[static_cast<size_t>(src1) * N + i] +=
-      gdst * moments[static_cast<size_t>(src0) * N + i];
-    grads[static_cast<size_t>(src0) * N + i] +=
-      gdst * moments[static_cast<size_t>(src1) * N + i];
+    const double gdst = load_sus2_grad(grads, N, dst, i) * static_cast<double>(mult);
+    add_sus2_grad(grads, static_cast<size_t>(src1) * N + i, gdst * moments[static_cast<size_t>(src0) * N + i]);
+    add_sus2_grad(grads, static_cast<size_t>(src0) * N + i, gdst * moments[static_cast<size_t>(src1) * N + i]);
   }
 }
 
+template <typename GradT>
 static __global__ void gpu_compute_forces(
   int N,
   Box box,
@@ -1580,7 +1632,7 @@ static __global__ void gpu_compute_forces(
   const double* x,
   const double* y,
   const double* z,
-  const double* grads,
+  const GradT* grads,
   float* force_tmp,
   float* virial_tmp)
 {
@@ -1623,7 +1675,7 @@ static __global__ void gpu_compute_forces(
     double dEx = 0.0;
     double dEy = 0.0;
     double dEz = 0.0;
-    compute_sus2_edge_derivative(N, model, i, type_i, type_j, dx, dy, dz, r, grads, dEx, dEy, dEz);
+    compute_sus2_edge_derivative<GradT>(N, model, i, type_i, type_j, dx, dy, dz, r, grads, dEx, dEy, dEz);
 
     fx_self += dEx;
     fy_self += dEy;
@@ -1659,6 +1711,7 @@ static __global__ void gpu_compute_forces(
   virial_tmp[i + 8 * N] += static_cast<float>(s_zy);
 }
 
+template <typename GradT>
 static __global__ void gpu_compute_forces_pairwise_no_atomic(
   int N,
   Box box,
@@ -1670,7 +1723,7 @@ static __global__ void gpu_compute_forces_pairwise_no_atomic(
   const double* x,
   const double* y,
   const double* z,
-  const double* grads,
+  const GradT* grads,
   float* force_tmp,
   float* virial_tmp)
 {
@@ -1713,12 +1766,12 @@ static __global__ void gpu_compute_forces_pairwise_no_atomic(
     double dFix;
     double dFiy;
     double dFiz;
-    compute_sus2_edge_derivative(N, model, i, type_i, type_j, dx, dy, dz, r, grads, dFix, dFiy, dFiz);
+    compute_sus2_edge_derivative<GradT>(N, model, i, type_i, type_j, dx, dy, dz, r, grads, dFix, dFiy, dFiz);
 
     double dFjx;
     double dFjy;
     double dFjz;
-    compute_sus2_edge_derivative(N, model, j, type_j, type_i, -dx, -dy, -dz, r, grads, dFjx, dFjy, dFjz);
+    compute_sus2_edge_derivative<GradT>(N, model, j, type_j, type_i, -dx, -dy, -dz, r, grads, dFjx, dFjy, dFjz);
 
     fx += dFix - dFjx;
     fy += dFiy - dFjy;
@@ -1803,6 +1856,7 @@ SUS2_V11::SUS2_V11(
   const char* no_atomic_force_env = std::getenv("SUS2_GPUMD_PAIRWISE_NO_ATOMIC_FORCE");
   use_pairwise_no_atomic_force_ =
     no_atomic_force_env != nullptr && std::atoi(no_atomic_force_env) != 0;
+  use_float_moment_grads_ = parse_float_moment_grads(host_model, num_potential_options, potential_options);
 
   shift_coeffs_.resize(host_model.shift_coeffs.size());
   shift_coeffs_.copy_from_host(host_model.shift_coeffs.data());
@@ -1882,6 +1936,9 @@ SUS2_V11::SUS2_V11(
   if (use_const_alpha_times_) {
     printf("SUS2 v1.1 GPUMD product-rule table: constant-memory uint16 alpha_index_times.\n");
   }
+  printf(
+    "SUS2 v1.1 GPUMD moment-gradient workspace: %s.\n",
+    use_float_moment_grads_ ? "float" : "double");
 }
 
 SUS2_V11::~SUS2_V11(void) {}
@@ -1928,8 +1985,11 @@ void SUS2_V11::resize_work_buffers(int num_atoms)
   if (moment_vals_.size() != moment_size) {
     moment_vals_.resize(moment_size);
   }
-  if (moment_grads_.size() != moment_size) {
+  if (!use_float_moment_grads_ && moment_grads_.size() != moment_size) {
     moment_grads_.resize(moment_size);
+  }
+  if (use_float_moment_grads_ && moment_grads_float_.size() != moment_size) {
+    moment_grads_float_.resize(moment_size);
   }
   const size_t force_size = static_cast<size_t>(num_atoms) * 3;
   const size_t virial_size = static_cast<size_t>(num_atoms) * 9;
@@ -2096,7 +2156,11 @@ void SUS2_V11::compute(
 
   profile_t = profile_start();
   CHECK(gpuMemset(moment_vals_.data(), 0, moment_size * sizeof(double)));
-  CHECK(gpuMemset(moment_grads_.data(), 0, moment_size * sizeof(double)));
+  if (use_float_moment_grads_) {
+    CHECK(gpuMemset(moment_grads_float_.data(), 0, moment_size * sizeof(float)));
+  } else {
+    CHECK(gpuMemset(moment_grads_.data(), 0, moment_size * sizeof(double)));
+  }
   if (!use_pairwise_no_atomic_force) {
     CHECK(gpuMemset(force_tmp_.data(), 0, static_cast<size_t>(num_atoms) * 3 * sizeof(float)));
     CHECK(gpuMemset(virial_tmp_.data(), 0, static_cast<size_t>(num_atoms) * 9 * sizeof(float)));
@@ -2174,58 +2238,111 @@ void SUS2_V11::compute(
   profile_stop(profile_forward, profile_t);
 
   profile_t = profile_start();
-  gpu_site_energy_init_grad<<<grid_size, kBlockSize>>>(
-    num_atoms, model, type.data(), moment_vals_.data(), moment_grads_.data(), potential.data());
+  if (use_float_moment_grads_) {
+    gpu_site_energy_init_grad<float><<<grid_size, kBlockSize>>>(
+      num_atoms, model, type.data(), moment_vals_.data(), moment_grads_float_.data(), potential.data());
+  } else {
+    gpu_site_energy_init_grad<double><<<grid_size, kBlockSize>>>(
+      num_atoms, model, type.data(), moment_vals_.data(), moment_grads_.data(), potential.data());
+  }
   GPU_CHECK_KERNEL
   profile_stop(profile_energy_grad, profile_t);
 
   profile_t = profile_start();
-  if (use_const_alpha_times_) {
-    gpu_backward_times_const_u16<<<grid_size, kBlockSize>>>(
-      num_atoms, model, moment_vals_.data(), moment_grads_.data());
+  if (use_float_moment_grads_) {
+    if (use_const_alpha_times_) {
+      gpu_backward_times_const_u16<float><<<grid_size, kBlockSize>>>(
+        num_atoms, model, moment_vals_.data(), moment_grads_float_.data());
+    } else {
+      gpu_backward_times<float><<<grid_size, kBlockSize>>>(
+        num_atoms, model, moment_vals_.data(), moment_grads_float_.data());
+    }
   } else {
-    gpu_backward_times<<<grid_size, kBlockSize>>>(
-      num_atoms, model, moment_vals_.data(), moment_grads_.data());
+    if (use_const_alpha_times_) {
+      gpu_backward_times_const_u16<double><<<grid_size, kBlockSize>>>(
+        num_atoms, model, moment_vals_.data(), moment_grads_.data());
+    } else {
+      gpu_backward_times<double><<<grid_size, kBlockSize>>>(
+        num_atoms, model, moment_vals_.data(), moment_grads_.data());
+    }
   }
   GPU_CHECK_KERNEL
   profile_stop(profile_backward, profile_t);
 
   profile_t = profile_start();
   if (!use_pairwise_no_atomic_force) {
-    gpu_compute_forces<<<grid_size, kBlockSize>>>(
-      num_atoms,
-      box,
-      rc * rc,
-      use_cached_neighbor_displacements_,
-      model,
-      type.data(),
-      neighbor_count_.data(),
-      neighbor_atom_.data(),
-      neighbor_dx_.data(),
-      neighbor_dy_.data(),
-      neighbor_dz_.data(),
-      position.data(),
-      position.data() + num_atoms,
-      position.data() + 2 * num_atoms,
-      moment_grads_.data(),
-      force_tmp_.data(),
-      virial_tmp_.data());
+    if (use_float_moment_grads_) {
+      gpu_compute_forces<float><<<grid_size, kBlockSize>>>(
+        num_atoms,
+        box,
+        rc * rc,
+        use_cached_neighbor_displacements_,
+        model,
+        type.data(),
+        neighbor_count_.data(),
+        neighbor_atom_.data(),
+        neighbor_dx_.data(),
+        neighbor_dy_.data(),
+        neighbor_dz_.data(),
+        position.data(),
+        position.data() + num_atoms,
+        position.data() + 2 * num_atoms,
+        moment_grads_float_.data(),
+        force_tmp_.data(),
+        virial_tmp_.data());
+    } else {
+      gpu_compute_forces<double><<<grid_size, kBlockSize>>>(
+        num_atoms,
+        box,
+        rc * rc,
+        use_cached_neighbor_displacements_,
+        model,
+        type.data(),
+        neighbor_count_.data(),
+        neighbor_atom_.data(),
+        neighbor_dx_.data(),
+        neighbor_dy_.data(),
+        neighbor_dz_.data(),
+        position.data(),
+        position.data() + num_atoms,
+        position.data() + 2 * num_atoms,
+        moment_grads_.data(),
+        force_tmp_.data(),
+        virial_tmp_.data());
+    }
     GPU_CHECK_KERNEL
   } else {
-    gpu_compute_forces_pairwise_no_atomic<<<grid_size, kBlockSize>>>(
-      num_atoms,
-      box,
-      rc * rc,
-      model,
-      type.data(),
-      neighbor_count_.data(),
-      neighbor_atom_.data(),
-      position.data(),
-      position.data() + num_atoms,
-      position.data() + 2 * num_atoms,
-      moment_grads_.data(),
-      force_tmp_.data(),
-      virial_tmp_.data());
+    if (use_float_moment_grads_) {
+      gpu_compute_forces_pairwise_no_atomic<float><<<grid_size, kBlockSize>>>(
+        num_atoms,
+        box,
+        rc * rc,
+        model,
+        type.data(),
+        neighbor_count_.data(),
+        neighbor_atom_.data(),
+        position.data(),
+        position.data() + num_atoms,
+        position.data() + 2 * num_atoms,
+        moment_grads_float_.data(),
+        force_tmp_.data(),
+        virial_tmp_.data());
+    } else {
+      gpu_compute_forces_pairwise_no_atomic<double><<<grid_size, kBlockSize>>>(
+        num_atoms,
+        box,
+        rc * rc,
+        model,
+        type.data(),
+        neighbor_count_.data(),
+        neighbor_atom_.data(),
+        position.data(),
+        position.data() + num_atoms,
+        position.data() + 2 * num_atoms,
+        moment_grads_.data(),
+        force_tmp_.data(),
+        virial_tmp_.data());
+    }
     GPU_CHECK_KERNEL
   }
   profile_stop(profile_force, profile_t);

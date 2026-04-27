@@ -82,9 +82,11 @@ private:
   bool use_pairwise_no_atomic_force_ = false;
   bool use_l3k3_basic_fastpath_ = false;
   bool use_const_alpha_times_ = false;
+  bool use_float_moment_grads_ = false;
 
   GPU_Vector<double> moment_vals_;
   GPU_Vector<double> moment_grads_;
+  GPU_Vector<float> moment_grads_float_;
   GPU_Vector<float> force_tmp_;
   GPU_Vector<float> virial_tmp_;
 

@@ -113,7 +113,23 @@ export SUS2_GPUMD_LUT_SPAN=65002
 
 `sus2_lut_span` and `SUS2_GPUMD_LUT_SPAN` override the number of table entries directly. In normal use, prefer setting `sus2_lut_dr`.
 
-## 6. Supported Radial Basis Types
+## 6. Optional Float Gradient Workspace
+
+The default SUS2 reverse-mode moment-gradient workspace is double precision. To reduce memory traffic and memory footprint, enable the experimental float-gradient workspace:
+
+```text
+potential p.mtp H C N I Pb sus2_grad_float=1
+```
+
+or:
+
+```bash
+export SUS2_GPUMD_GRAD_FLOAT=1
+```
+
+Only the reverse-gradient workspace is changed to float; forward moments remain double. On the tested l3k3 98k MA case, this improved speed from `4.357e6` to `5.195e6 atom-step/s` and reduced GPUMD process GPU memory from about `4124 MiB` to `3366 MiB`.
+
+## 7. Supported Radial Basis Types
 
 The current GPUMD-SUS2 v1.1 overlay supports:
 
@@ -134,7 +150,7 @@ RBLaguerre_log1p_pos_lmp
 
 The `_lmp` suffix is accepted for compatibility. In GPUMD-SUS2, supported radial types default to lookup-table evaluation regardless of the suffix.
 
-## 7. Product-Graph Codegen Cache
+## 8. Product-Graph Codegen Cache
 
 The code generator can produce a model-topology-specific CUDA core and cache it for reuse:
 
@@ -164,7 +180,7 @@ active moment count
 
 The key intentionally ignores element names, fitted coefficients, radial coefficients, scaling coefficients, and the radial basis type. Those quantities affect radial values or fitted weights, not the product graph itself.
 
-## 8. Validation Snapshot
+## 9. Validation Snapshot
 
 The current formal SUS2-GPUMD binary on the development cluster is:
 
@@ -186,4 +202,3 @@ For development notes and known limitations, see:
 ```text
 docs/sus2-gpumd-v1.1-porting-notes.md
 ```
-

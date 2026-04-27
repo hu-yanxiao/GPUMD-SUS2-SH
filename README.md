@@ -11,6 +11,7 @@ This repository is an overlay on top of upstream GPUMD, not a full GPUMD fork. I
 - Default radial evaluation: GPU lookup table for all supported radial basis types
 - Default LUT spacing: `dr = 1.0e-4 A`, matching the LAMMPS table convention
 - Runtime LUT controls: `sus2_lut_dr=...`, `sus2_lut_span=...`, `SUS2_GPUMD_LUT_DR`, `SUS2_GPUMD_LUT_SPAN`
+- Optional memory-saving reverse-gradient workspace: `sus2_grad_float=1` or `SUS2_GPUMD_GRAD_FLOAT=1`
 - Supported radial basis types:
   - `RBJacobi_sss`, `RBJacobi_sss_lmp`
   - `RBJacobi_sss_noweight`, `RBJacobi_sss_noweight_lmp`
@@ -58,6 +59,20 @@ or:
 export SUS2_GPUMD_LUT_DR=0.0001
 ```
 
+To test the optional float moment-gradient workspace:
+
+```text
+potential p.mtp H C N I Pb sus2_grad_float=1
+```
+
+or:
+
+```bash
+export SUS2_GPUMD_GRAD_FLOAT=1
+```
+
+This keeps the SUS2 forward moment values in double precision but stores the reverse-mode moment-gradient workspace in float. The default remains double.
+
 ## Codegen Cache
 
 The topology code generator uses a persistent cache:
@@ -92,6 +107,7 @@ Chebyshev_sss load smoke: GPUMD_RC=0, LUT=65002, dr=0.0001 A
 1.18M atom MA/Jacobi NPT2000: 4.12257e6 atom-step/s
 l4k3 codegen cache miss: 158.16 s
 l4k3 codegen cache hit: 0.19 s
+l3k3 98k grad-float test: 4.357e6 -> 5.195e6 atom-step/s, GPU process memory 4124 -> 3366 MiB
 ```
 
 More detailed notes are in [docs/sus2-gpumd-v1.1-porting-notes.md](docs/sus2-gpumd-v1.1-porting-notes.md).
