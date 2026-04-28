@@ -34,6 +34,11 @@ constexpr int kSus2MaxTensorBasic = 140;
 constexpr double kLaguerreMinRho = 1.0e-8;
 constexpr double kLaguerrePositiveParamFloor = 1.0e-6;
 
+template <int L>
+struct Sus2TensorStaticLayout {
+  static constexpr int basic_per_group = (L + 1) * (L + 2) * (L + 3) / 6;
+};
+
 __constant__ unsigned short c_sus2_alpha_times_u16[kSus2MaxConstAlphaTimes * 4];
 __constant__ unsigned short c_sus2_alpha_moment_mapping_u16[kSus2MaxConstScalarMoments];
 __constant__ float c_sus2_shift_coeffs_float[kSus2MaxConstSpecies];
@@ -1748,6 +1753,186 @@ __device__ __forceinline__ void compute_sus2_edge_derivative_tensor_cached(
   }
 }
 
+template <typename RealT, int L, int K>
+__device__ __forceinline__ void compute_sus2_edge_derivative_tensor_cached_static(
+  const SUS2DeviceModel& model,
+  int center_type,
+  int neighbor_type,
+  RealT dx,
+  RealT dy,
+  RealT dz,
+  RealT r,
+  const RealT* basic_grads,
+  RealT& dEx,
+  RealT& dEy,
+  RealT& dEz)
+{
+  constexpr int BasicPerGroup = Sus2TensorStaticLayout<L>::basic_per_group;
+  constexpr int BasicCount = K * BasicPerGroup;
+  if (model.alpha_basic_count != BasicCount) {
+    dEx = static_cast<RealT>(0.0);
+    dEy = static_cast<RealT>(0.0);
+    dEz = static_cast<RealT>(0.0);
+    return;
+  }
+
+  const int pair = center_type * model.species_count + neighbor_type;
+
+  RealT mu_val[32];
+  RealT mu_der[32];
+  interp_radial_vals_ders(model, pair, r, mu_val, mu_der);
+
+  const RealT inv_r = static_cast<RealT>(1.0) / r;
+  const RealT inv_r2 = inv_r * inv_r;
+  const RealT inv_r3 = inv_r2 * inv_r;
+  const RealT inv_r4 = inv_r2 * inv_r2;
+  const RealT x2 = dx * dx;
+  const RealT y2 = dy * dy;
+  const RealT z2 = dz * dz;
+  const RealT xy = dx * dy;
+  const RealT xz = dx * dz;
+  const RealT yz = dy * dz;
+
+  dEx = static_cast<RealT>(0.0);
+  dEy = static_cast<RealT>(0.0);
+  dEz = static_cast<RealT>(0.0);
+
+#pragma unroll
+  for (int group = 0; group < K; ++group) {
+    const int base = group * BasicPerGroup;
+    const int mu_base = group * (L + 1);
+
+    const RealT rc0 = mu_der[mu_base + 0] * inv_r;
+    const RealT c0 = basic_grads[base + 0] * rc0;
+    dEx += c0 * dx;
+    dEy += c0 * dy;
+    dEz += c0 * dz;
+
+    if (L >= 1) {
+      const RealT inv1 = mu_val[mu_base + 1] * inv_r;
+      const RealT rc1 = (mu_der[mu_base + 1] * inv_r - inv1 * inv_r) * inv_r;
+      const RealT g1x = basic_grads[base + 1];
+      const RealT g1y = basic_grads[base + 2];
+      const RealT g1z = basic_grads[base + 3];
+      const RealT p1 = g1x * dx + g1y * dy + g1z * dz;
+      const RealT c1 = rc1 * p1;
+      dEx += c1 * dx + inv1 * g1x;
+      dEy += c1 * dy + inv1 * g1y;
+      dEz += c1 * dz + inv1 * g1z;
+    }
+
+    if (L >= 2) {
+      const RealT inv2 = mu_val[mu_base + 2] * inv_r2;
+      const RealT rc2 =
+        (mu_der[mu_base + 2] * inv_r2 - static_cast<RealT>(2.0) * inv2 * inv_r) * inv_r;
+      const RealT g2xx = basic_grads[base + 4];
+      const RealT g2xy = basic_grads[base + 5];
+      const RealT g2xz = basic_grads[base + 6];
+      const RealT g2yy = basic_grads[base + 7];
+      const RealT g2yz = basic_grads[base + 8];
+      const RealT g2zz = basic_grads[base + 9];
+      const RealT p2 =
+        g2xx * x2 + g2xy * xy + g2xz * xz + g2yy * y2 + g2yz * yz + g2zz * z2;
+      const RealT p2x = static_cast<RealT>(2.0) * g2xx * dx + g2xy * dy + g2xz * dz;
+      const RealT p2y = g2xy * dx + static_cast<RealT>(2.0) * g2yy * dy + g2yz * dz;
+      const RealT p2z = g2xz * dx + g2yz * dy + static_cast<RealT>(2.0) * g2zz * dz;
+      const RealT c2 = rc2 * p2;
+      dEx += c2 * dx + inv2 * p2x;
+      dEy += c2 * dy + inv2 * p2y;
+      dEz += c2 * dz + inv2 * p2z;
+    }
+
+    if (L >= 3) {
+      const RealT inv3 = mu_val[mu_base + 3] * inv_r3;
+      const RealT rc3 =
+        (mu_der[mu_base + 3] * inv_r3 - static_cast<RealT>(3.0) * inv3 * inv_r) * inv_r;
+      const RealT g3xxx = basic_grads[base + 10];
+      const RealT g3xxy = basic_grads[base + 11];
+      const RealT g3xxz = basic_grads[base + 12];
+      const RealT g3xyy = basic_grads[base + 13];
+      const RealT g3xyz = basic_grads[base + 14];
+      const RealT g3xzz = basic_grads[base + 15];
+      const RealT g3yyy = basic_grads[base + 16];
+      const RealT g3yyz = basic_grads[base + 17];
+      const RealT g3yzz = basic_grads[base + 18];
+      const RealT g3zzz = basic_grads[base + 19];
+      const RealT p3 =
+        g3xxx * x2 * dx + g3xxy * x2 * dy + g3xxz * x2 * dz + g3xyy * dx * y2 +
+        g3xyz * xy * dz + g3xzz * dx * z2 + g3yyy * y2 * dy + g3yyz * y2 * dz +
+        g3yzz * dy * z2 + g3zzz * z2 * dz;
+      const RealT p3x =
+        static_cast<RealT>(3.0) * g3xxx * x2 + static_cast<RealT>(2.0) * g3xxy * xy +
+        static_cast<RealT>(2.0) * g3xxz * xz + g3xyy * y2 + g3xyz * yz + g3xzz * z2;
+      const RealT p3y =
+        g3xxy * x2 + static_cast<RealT>(2.0) * g3xyy * xy + g3xyz * xz +
+        static_cast<RealT>(3.0) * g3yyy * y2 + static_cast<RealT>(2.0) * g3yyz * yz +
+        g3yzz * z2;
+      const RealT p3z =
+        g3xxz * x2 + g3xyz * xy + static_cast<RealT>(2.0) * g3xzz * xz + g3yyz * y2 +
+        static_cast<RealT>(2.0) * g3yzz * yz + static_cast<RealT>(3.0) * g3zzz * z2;
+      const RealT c3 = rc3 * p3;
+      dEx += c3 * dx + inv3 * p3x;
+      dEy += c3 * dy + inv3 * p3y;
+      dEz += c3 * dz + inv3 * p3z;
+    }
+
+    if (L >= 4) {
+      const RealT inv4 = mu_val[mu_base + 4] * inv_r4;
+      const RealT rc4 =
+        (mu_der[mu_base + 4] * inv_r4 - static_cast<RealT>(4.0) * inv4 * inv_r) * inv_r;
+      const RealT g4xxxx = basic_grads[base + 20];
+      const RealT g4xxxy = basic_grads[base + 21];
+      const RealT g4xxxz = basic_grads[base + 22];
+      const RealT g4xxyy = basic_grads[base + 23];
+      const RealT g4xxyz = basic_grads[base + 24];
+      const RealT g4xxzz = basic_grads[base + 25];
+      const RealT g4xyyy = basic_grads[base + 26];
+      const RealT g4xyyz = basic_grads[base + 27];
+      const RealT g4xyzz = basic_grads[base + 28];
+      const RealT g4xzzz = basic_grads[base + 29];
+      const RealT g4yyyy = basic_grads[base + 30];
+      const RealT g4yyyz = basic_grads[base + 31];
+      const RealT g4yyzz = basic_grads[base + 32];
+      const RealT g4yzzz = basic_grads[base + 33];
+      const RealT g4zzzz = basic_grads[base + 34];
+      const RealT p4 =
+        g4xxxx * x2 * x2 + g4xxxy * x2 * dx * dy + g4xxxz * x2 * dx * dz +
+        g4xxyy * x2 * y2 + g4xxyz * x2 * yz + g4xxzz * x2 * z2 +
+        g4xyyy * dx * y2 * dy + g4xyyz * dx * y2 * dz + g4xyzz * dx * dy * z2 +
+        g4xzzz * dx * z2 * dz + g4yyyy * y2 * y2 + g4yyyz * y2 * dy * dz +
+        g4yyzz * y2 * z2 + g4yzzz * dy * z2 * dz + g4zzzz * z2 * z2;
+      const RealT p4x =
+        static_cast<RealT>(4.0) * g4xxxx * x2 * dx +
+        static_cast<RealT>(3.0) * g4xxxy * x2 * dy +
+        static_cast<RealT>(3.0) * g4xxxz * x2 * dz +
+        static_cast<RealT>(2.0) * g4xxyy * dx * y2 +
+        static_cast<RealT>(2.0) * g4xxyz * dx * yz +
+        static_cast<RealT>(2.0) * g4xxzz * dx * z2 +
+        g4xyyy * y2 * dy + g4xyyz * y2 * dz + g4xyzz * dy * z2 +
+        g4xzzz * z2 * dz;
+      const RealT p4y =
+        g4xxxy * x2 * dx + static_cast<RealT>(2.0) * g4xxyy * x2 * dy +
+        g4xxyz * x2 * dz + static_cast<RealT>(3.0) * g4xyyy * dx * y2 +
+        static_cast<RealT>(2.0) * g4xyyz * dx * yz + g4xyzz * dx * z2 +
+        static_cast<RealT>(4.0) * g4yyyy * y2 * dy +
+        static_cast<RealT>(3.0) * g4yyyz * y2 * dz +
+        static_cast<RealT>(2.0) * g4yyzz * dy * z2 + g4yzzz * z2 * dz;
+      const RealT p4z =
+        g4xxxz * x2 * dx + g4xxyz * x2 * dy +
+        static_cast<RealT>(2.0) * g4xxzz * x2 * dz + g4xyyz * dx * y2 +
+        static_cast<RealT>(2.0) * g4xyzz * dx * yz +
+        static_cast<RealT>(3.0) * g4xzzz * dx * z2 + g4yyyz * y2 * dy +
+        static_cast<RealT>(2.0) * g4yyzz * y2 * dz +
+        static_cast<RealT>(3.0) * g4yzzz * dy * z2 +
+        static_cast<RealT>(4.0) * g4zzzz * z2 * dz;
+      const RealT c4 = rc4 * p4;
+      dEx += c4 * dx + inv4 * p4x;
+      dEy += c4 * dy + inv4 * p4y;
+      dEz += c4 * dz + inv4 * p4z;
+    }
+  }
+}
+
 template <typename GradT, typename RealT>
 __device__ __forceinline__ void compute_sus2_edge_derivative(
   int N,
@@ -2119,6 +2304,132 @@ static __global__ void gpu_compute_basic_moments_tensor_accum(
   }
 
   for (int basic = 0; basic < model.alpha_basic_count; ++basic) {
+    moments[static_cast<size_t>(basic) * N + i] = acc[basic];
+  }
+}
+
+template <typename RealT, int L, int K>
+static __global__ void gpu_compute_basic_moments_tensor_accum_static(
+  int N,
+  Box box,
+  double cutoff_square,
+  bool use_cached_displacements,
+  SUS2DeviceModel model,
+  const int* type,
+  const int* neighbor_count,
+  const int* neighbor_atoms,
+  const double* neighbor_dx,
+  const double* neighbor_dy,
+  const double* neighbor_dz,
+  const double* x,
+  const double* y,
+  const double* z,
+  RealT* moments)
+{
+  constexpr int BasicPerGroup = Sus2TensorStaticLayout<L>::basic_per_group;
+  constexpr int BasicCount = K * BasicPerGroup;
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= N || model.alpha_basic_count != BasicCount) {
+    return;
+  }
+
+  RealT acc[BasicCount];
+#pragma unroll
+  for (int basic = 0; basic < BasicCount; ++basic) {
+    acc[basic] = static_cast<RealT>(0.0);
+  }
+
+  const int type_i = type[i];
+  const int count = neighbor_count[i];
+
+  for (int nbr = 0; nbr < count; ++nbr) {
+    const size_t edge = static_cast<size_t>(nbr) * N + i;
+    const int j = neighbor_atoms[edge];
+    RealT dx;
+    RealT dy;
+    RealT dz;
+    load_sus2_edge_displacement(
+      use_cached_displacements, N, box, edge, i, j, neighbor_dx, neighbor_dy, neighbor_dz, x, y, z, dx, dy, dz);
+    const RealT r2 = dx * dx + dy * dy + dz * dz;
+    if (r2 >= static_cast<RealT>(cutoff_square)) {
+      continue;
+    }
+    const RealT r = sqrt(r2);
+    const int pair = type_i * model.species_count + type[j];
+
+    RealT mu_val[32];
+    interp_radial_vals_ders(model, pair, r, mu_val, static_cast<RealT*>(nullptr));
+
+    const RealT inv_r = static_cast<RealT>(1.0) / r;
+    const RealT inv_r2 = inv_r * inv_r;
+    const RealT inv_r3 = inv_r2 * inv_r;
+    const RealT inv_r4 = inv_r2 * inv_r2;
+    const RealT x2 = dx * dx;
+    const RealT y2 = dy * dy;
+    const RealT z2 = dz * dz;
+    const RealT xy = dx * dy;
+    const RealT yz = dy * dz;
+
+#pragma unroll
+    for (int group = 0; group < K; ++group) {
+      const int base = group * BasicPerGroup;
+      const int mu_base = group * (L + 1);
+      acc[base + 0] += mu_val[mu_base + 0];
+
+      if (L >= 1) {
+        const RealT s1 = mu_val[mu_base + 1] * inv_r;
+        acc[base + 1] += s1 * dx;
+        acc[base + 2] += s1 * dy;
+        acc[base + 3] += s1 * dz;
+      }
+
+      if (L >= 2) {
+        const RealT s2 = mu_val[mu_base + 2] * inv_r2;
+        acc[base + 4] += s2 * x2;
+        acc[base + 5] += s2 * xy;
+        acc[base + 6] += s2 * dx * dz;
+        acc[base + 7] += s2 * y2;
+        acc[base + 8] += s2 * yz;
+        acc[base + 9] += s2 * z2;
+      }
+
+      if (L >= 3) {
+        const RealT s3 = mu_val[mu_base + 3] * inv_r3;
+        acc[base + 10] += s3 * x2 * dx;
+        acc[base + 11] += s3 * x2 * dy;
+        acc[base + 12] += s3 * x2 * dz;
+        acc[base + 13] += s3 * dx * y2;
+        acc[base + 14] += s3 * xy * dz;
+        acc[base + 15] += s3 * dx * z2;
+        acc[base + 16] += s3 * y2 * dy;
+        acc[base + 17] += s3 * y2 * dz;
+        acc[base + 18] += s3 * dy * z2;
+        acc[base + 19] += s3 * z2 * dz;
+      }
+
+      if (L >= 4) {
+        const RealT s4 = mu_val[mu_base + 4] * inv_r4;
+        acc[base + 20] += s4 * x2 * x2;
+        acc[base + 21] += s4 * x2 * dx * dy;
+        acc[base + 22] += s4 * x2 * dx * dz;
+        acc[base + 23] += s4 * x2 * y2;
+        acc[base + 24] += s4 * x2 * yz;
+        acc[base + 25] += s4 * x2 * z2;
+        acc[base + 26] += s4 * dx * y2 * dy;
+        acc[base + 27] += s4 * dx * y2 * dz;
+        acc[base + 28] += s4 * dx * dy * z2;
+        acc[base + 29] += s4 * dx * z2 * dz;
+        acc[base + 30] += s4 * y2 * y2;
+        acc[base + 31] += s4 * y2 * dy * dz;
+        acc[base + 32] += s4 * y2 * z2;
+        acc[base + 33] += s4 * dy * z2 * dz;
+        acc[base + 34] += s4 * z2 * z2;
+      }
+    }
+  }
+
+#pragma unroll
+  for (int basic = 0; basic < BasicCount; ++basic) {
     moments[static_cast<size_t>(basic) * N + i] = acc[basic];
   }
 }
@@ -2806,6 +3117,112 @@ static __global__ void gpu_compute_forces_tensor_cached_grads(
   virial_tmp[i + 8 * N] += static_cast<float>(s_zy);
 }
 
+template <typename GradT, typename RealT, int L, int K>
+static __global__ void gpu_compute_forces_tensor_cached_grads_static(
+  int N,
+  Box box,
+  double cutoff_square,
+  bool use_cached_displacements,
+  SUS2DeviceModel model,
+  const int* type,
+  const int* neighbor_count,
+  const int* neighbor_atoms,
+  const double* neighbor_dx,
+  const double* neighbor_dy,
+  const double* neighbor_dz,
+  const double* x,
+  const double* y,
+  const double* z,
+  const GradT* grads,
+  float* force_tmp,
+  float* virial_tmp)
+{
+  constexpr int BasicPerGroup = Sus2TensorStaticLayout<L>::basic_per_group;
+  constexpr int BasicCount = K * BasicPerGroup;
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= N || model.alpha_basic_count != BasicCount) {
+    return;
+  }
+
+  const int type_i = type[i];
+  const RealT center_coeff = sus2_species_coeff<RealT>(model, type_i);
+  RealT basic_grads[BasicCount];
+#pragma unroll
+  for (int basic = 0; basic < BasicCount; ++basic) {
+    basic_grads[basic] =
+      static_cast<RealT>(load_sus2_grad(grads, N, basic, i)) * center_coeff;
+  }
+
+  const int count = neighbor_count[i];
+
+  RealT fx_self = static_cast<RealT>(0.0);
+  RealT fy_self = static_cast<RealT>(0.0);
+  RealT fz_self = static_cast<RealT>(0.0);
+  RealT s_xx = static_cast<RealT>(0.0);
+  RealT s_yy = static_cast<RealT>(0.0);
+  RealT s_zz = static_cast<RealT>(0.0);
+  RealT s_xy = static_cast<RealT>(0.0);
+  RealT s_xz = static_cast<RealT>(0.0);
+  RealT s_yz = static_cast<RealT>(0.0);
+  RealT s_yx = static_cast<RealT>(0.0);
+  RealT s_zx = static_cast<RealT>(0.0);
+  RealT s_zy = static_cast<RealT>(0.0);
+
+  for (int nbr = 0; nbr < count; ++nbr) {
+    const size_t edge = static_cast<size_t>(nbr) * N + i;
+    const int j = neighbor_atoms[edge];
+    RealT dx;
+    RealT dy;
+    RealT dz;
+    load_sus2_edge_displacement(
+      use_cached_displacements, N, box, edge, i, j, neighbor_dx, neighbor_dy, neighbor_dz, x, y, z, dx, dy, dz);
+    const RealT r2 = dx * dx + dy * dy + dz * dz;
+    if (r2 >= static_cast<RealT>(cutoff_square)) {
+      continue;
+    }
+    const RealT r = sqrt(r2);
+    const int type_j = type[j];
+
+    RealT dEx = static_cast<RealT>(0.0);
+    RealT dEy = static_cast<RealT>(0.0);
+    RealT dEz = static_cast<RealT>(0.0);
+    compute_sus2_edge_derivative_tensor_cached_static<RealT, L, K>(
+      model, type_i, type_j, dx, dy, dz, r, basic_grads, dEx, dEy, dEz);
+
+    fx_self += dEx;
+    fy_self += dEy;
+    fz_self += dEz;
+
+    atomicAdd(force_tmp + j, static_cast<float>(-dEx));
+    atomicAdd(force_tmp + j + N, static_cast<float>(-dEy));
+    atomicAdd(force_tmp + j + 2 * N, static_cast<float>(-dEz));
+
+    s_xx -= dEx * dx;
+    s_yy -= dEy * dy;
+    s_zz -= dEz * dz;
+    s_xy -= dEx * dy;
+    s_xz -= dEx * dz;
+    s_yz -= dEy * dz;
+    s_yx -= dEy * dx;
+    s_zx -= dEz * dx;
+    s_zy -= dEz * dy;
+  }
+
+  atomicAdd(force_tmp + i, static_cast<float>(fx_self));
+  atomicAdd(force_tmp + i + N, static_cast<float>(fy_self));
+  atomicAdd(force_tmp + i + 2 * N, static_cast<float>(fz_self));
+
+  virial_tmp[i + 0 * N] += static_cast<float>(s_xx);
+  virial_tmp[i + 1 * N] += static_cast<float>(s_yy);
+  virial_tmp[i + 2 * N] += static_cast<float>(s_zz);
+  virial_tmp[i + 3 * N] += static_cast<float>(s_xy);
+  virial_tmp[i + 4 * N] += static_cast<float>(s_xz);
+  virial_tmp[i + 5 * N] += static_cast<float>(s_yz);
+  virial_tmp[i + 6 * N] += static_cast<float>(s_yx);
+  virial_tmp[i + 7 * N] += static_cast<float>(s_zx);
+  virial_tmp[i + 8 * N] += static_cast<float>(s_zy);
+}
+
 template <typename GradT, typename RealT>
 static __global__ void gpu_compute_forces_pairwise_no_atomic(
   int N,
@@ -3390,6 +3807,75 @@ void SUS2_V11::compute(
     use_const_float_coeffs_,
     use_float_moments_};
 
+#define SUS2_LAUNCH_TENSOR_BASIC_DYNAMIC(REAL_T, OUT_PTR) \
+  do { \
+    if (alpha_basic_count_ <= 40) { \
+      gpu_compute_basic_moments_tensor_accum<REAL_T, 40><<<grid_size, kBlockSize>>>( \
+        num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(), \
+        neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(), \
+        neighbor_dz_.data(), position.data(), position.data() + num_atoms, \
+        position.data() + 2 * num_atoms, OUT_PTR); \
+    } else if (alpha_basic_count_ <= 80) { \
+      gpu_compute_basic_moments_tensor_accum<REAL_T, 80><<<grid_size, kBlockSize>>>( \
+        num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(), \
+        neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(), \
+        neighbor_dz_.data(), position.data(), position.data() + num_atoms, \
+        position.data() + 2 * num_atoms, OUT_PTR); \
+    } else { \
+      gpu_compute_basic_moments_tensor_accum<REAL_T, kSus2MaxTensorBasic><<<grid_size, kBlockSize>>>( \
+        num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(), \
+        neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(), \
+        neighbor_dz_.data(), position.data(), position.data() + num_atoms, \
+        position.data() + 2 * num_atoms, OUT_PTR); \
+    } \
+  } while (0)
+
+#define SUS2_LAUNCH_TENSOR_BASIC_STATIC(REAL_T, LVAL, KVAL, OUT_PTR) \
+  gpu_compute_basic_moments_tensor_accum_static<REAL_T, LVAL, KVAL><<<grid_size, kBlockSize>>>( \
+    num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(), \
+    neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(), \
+    neighbor_dz_.data(), position.data(), position.data() + num_atoms, \
+    position.data() + 2 * num_atoms, OUT_PTR)
+
+#define SUS2_LAUNCH_TENSOR_BASIC_SPECIALIZED(REAL_T, OUT_PTR) \
+  do { \
+    if (tensor_l_ == 1 && tensor_k_ == 1) { \
+      SUS2_LAUNCH_TENSOR_BASIC_STATIC(REAL_T, 1, 1, OUT_PTR); \
+    } else if (tensor_l_ == 1 && tensor_k_ == 2) { \
+      SUS2_LAUNCH_TENSOR_BASIC_STATIC(REAL_T, 1, 2, OUT_PTR); \
+    } else if (tensor_l_ == 1 && tensor_k_ == 3) { \
+      SUS2_LAUNCH_TENSOR_BASIC_STATIC(REAL_T, 1, 3, OUT_PTR); \
+    } else if (tensor_l_ == 1 && tensor_k_ == 4) { \
+      SUS2_LAUNCH_TENSOR_BASIC_STATIC(REAL_T, 1, 4, OUT_PTR); \
+    } else if (tensor_l_ == 2 && tensor_k_ == 1) { \
+      SUS2_LAUNCH_TENSOR_BASIC_STATIC(REAL_T, 2, 1, OUT_PTR); \
+    } else if (tensor_l_ == 2 && tensor_k_ == 2) { \
+      SUS2_LAUNCH_TENSOR_BASIC_STATIC(REAL_T, 2, 2, OUT_PTR); \
+    } else if (tensor_l_ == 2 && tensor_k_ == 3) { \
+      SUS2_LAUNCH_TENSOR_BASIC_STATIC(REAL_T, 2, 3, OUT_PTR); \
+    } else if (tensor_l_ == 2 && tensor_k_ == 4) { \
+      SUS2_LAUNCH_TENSOR_BASIC_STATIC(REAL_T, 2, 4, OUT_PTR); \
+    } else if (tensor_l_ == 3 && tensor_k_ == 1) { \
+      SUS2_LAUNCH_TENSOR_BASIC_STATIC(REAL_T, 3, 1, OUT_PTR); \
+    } else if (tensor_l_ == 3 && tensor_k_ == 2) { \
+      SUS2_LAUNCH_TENSOR_BASIC_STATIC(REAL_T, 3, 2, OUT_PTR); \
+    } else if (tensor_l_ == 3 && tensor_k_ == 3) { \
+      SUS2_LAUNCH_TENSOR_BASIC_STATIC(REAL_T, 3, 3, OUT_PTR); \
+    } else if (tensor_l_ == 3 && tensor_k_ == 4) { \
+      SUS2_LAUNCH_TENSOR_BASIC_STATIC(REAL_T, 3, 4, OUT_PTR); \
+    } else if (tensor_l_ == 4 && tensor_k_ == 1) { \
+      SUS2_LAUNCH_TENSOR_BASIC_STATIC(REAL_T, 4, 1, OUT_PTR); \
+    } else if (tensor_l_ == 4 && tensor_k_ == 2) { \
+      SUS2_LAUNCH_TENSOR_BASIC_STATIC(REAL_T, 4, 2, OUT_PTR); \
+    } else if (tensor_l_ == 4 && tensor_k_ == 3) { \
+      SUS2_LAUNCH_TENSOR_BASIC_STATIC(REAL_T, 4, 3, OUT_PTR); \
+    } else if (tensor_l_ == 4 && tensor_k_ == 4) { \
+      SUS2_LAUNCH_TENSOR_BASIC_STATIC(REAL_T, 4, 4, OUT_PTR); \
+    } else { \
+      SUS2_LAUNCH_TENSOR_BASIC_DYNAMIC(REAL_T, OUT_PTR); \
+    } \
+  } while (0)
+
   profile_t = profile_start();
   const bool use_exact_l3k3_tensor = use_tensor_basic_fastpath_ && tensor_l_ == 3 && tensor_k_ == 3;
 
@@ -3431,45 +3917,9 @@ void SUS2_V11::compute(
     }
   } else if (use_tensor_basic_fastpath_) {
     if (use_float_moments_) {
-      if (alpha_basic_count_ <= 40) {
-        gpu_compute_basic_moments_tensor_accum<float, 40><<<grid_size, kBlockSize>>>(
-          num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(),
-          neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(),
-          neighbor_dz_.data(), position.data(), position.data() + num_atoms,
-          position.data() + 2 * num_atoms, moment_vals_float_.data());
-      } else if (alpha_basic_count_ <= 80) {
-        gpu_compute_basic_moments_tensor_accum<float, 80><<<grid_size, kBlockSize>>>(
-          num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(),
-          neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(),
-          neighbor_dz_.data(), position.data(), position.data() + num_atoms,
-          position.data() + 2 * num_atoms, moment_vals_float_.data());
-      } else {
-        gpu_compute_basic_moments_tensor_accum<float, kSus2MaxTensorBasic><<<grid_size, kBlockSize>>>(
-          num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(),
-          neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(),
-          neighbor_dz_.data(), position.data(), position.data() + num_atoms,
-          position.data() + 2 * num_atoms, moment_vals_float_.data());
-      }
+      SUS2_LAUNCH_TENSOR_BASIC_SPECIALIZED(float, moment_vals_float_.data());
     } else {
-      if (alpha_basic_count_ <= 40) {
-        gpu_compute_basic_moments_tensor_accum<double, 40><<<grid_size, kBlockSize>>>(
-          num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(),
-          neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(),
-          neighbor_dz_.data(), position.data(), position.data() + num_atoms,
-          position.data() + 2 * num_atoms, moment_vals_.data());
-      } else if (alpha_basic_count_ <= 80) {
-        gpu_compute_basic_moments_tensor_accum<double, 80><<<grid_size, kBlockSize>>>(
-          num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(),
-          neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(),
-          neighbor_dz_.data(), position.data(), position.data() + num_atoms,
-          position.data() + 2 * num_atoms, moment_vals_.data());
-      } else {
-        gpu_compute_basic_moments_tensor_accum<double, kSus2MaxTensorBasic><<<grid_size, kBlockSize>>>(
-          num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(),
-          neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(),
-          neighbor_dz_.data(), position.data(), position.data() + num_atoms,
-          position.data() + 2 * num_atoms, moment_vals_.data());
-      }
+      SUS2_LAUNCH_TENSOR_BASIC_SPECIALIZED(double, moment_vals_.data());
     }
   } else {
     if (use_float_moments_) {
@@ -3646,15 +4096,9 @@ void SUS2_V11::compute(
     }
   }
 
-#define SUS2_LAUNCH_TENSOR_CACHED_FORCE(GRAD_T, REAL_T, GRADS_PTR) \
+#define SUS2_LAUNCH_TENSOR_CACHED_FORCE_DYNAMIC(GRAD_T, REAL_T, GRADS_PTR) \
   do { \
-    if (use_exact_l3k3_tensor) { \
-      gpu_compute_forces_l3k3_cached_grads<GRAD_T, REAL_T><<<grid_size, kBlockSize>>>( \
-        num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(), \
-        neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(), \
-        neighbor_dz_.data(), position.data(), position.data() + num_atoms, \
-        position.data() + 2 * num_atoms, GRADS_PTR, force_tmp_.data(), virial_tmp_.data()); \
-    } else if (alpha_basic_count_ <= 40) { \
+    if (alpha_basic_count_ <= 40) { \
       gpu_compute_forces_tensor_cached_grads<GRAD_T, REAL_T, 40><<<grid_size, kBlockSize>>>( \
         num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(), \
         neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(), \
@@ -3672,6 +4116,58 @@ void SUS2_V11::compute(
         neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(), \
         neighbor_dz_.data(), position.data(), position.data() + num_atoms, \
         position.data() + 2 * num_atoms, GRADS_PTR, force_tmp_.data(), virial_tmp_.data()); \
+    } \
+  } while (0)
+
+#define SUS2_LAUNCH_TENSOR_CACHED_FORCE_STATIC(GRAD_T, REAL_T, LVAL, KVAL, GRADS_PTR) \
+  gpu_compute_forces_tensor_cached_grads_static<GRAD_T, REAL_T, LVAL, KVAL><<<grid_size, kBlockSize>>>( \
+    num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(), \
+    neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(), \
+    neighbor_dz_.data(), position.data(), position.data() + num_atoms, \
+    position.data() + 2 * num_atoms, GRADS_PTR, force_tmp_.data(), virial_tmp_.data())
+
+#define SUS2_LAUNCH_TENSOR_CACHED_FORCE(GRAD_T, REAL_T, GRADS_PTR) \
+  do { \
+    if (use_exact_l3k3_tensor) { \
+      gpu_compute_forces_l3k3_cached_grads<GRAD_T, REAL_T><<<grid_size, kBlockSize>>>( \
+        num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(), \
+        neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(), \
+        neighbor_dz_.data(), position.data(), position.data() + num_atoms, \
+        position.data() + 2 * num_atoms, GRADS_PTR, force_tmp_.data(), virial_tmp_.data()); \
+    } else if (tensor_l_ == 1 && tensor_k_ == 1) { \
+      SUS2_LAUNCH_TENSOR_CACHED_FORCE_STATIC(GRAD_T, REAL_T, 1, 1, GRADS_PTR); \
+    } else if (tensor_l_ == 1 && tensor_k_ == 2) { \
+      SUS2_LAUNCH_TENSOR_CACHED_FORCE_STATIC(GRAD_T, REAL_T, 1, 2, GRADS_PTR); \
+    } else if (tensor_l_ == 1 && tensor_k_ == 3) { \
+      SUS2_LAUNCH_TENSOR_CACHED_FORCE_STATIC(GRAD_T, REAL_T, 1, 3, GRADS_PTR); \
+    } else if (tensor_l_ == 1 && tensor_k_ == 4) { \
+      SUS2_LAUNCH_TENSOR_CACHED_FORCE_STATIC(GRAD_T, REAL_T, 1, 4, GRADS_PTR); \
+    } else if (tensor_l_ == 2 && tensor_k_ == 1) { \
+      SUS2_LAUNCH_TENSOR_CACHED_FORCE_STATIC(GRAD_T, REAL_T, 2, 1, GRADS_PTR); \
+    } else if (tensor_l_ == 2 && tensor_k_ == 2) { \
+      SUS2_LAUNCH_TENSOR_CACHED_FORCE_STATIC(GRAD_T, REAL_T, 2, 2, GRADS_PTR); \
+    } else if (tensor_l_ == 2 && tensor_k_ == 3) { \
+      SUS2_LAUNCH_TENSOR_CACHED_FORCE_STATIC(GRAD_T, REAL_T, 2, 3, GRADS_PTR); \
+    } else if (tensor_l_ == 2 && tensor_k_ == 4) { \
+      SUS2_LAUNCH_TENSOR_CACHED_FORCE_STATIC(GRAD_T, REAL_T, 2, 4, GRADS_PTR); \
+    } else if (tensor_l_ == 3 && tensor_k_ == 1) { \
+      SUS2_LAUNCH_TENSOR_CACHED_FORCE_STATIC(GRAD_T, REAL_T, 3, 1, GRADS_PTR); \
+    } else if (tensor_l_ == 3 && tensor_k_ == 2) { \
+      SUS2_LAUNCH_TENSOR_CACHED_FORCE_STATIC(GRAD_T, REAL_T, 3, 2, GRADS_PTR); \
+    } else if (tensor_l_ == 3 && tensor_k_ == 3) { \
+      SUS2_LAUNCH_TENSOR_CACHED_FORCE_STATIC(GRAD_T, REAL_T, 3, 3, GRADS_PTR); \
+    } else if (tensor_l_ == 3 && tensor_k_ == 4) { \
+      SUS2_LAUNCH_TENSOR_CACHED_FORCE_STATIC(GRAD_T, REAL_T, 3, 4, GRADS_PTR); \
+    } else if (tensor_l_ == 4 && tensor_k_ == 1) { \
+      SUS2_LAUNCH_TENSOR_CACHED_FORCE_STATIC(GRAD_T, REAL_T, 4, 1, GRADS_PTR); \
+    } else if (tensor_l_ == 4 && tensor_k_ == 2) { \
+      SUS2_LAUNCH_TENSOR_CACHED_FORCE_STATIC(GRAD_T, REAL_T, 4, 2, GRADS_PTR); \
+    } else if (tensor_l_ == 4 && tensor_k_ == 3) { \
+      SUS2_LAUNCH_TENSOR_CACHED_FORCE_STATIC(GRAD_T, REAL_T, 4, 3, GRADS_PTR); \
+    } else if (tensor_l_ == 4 && tensor_k_ == 4) { \
+      SUS2_LAUNCH_TENSOR_CACHED_FORCE_STATIC(GRAD_T, REAL_T, 4, 4, GRADS_PTR); \
+    } else { \
+      SUS2_LAUNCH_TENSOR_CACHED_FORCE_DYNAMIC(GRAD_T, REAL_T, GRADS_PTR); \
     } \
   } while (0)
 
@@ -3798,6 +4294,11 @@ void SUS2_V11::compute(
     GPU_CHECK_KERNEL
   }
 #undef SUS2_LAUNCH_TENSOR_CACHED_FORCE
+#undef SUS2_LAUNCH_TENSOR_CACHED_FORCE_STATIC
+#undef SUS2_LAUNCH_TENSOR_CACHED_FORCE_DYNAMIC
+#undef SUS2_LAUNCH_TENSOR_BASIC_SPECIALIZED
+#undef SUS2_LAUNCH_TENSOR_BASIC_STATIC
+#undef SUS2_LAUNCH_TENSOR_BASIC_DYNAMIC
   profile_stop(profile_force, profile_t);
 
   profile_t = profile_start();

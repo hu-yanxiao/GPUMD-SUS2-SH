@@ -1213,3 +1213,86 @@ speedup vs cache off = 1.37x
 ```
 
 Takeaway: the useful pattern is not to maintain many handwritten `l2k3`, `l3k4`, `l4k4` branches. The robust version is to detect the regular tensor layout, then use one rank-block implementation covering the supported `L <= 4`, `K <= 4` family.
+
+## L/K-Specialized Tensor Kernels
+
+Date: 2026-04-28
+
+The next pass pushed the same idea one step closer to handwritten code. Instead of one dynamic rank-block kernel with runtime `tensor_l`, `tensor_k`, `tensor_basic_per_group`, and `MaxBasic`, the code now dispatches standard layouts to compile-time specializations:
+
+```text
+gpu_compute_basic_moments_tensor_accum_static<RealT, L, K>
+gpu_compute_forces_tensor_cached_grads_static<GradT, RealT, L, K>
+```
+
+The supported specialized grid is:
+
+```text
+L = 1..4
+K = 1..4
+basic_per_group = C(L + 3, 3)
+basic_count = K * basic_per_group
+```
+
+Unsupported or nonstandard layouts still fall back to the dynamic tensor implementation. The exact `l3k3` path remains enabled by default, but forcing it off now routes `l3k3` through the `L=3,K=3` specialization.
+
+Correctness checks after L/K specialization, using cache on/off parity:
+
+```text
+directory = /work/phy-weigw/20260321_Test/GPUMD-SUS2-v1.1-work-codex/codex_smoke/tensor_l4k4_cache_parity_20260428
+
+l3k3 Cu-Zr:
+  force_mae = 3.9340e-7 eV/A
+  force_rmse = 5.2679e-7 eV/A
+  force_max = 2.5481e-6 eV/A
+  thermo_max = 1.7242e-5
+
+l4k3 MA/Laguerre:
+  force_mae = 9.6303e-7 eV/A
+  force_rmse = 1.7336e-6 eV/A
+  force_max = 1.7881e-5 eV/A
+  thermo_max = 5.5635e-5
+
+l4k4 drug/Chebyshev:
+  force_mae = 9.3807e-7 eV/A
+  force_rmse = 1.3336e-6 eV/A
+  force_max = 6.3181e-6 eV/A
+  thermo_max = 3.1296e-7
+```
+
+Performance updates:
+
+```text
+l4k3 MA/Laguerre, 98,304 atoms, 100 NPT steps:
+  directory = /work/phy-weigw/20260321_Test/GPUMD-SUS2-v1.1-work-codex/codex_bench/tensor_l4k3_98k_cache_profile_20260428/on_lk_static_20260428
+  speed = 2.28901e6 atom-step/s
+  basic ~= 0.98 ms
+  force ~= 2.10 ms
+
+Previous rank-block cache:
+  speed = 2.05907e6 atom-step/s
+  basic ~= 4.08 ms
+  force ~= 3.86 ms
+
+Original dynamic cache-off baseline:
+  speed = 1.50229e6 atom-step/s
+  basic ~= 6.92 ms
+  force ~= 18.76 ms
+```
+
+The `l3k3` forced-static check shows that the general `L=3,K=3` specialization has effectively caught the old exact path:
+
+```text
+exact l3k3:
+  speed = 1.67767e7 atom-step/s
+  basic ~= 9.97 ms
+  force ~= 20.50 ms
+
+forced L=3,K=3 static path:
+  directory = /work/phy-weigw/20260321_Test/GPUMD-SUS2-v1.1-work-codex/codex_bench/cuzr_l3k3_generic_vs_exact_1m_200step_20260428/l3_static_lk_20260428
+  speed = 1.67617e7 atom-step/s
+  basic ~= 9.97 ms
+  force ~= 20.60 ms
+```
+
+Takeaway: the model reader still discovers the layout automatically, but the runtime now lands on a compile-time `L,K` specialized path. This keeps the maintainability of automatic detection while recovering handwritten-path performance for the regular tensor families currently used in SUS2-SL.
