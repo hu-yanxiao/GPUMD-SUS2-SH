@@ -2887,12 +2887,12 @@ static __global__ void gpu_compute_forces(
     s_xx -= dEx * dx;
     s_yy -= dEy * dy;
     s_zz -= dEz * dz;
-    s_xy -= dEx * dy;
-    s_xz -= dEx * dz;
-    s_yz -= dEy * dz;
-    s_yx -= dEy * dx;
-    s_zx -= dEz * dx;
-    s_zy -= dEz * dy;
+    s_xy -= dx * dEy;
+    s_xz -= dx * dEz;
+    s_yz -= dy * dEz;
+    s_yx -= dy * dEx;
+    s_zx -= dz * dEx;
+    s_zy -= dz * dEy;
   }
 
   atomicAdd(force_tmp + i, static_cast<float>(fx_self));
@@ -2991,12 +2991,12 @@ static __global__ void gpu_compute_forces_l3k3_cached_grads(
     s_xx -= dEx * dx;
     s_yy -= dEy * dy;
     s_zz -= dEz * dz;
-    s_xy -= dEx * dy;
-    s_xz -= dEx * dz;
-    s_yz -= dEy * dz;
-    s_yx -= dEy * dx;
-    s_zx -= dEz * dx;
-    s_zy -= dEz * dy;
+    s_xy -= dx * dEy;
+    s_xz -= dx * dEz;
+    s_yz -= dy * dEz;
+    s_yx -= dy * dEx;
+    s_zx -= dz * dEx;
+    s_zy -= dz * dEy;
   }
 
   atomicAdd(force_tmp + i, static_cast<float>(fx_self));
@@ -3094,12 +3094,12 @@ static __global__ void gpu_compute_forces_tensor_cached_grads(
     s_xx -= dEx * dx;
     s_yy -= dEy * dy;
     s_zz -= dEz * dz;
-    s_xy -= dEx * dy;
-    s_xz -= dEx * dz;
-    s_yz -= dEy * dz;
-    s_yx -= dEy * dx;
-    s_zx -= dEz * dx;
-    s_zy -= dEz * dy;
+    s_xy -= dx * dEy;
+    s_xz -= dx * dEz;
+    s_yz -= dy * dEz;
+    s_yx -= dy * dEx;
+    s_zx -= dz * dEx;
+    s_zy -= dz * dEy;
   }
 
   atomicAdd(force_tmp + i, static_cast<float>(fx_self));
@@ -3200,12 +3200,12 @@ static __global__ void gpu_compute_forces_tensor_cached_grads_static(
     s_xx -= dEx * dx;
     s_yy -= dEy * dy;
     s_zz -= dEz * dz;
-    s_xy -= dEx * dy;
-    s_xz -= dEx * dz;
-    s_yz -= dEy * dz;
-    s_yx -= dEy * dx;
-    s_zx -= dEz * dx;
-    s_zy -= dEz * dy;
+    s_xy -= dx * dEy;
+    s_xz -= dx * dEz;
+    s_yz -= dy * dEz;
+    s_yx -= dy * dEx;
+    s_zx -= dz * dEx;
+    s_zy -= dz * dEy;
   }
 
   atomicAdd(force_tmp + i, static_cast<float>(fx_self));
@@ -3294,12 +3294,12 @@ static __global__ void gpu_compute_forces_pairwise_no_atomic(
     s_xx -= dFix * dx;
     s_yy -= dFiy * dy;
     s_zz -= dFiz * dz;
-    s_xy -= dFix * dy;
-    s_xz -= dFix * dz;
-    s_yz -= dFiy * dz;
-    s_yx -= dFiy * dx;
-    s_zx -= dFiz * dx;
-    s_zy -= dFiz * dy;
+    s_xy -= dx * dFiy;
+    s_xz -= dx * dFiz;
+    s_yz -= dy * dFiz;
+    s_yx -= dy * dFix;
+    s_zx -= dz * dFix;
+    s_zy -= dz * dFiy;
   }
 
   force_tmp[i] = static_cast<float>(fx);
