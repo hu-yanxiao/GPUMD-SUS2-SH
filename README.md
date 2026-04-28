@@ -117,6 +117,16 @@ On the tested l4k3 model, the first cache miss took about `158-160 s`; a later c
 
 The cache key is based on the product topology, not element identities or fitted coefficients. It includes `L`, `scaling_map`, `radial_funcs_count`, `alpha_index_basic`, compressed `alpha_index_times`, compressed `alpha_moment_mapping`, and active moment count.
 
+To identify whether a model can reuse an already preserved product graph:
+
+```bash
+tools/sus2_v11_codegen.py model.mtp \
+  --cache-dir codegen_cache/sus2_v11 \
+  --query-cache
+```
+
+The cache also maintains `registry.json`; use `--list-cache` to inspect saved graph entries.
+
 ## Validation Snapshot
 
 The experimental A100 build used:

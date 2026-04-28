@@ -1296,3 +1296,87 @@ forced L=3,K=3 static path:
 ```
 
 Takeaway: the model reader still discovers the layout automatically, but the runtime now lands on a compile-time `L,K` specialized path. This keeps the maintainability of automatic detection while recovering handwritten-path performance for the regular tensor families currently used in SUS2-SL.
+
+## Product-Graph Fingerprint And Registry Prototype
+
+Date: 2026-04-28
+
+The product graph must be preserved independently of fitted coefficients so later applications can check whether a model has an existing specialized graph core. The codegen tool now has three explicit cache/registry modes:
+
+```bash
+tools/sus2_v11_codegen.py model.mtp --fingerprint-only
+tools/sus2_v11_codegen.py model.mtp --cache-dir codegen_cache/sus2_v11 --query-cache
+tools/sus2_v11_codegen.py model.mtp --cache-dir codegen_cache/sus2_v11 --list-cache
+```
+
+The fingerprint key is the SHA256 of a canonical product-topology payload:
+
+```text
+included:
+  version
+  L
+  scaling_map
+  radial_funcs_count
+  alpha_index_basic
+  compressed alpha_index_times
+  compressed alpha_moment_mapping
+  compressed active moment count
+
+excluded:
+  species_count
+  element names
+  radial_basis_type
+  radial/scaling/shift/species/moment fitted coefficients
+```
+
+This means the graph core can be reused when the topology is the same even if the chemical elements, radial type, or fitted numeric coefficients differ. It will not be reused when the final scalar graph is different, even if both models are called `l3k3` or `l4k3`.
+
+`l3k3` Cu-Zr prototype:
+
+```text
+model = /work/phy-weigw/hyx/cu-zr/7.5/lmp/p.mtp
+cache_dir = /work/phy-weigw/20260321_Test/GPUMD-SUS2-v1.1-work-codex/codegen_cache/sus2_v11_l3k3_probe_20260428
+cache_key = 993c0ffd3b8d1d62e97d9a1b714fba487b0a0d153ca0e7a8f46f9a250bb167f0
+layout = l3k3 matched
+compressed alpha_times_count = 1291
+compressed alpha_moments_count = 514
+alpha_scalar_moments = 349
+```
+
+First compile preserved the graph:
+
+```text
+out_dir = /work/phy-weigw/20260321_Test/GPUMD-SUS2-v1.1-work-codex/codex_codegen/cuzr_l3k3_graph_cache_probe_20260428_first
+chunk_size = 512
+cache_hit = false
+compile_seconds = 10.51
+object_bytes = 488544
+```
+
+Second compile of the same model hit the preserved graph:
+
+```text
+out_dir = /work/phy-weigw/20260321_Test/GPUMD-SUS2-v1.1-work-codex/codex_codegen/cuzr_l3k3_graph_cache_probe_20260428_second
+cache_hit = true
+compile_seconds = 0.0
+usable_compiled_core = true
+```
+
+Reuse/miss checks:
+
+```text
+Synthetic Cu-Zr copy with changed species_count and radial_basis_type:
+  same cache_key as original = true
+  usable_compiled_core = true
+
+MA/Jacobi l3k3 model:
+  model = /work/phy-weigw/hyx/ma/l3k3/jacobi/benchmark_lmp/p1.1.mtp
+  layout = l3k3 matched
+  cache_key = a1e9a1d3bd1cff4c55dce0e1cb0d2b47789a189389ae27ef68af7502f3167a5c
+  same as Cu-Zr key = false
+  usable_compiled_core = false
+```
+
+The cache directory now keeps a `registry.json` index. For the Cu-Zr probe it contains one entry with the graph key, dimensions, compressed counts, object size, and original compile seconds. This is the piece future GPUMD runtime or build tooling should query before deciding whether to compile a new product graph core.
+
+Next technical step: connect a preserved graph core to runtime execution. The safest path is AOT/cached build integration first: detect the model fingerprint, locate `registry.json`, link or load the matching generated object/cubin if available, otherwise fall back to the current constant-table product graph. Runtime CUDA-driver module loading is possible, but should be added only after the AOT cache path is stable.

@@ -224,6 +224,58 @@ def cache_paths(cache_dir, digest):
     }
 
 
+def cache_status(cpaths):
+    return {
+        "entry_exists": cpaths["entry_dir"].exists(),
+        "has_source": cpaths["source"].exists(),
+        "has_object": cpaths["object"].exists(),
+        "has_metadata": cpaths["metadata"].exists(),
+        "usable_compiled_core": cpaths["source"].exists()
+        and cpaths["object"].exists()
+        and cpaths["metadata"].exists(),
+    }
+
+
+def registry_summary(metadata):
+    return {
+        "cache_key": metadata["cache_key"],
+        "cache_dir": metadata["cache_dir"],
+        "kernel_scope": metadata["kernel_scope"],
+        "version": metadata["version"],
+        "L": metadata["L"],
+        "radial_funcs_count": metadata["radial_funcs_count"],
+        "alpha_basic_count": metadata["alpha_basic_count"],
+        "alpha_times_count_compressed": metadata["alpha_times_count_compressed"],
+        "alpha_moments_count_compressed": metadata["alpha_moments_count_compressed"],
+        "alpha_scalar_moments": metadata["alpha_scalar_moments"],
+        "lk_basic_layout": metadata["lk_basic_layout"],
+        "codegen_chunk_size": metadata["codegen_chunk_size"],
+        "object_bytes": metadata.get("object_bytes"),
+        "compile_seconds": metadata.get("cached_compile_seconds", metadata.get("compile_seconds")),
+        "last_model": metadata["model"],
+    }
+
+
+def update_registry(cache_dir, digest, metadata):
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    registry_path = cache_dir / "registry.json"
+    registry = {
+        "schema": "sus2_v11_product_graph_registry_v1",
+        "entries": {},
+    }
+    if registry_path.exists():
+        try:
+            registry = json.loads(registry_path.read_text())
+        except json.JSONDecodeError:
+            registry["entries"] = {}
+    registry.setdefault("schema", "sus2_v11_product_graph_registry_v1")
+    registry.setdefault("entries", {})
+    registry["entries"][digest] = registry_summary(metadata)
+    tmp_path = registry_path.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(registry, indent=2, sort_keys=True) + "\n")
+    tmp_path.replace(registry_path)
+
+
 def format_forward_rule(src0, src1, mult, dst):
     return (
         "  moments[(size_t){dst} * N + i] += {mult}.0 * "
@@ -377,7 +429,7 @@ def compile_cuda(source_path, out_path, nvcc, arch, progress_interval):
 def main(argv):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("model", type=pathlib.Path)
-    parser.add_argument("--out-dir", type=pathlib.Path, required=True)
+    parser.add_argument("--out-dir", type=pathlib.Path)
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--nvcc", default="nvcc")
     parser.add_argument("--arch", default="sm_80")
@@ -404,29 +456,57 @@ def main(argv):
         default=0,
         help="Emit noinline device chunks with this many product rules per chunk. Default 0 emits one fully unrolled kernel.",
     )
+    parser.add_argument(
+        "--fingerprint-only",
+        action="store_true",
+        help="Print the topology fingerprint metadata and exit without emitting source.",
+    )
+    parser.add_argument(
+        "--query-cache",
+        action="store_true",
+        help="Print whether the topology fingerprint already has a compiled cache entry and exit.",
+    )
+    parser.add_argument(
+        "--list-cache",
+        action="store_true",
+        help="Print the cache registry for the selected cache directory and exit.",
+    )
     args = parser.parse_args(argv)
 
     topo = load_topology(args.model)
     times, mapping, active_count = compress_active_dag(topo)
     digest = topology_hash(topo, times, mapping, active_count)
     layout = detect_lk_basic_layout(topo)
-    args.out_dir.mkdir(parents=True, exist_ok=True)
-
-    source_path = args.out_dir / f"sus2_v11_topo_{digest[:16]}.cu"
-    object_path = args.out_dir / f"sus2_v11_topo_{digest[:16]}.o"
-    meta_path = args.out_dir / f"sus2_v11_topo_{digest[:16]}.json"
     cache_dir = args.cache_dir
     if cache_dir is None:
         env_cache = os.environ.get("SUS2_CODEGEN_CACHE_DIR")
         cache_dir = pathlib.Path(env_cache) if env_cache else pathlib.Path("codegen_cache/sus2_v11")
     cpaths = cache_paths(cache_dir, digest)
+    if args.list_cache:
+        registry_path = cache_dir / "registry.json"
+        if registry_path.exists():
+            print(registry_path.read_text(), end="")
+        else:
+            print(json.dumps({"schema": "sus2_v11_product_graph_registry_v1", "entries": {}}, indent=2))
+        return 0
+
+    if args.out_dir is None:
+        if args.compile:
+            parser.error("--compile requires --out-dir")
+        args.out_dir = pathlib.Path(".")
+
+    source_path = args.out_dir / f"sus2_v11_topo_{digest[:16]}.cu"
+    object_path = args.out_dir / f"sus2_v11_topo_{digest[:16]}.o"
+    meta_path = args.out_dir / f"sus2_v11_topo_{digest[:16]}.json"
 
     metadata = {
         "model": str(topo.model_path),
         "hash": digest,
         "cache_key": digest,
         "cache_dir": str(cpaths["entry_dir"]),
+        "cache_schema": "sus2_v11_product_graph_v1",
         "cache_hit": False,
+        "kernel_scope": "alpha_basic_times_scalar_mapping",
         "source": str(source_path),
         "object": str(object_path),
         "version": topo.version,
@@ -444,7 +524,43 @@ def main(argv):
         "lk_basic_layout": layout,
         "codegen_chunk_size": args.chunk_size,
         "expected_compile_seconds_when_cache_miss": 160,
+        "reuse_policy": {
+            "included_in_key": [
+                "version",
+                "L",
+                "scaling_map",
+                "radial_funcs_count",
+                "alpha_index_basic",
+                "compressed_alpha_index_times",
+                "compressed_alpha_moment_mapping",
+                "compressed_active_moment_count",
+            ],
+            "excluded_from_key": [
+                "species_count",
+                "element_names",
+                "radial_basis_type",
+                "radial_coeffs",
+                "scal_coeffs",
+                "shift_coeffs",
+                "species_coeffs",
+                "moment_coeffs",
+            ],
+        },
     }
+    metadata["cache_status"] = cache_status(cpaths)
+
+    if args.fingerprint_only or args.query_cache:
+        if cpaths["metadata"].exists():
+            try:
+                cached_metadata = json.loads(cpaths["metadata"].read_text())
+                metadata["cached_compile_seconds"] = cached_metadata.get("compile_seconds")
+                metadata["cached_object_bytes"] = cached_metadata.get("object_bytes")
+            except json.JSONDecodeError:
+                metadata["cached_metadata_error"] = "invalid JSON"
+        print(json.dumps(metadata, indent=2, sort_keys=True))
+        return 0
+
+    args.out_dir.mkdir(parents=True, exist_ok=True)
 
     source_text = None
     if args.compile:
@@ -468,6 +584,8 @@ def main(argv):
             metadata["compile_seconds"] = 0.0
             metadata["cuda_source_bytes"] = source_path.stat().st_size
             metadata["object_bytes"] = object_path.stat().st_size
+            metadata["cache_status"] = cache_status(cpaths)
+            update_registry(cache_dir, digest, metadata)
         else:
             print(
                 "[sus2-codegen] cache miss: building topology core; expected compile time is about 160 s.",
@@ -499,6 +617,8 @@ def main(argv):
             )
             try_link_or_copy(cpaths["source"], source_path)
             try_link_or_copy(cpaths["object"], object_path)
+            metadata["cache_status"] = cache_status(cpaths)
+            update_registry(cache_dir, digest, metadata)
     else:
         source_text = emit_cuda_source(topo, times, digest, args.chunk_size)
         source_path.write_text(source_text)
