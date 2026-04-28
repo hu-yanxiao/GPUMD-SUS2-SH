@@ -242,6 +242,39 @@ stress_max_abs_GPa = 4.2829999991056411e-07
 
 The stress agreement is at numerical-noise level, so the sign/order convention for virial stress is consistent with the LAMMPS SUS2 reference for this case.
 
+## Atomic Virial Orientation
+
+Update date: 2026-04-29
+
+The SUS2-GPUMD atomic virial non-diagonal terms are aligned with the native NEP
+ordered-pair convention:
+
+```text
+W_xy += -r_x * g_y
+W_xz += -r_x * g_z
+W_yx += -r_y * g_x
+...
+```
+
+where `g = dE_i / dr_ij` for the center-site energy contribution. This keeps
+the 9-component storage order unchanged:
+
+```text
+xx yy zz xy xz yz yx zx zy
+```
+
+The change only fixes the orientation of the unsymmetrized per-atom virial
+tensor so that SUS2 follows NEP's internal convention. Energies, forces, and the
+physical symmetric stress are unchanged. The MA/Jacobi static virial parity was
+rechecked after this update:
+
+```text
+energy_diff_eV = 0.0
+stress_mae_GPa = 5.07e-07
+stress_rmse_GPa = 6.50e-07
+stress_max_abs_GPa = 1.24e-06
+```
+
 ## 98k Atom NPT Performance Smoke
 
 Benchmark directory:
