@@ -12,7 +12,7 @@ This repository is an overlay on top of upstream GPUMD, not a full GPUMD fork. I
 - Default LUT spacing: `dr = 1.0e-4 A`, matching the LAMMPS table convention
 - Runtime LUT controls: `sus2_lut_dr=...`, `sus2_lut_span=...`, `SUS2_GPUMD_LUT_DR`, `SUS2_GPUMD_LUT_SPAN`
 - Optional memory-saving reverse-gradient workspace: `sus2_grad_float=1` or `SUS2_GPUMD_GRAD_FLOAT=1`
-- Optimized tensor path: automatic for standard `lLkK` `alpha_index_basic` layouts up to `l4k4`
+- Optimized tensor path: automatic for standard `lLkK` `alpha_index_basic` layouts up to `l4k4`, using programmatic rank-block tensor contractions
 - Experimental product-graph controls: `sus2_fused_graph=...`, `sus2_local_product_graph=...`
 - Supported radial basis types:
   - `RBJacobi_sss`, `RBJacobi_sss_lmp`
@@ -136,7 +136,7 @@ l4k3 codegen cache miss: 158.16 s
 l4k3 codegen cache hit: 0.19 s
 l3k3 98k grad-float test: 4.357e6 -> 5.195e6 atom-step/s, GPU process memory 4124 -> 3366 MiB
 Cu-Zr l3k3 1.024M sus2_float opt pass: 1.24453e7 -> 1.69611e7 atom-step/s, GPU process memory about 9.6 GiB
-MA l4k3 98k tensor cache test: 1.50229e6 -> 1.75504e6 atom-step/s
+MA l4k3 98k tensor rank-block cache test: 1.50229e6 -> 2.05907e6 atom-step/s
 ```
 
 More detailed notes are in [docs/sus2-gpumd-v1.1-porting-notes.md](docs/sus2-gpumd-v1.1-porting-notes.md).

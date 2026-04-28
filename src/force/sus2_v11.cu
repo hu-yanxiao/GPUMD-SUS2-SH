@@ -1598,60 +1598,152 @@ __device__ __forceinline__ void compute_sus2_edge_derivative_tensor_cached(
   RealT mu_der[32];
   interp_radial_vals_ders(model, pair, r, mu_val, mu_der);
 
-  RealT x_pow[kSus2MaxTensorRank + 1];
-  RealT y_pow[kSus2MaxTensorRank + 1];
-  RealT z_pow[kSus2MaxTensorRank + 1];
-  RealT inv_r_pow[kSus2MaxTensorRank + 1];
-  x_pow[0] = static_cast<RealT>(1.0);
-  y_pow[0] = static_cast<RealT>(1.0);
-  z_pow[0] = static_cast<RealT>(1.0);
-  inv_r_pow[0] = static_cast<RealT>(1.0);
   const RealT inv_r = static_cast<RealT>(1.0) / r;
-  for (int rank = 1; rank <= model.tensor_l; ++rank) {
-    x_pow[rank] = x_pow[rank - 1] * dx;
-    y_pow[rank] = y_pow[rank - 1] * dy;
-    z_pow[rank] = z_pow[rank - 1] * dz;
-    inv_r_pow[rank] = inv_r_pow[rank - 1] * inv_r;
-  }
+  const RealT inv_r2 = inv_r * inv_r;
+  const RealT inv_r3 = inv_r2 * inv_r;
+  const RealT inv_r4 = inv_r2 * inv_r2;
+  const RealT x2 = dx * dx;
+  const RealT y2 = dy * dy;
+  const RealT z2 = dz * dz;
+  const RealT xy = dx * dy;
+  const RealT xz = dx * dz;
+  const RealT yz = dy * dz;
 
   dEx = static_cast<RealT>(0.0);
   dEy = static_cast<RealT>(0.0);
   dEz = static_cast<RealT>(0.0);
 
   for (int group = 0; group < model.tensor_k; ++group) {
-    int basic = group * model.tensor_basic_per_group;
+    const int base = group * model.tensor_basic_per_group;
     const int mu_base = group * (model.tensor_l + 1);
-    for (int rank = 0; rank <= model.tensor_l; ++rank) {
-      const int mu = mu_base + rank;
-      const RealT inv_dist_pow = mu_val[mu] * inv_r_pow[rank];
-      const RealT radial_der_over_r =
-        (mu_der[mu] * inv_r_pow[rank] -
-         static_cast<RealT>(rank) * inv_dist_pow * inv_r) *
-        inv_r;
 
-      for (int a = rank; a >= 0; --a) {
-        for (int b = rank - a; b >= 0; --b) {
-          const int c = rank - a - b;
-          const RealT geom = x_pow[a] * y_pow[b] * z_pow[c];
-          RealT jac_x = geom * radial_der_over_r * dx;
-          RealT jac_y = geom * radial_der_over_r * dy;
-          RealT jac_z = geom * radial_der_over_r * dz;
-          if (a != 0) {
-            jac_x += inv_dist_pow * static_cast<RealT>(a) * x_pow[a - 1] * y_pow[b] * z_pow[c];
-          }
-          if (b != 0) {
-            jac_y += inv_dist_pow * static_cast<RealT>(b) * x_pow[a] * y_pow[b - 1] * z_pow[c];
-          }
-          if (c != 0) {
-            jac_z += inv_dist_pow * static_cast<RealT>(c) * x_pow[a] * y_pow[b] * z_pow[c - 1];
-          }
-          const RealT basic_grad = basic_grads[basic];
-          dEx += basic_grad * jac_x;
-          dEy += basic_grad * jac_y;
-          dEz += basic_grad * jac_z;
-          ++basic;
-        }
-      }
+    const RealT rc0 = mu_der[mu_base + 0] * inv_r;
+    const RealT c0 = basic_grads[base + 0] * rc0;
+    dEx += c0 * dx;
+    dEy += c0 * dy;
+    dEz += c0 * dz;
+
+    if (model.tensor_l >= 1) {
+      const RealT inv1 = mu_val[mu_base + 1] * inv_r;
+      const RealT rc1 = (mu_der[mu_base + 1] * inv_r - inv1 * inv_r) * inv_r;
+      const RealT g1x = basic_grads[base + 1];
+      const RealT g1y = basic_grads[base + 2];
+      const RealT g1z = basic_grads[base + 3];
+      const RealT p1 = g1x * dx + g1y * dy + g1z * dz;
+      const RealT c1 = rc1 * p1;
+      dEx += c1 * dx + inv1 * g1x;
+      dEy += c1 * dy + inv1 * g1y;
+      dEz += c1 * dz + inv1 * g1z;
+    }
+
+    if (model.tensor_l >= 2) {
+      const RealT inv2 = mu_val[mu_base + 2] * inv_r2;
+      const RealT rc2 =
+        (mu_der[mu_base + 2] * inv_r2 - static_cast<RealT>(2.0) * inv2 * inv_r) * inv_r;
+      const RealT g2xx = basic_grads[base + 4];
+      const RealT g2xy = basic_grads[base + 5];
+      const RealT g2xz = basic_grads[base + 6];
+      const RealT g2yy = basic_grads[base + 7];
+      const RealT g2yz = basic_grads[base + 8];
+      const RealT g2zz = basic_grads[base + 9];
+      const RealT p2 =
+        g2xx * x2 + g2xy * xy + g2xz * xz + g2yy * y2 + g2yz * yz + g2zz * z2;
+      const RealT p2x = static_cast<RealT>(2.0) * g2xx * dx + g2xy * dy + g2xz * dz;
+      const RealT p2y = g2xy * dx + static_cast<RealT>(2.0) * g2yy * dy + g2yz * dz;
+      const RealT p2z = g2xz * dx + g2yz * dy + static_cast<RealT>(2.0) * g2zz * dz;
+      const RealT c2 = rc2 * p2;
+      dEx += c2 * dx + inv2 * p2x;
+      dEy += c2 * dy + inv2 * p2y;
+      dEz += c2 * dz + inv2 * p2z;
+    }
+
+    if (model.tensor_l >= 3) {
+      const RealT inv3 = mu_val[mu_base + 3] * inv_r3;
+      const RealT rc3 =
+        (mu_der[mu_base + 3] * inv_r3 - static_cast<RealT>(3.0) * inv3 * inv_r) * inv_r;
+      const RealT g3xxx = basic_grads[base + 10];
+      const RealT g3xxy = basic_grads[base + 11];
+      const RealT g3xxz = basic_grads[base + 12];
+      const RealT g3xyy = basic_grads[base + 13];
+      const RealT g3xyz = basic_grads[base + 14];
+      const RealT g3xzz = basic_grads[base + 15];
+      const RealT g3yyy = basic_grads[base + 16];
+      const RealT g3yyz = basic_grads[base + 17];
+      const RealT g3yzz = basic_grads[base + 18];
+      const RealT g3zzz = basic_grads[base + 19];
+      const RealT p3 =
+        g3xxx * x2 * dx + g3xxy * x2 * dy + g3xxz * x2 * dz + g3xyy * dx * y2 +
+        g3xyz * xy * dz + g3xzz * dx * z2 + g3yyy * y2 * dy + g3yyz * y2 * dz +
+        g3yzz * dy * z2 + g3zzz * z2 * dz;
+      const RealT p3x =
+        static_cast<RealT>(3.0) * g3xxx * x2 + static_cast<RealT>(2.0) * g3xxy * xy +
+        static_cast<RealT>(2.0) * g3xxz * xz + g3xyy * y2 + g3xyz * yz + g3xzz * z2;
+      const RealT p3y =
+        g3xxy * x2 + static_cast<RealT>(2.0) * g3xyy * xy + g3xyz * xz +
+        static_cast<RealT>(3.0) * g3yyy * y2 + static_cast<RealT>(2.0) * g3yyz * yz +
+        g3yzz * z2;
+      const RealT p3z =
+        g3xxz * x2 + g3xyz * xy + static_cast<RealT>(2.0) * g3xzz * xz + g3yyz * y2 +
+        static_cast<RealT>(2.0) * g3yzz * yz + static_cast<RealT>(3.0) * g3zzz * z2;
+      const RealT c3 = rc3 * p3;
+      dEx += c3 * dx + inv3 * p3x;
+      dEy += c3 * dy + inv3 * p3y;
+      dEz += c3 * dz + inv3 * p3z;
+    }
+
+    if (model.tensor_l >= 4) {
+      const RealT inv4 = mu_val[mu_base + 4] * inv_r4;
+      const RealT rc4 =
+        (mu_der[mu_base + 4] * inv_r4 - static_cast<RealT>(4.0) * inv4 * inv_r) * inv_r;
+      const RealT g4xxxx = basic_grads[base + 20];
+      const RealT g4xxxy = basic_grads[base + 21];
+      const RealT g4xxxz = basic_grads[base + 22];
+      const RealT g4xxyy = basic_grads[base + 23];
+      const RealT g4xxyz = basic_grads[base + 24];
+      const RealT g4xxzz = basic_grads[base + 25];
+      const RealT g4xyyy = basic_grads[base + 26];
+      const RealT g4xyyz = basic_grads[base + 27];
+      const RealT g4xyzz = basic_grads[base + 28];
+      const RealT g4xzzz = basic_grads[base + 29];
+      const RealT g4yyyy = basic_grads[base + 30];
+      const RealT g4yyyz = basic_grads[base + 31];
+      const RealT g4yyzz = basic_grads[base + 32];
+      const RealT g4yzzz = basic_grads[base + 33];
+      const RealT g4zzzz = basic_grads[base + 34];
+      const RealT p4 =
+        g4xxxx * x2 * x2 + g4xxxy * x2 * dx * dy + g4xxxz * x2 * dx * dz +
+        g4xxyy * x2 * y2 + g4xxyz * x2 * yz + g4xxzz * x2 * z2 +
+        g4xyyy * dx * y2 * dy + g4xyyz * dx * y2 * dz + g4xyzz * dx * dy * z2 +
+        g4xzzz * dx * z2 * dz + g4yyyy * y2 * y2 + g4yyyz * y2 * dy * dz +
+        g4yyzz * y2 * z2 + g4yzzz * dy * z2 * dz + g4zzzz * z2 * z2;
+      const RealT p4x =
+        static_cast<RealT>(4.0) * g4xxxx * x2 * dx +
+        static_cast<RealT>(3.0) * g4xxxy * x2 * dy +
+        static_cast<RealT>(3.0) * g4xxxz * x2 * dz +
+        static_cast<RealT>(2.0) * g4xxyy * dx * y2 +
+        static_cast<RealT>(2.0) * g4xxyz * dx * yz +
+        static_cast<RealT>(2.0) * g4xxzz * dx * z2 +
+        g4xyyy * y2 * dy + g4xyyz * y2 * dz + g4xyzz * dy * z2 +
+        g4xzzz * z2 * dz;
+      const RealT p4y =
+        g4xxxy * x2 * dx + static_cast<RealT>(2.0) * g4xxyy * x2 * dy +
+        g4xxyz * x2 * dz + static_cast<RealT>(3.0) * g4xyyy * dx * y2 +
+        static_cast<RealT>(2.0) * g4xyyz * dx * yz + g4xyzz * dx * z2 +
+        static_cast<RealT>(4.0) * g4yyyy * y2 * dy +
+        static_cast<RealT>(3.0) * g4yyyz * y2 * dz +
+        static_cast<RealT>(2.0) * g4yyzz * dy * z2 + g4yzzz * z2 * dz;
+      const RealT p4z =
+        g4xxxz * x2 * dx + g4xxyz * x2 * dy +
+        static_cast<RealT>(2.0) * g4xxzz * x2 * dz + g4xyyz * dx * y2 +
+        static_cast<RealT>(2.0) * g4xyzz * dx * yz +
+        static_cast<RealT>(3.0) * g4xzzz * dx * z2 + g4yyyz * y2 * dy +
+        static_cast<RealT>(2.0) * g4yyzz * y2 * dz +
+        static_cast<RealT>(3.0) * g4yzzz * dy * z2 +
+        static_cast<RealT>(4.0) * g4zzzz * z2 * dz;
+      const RealT c4 = rc4 * p4;
+      dEx += c4 * dx + inv4 * p4x;
+      dEy += c4 * dy + inv4 * p4y;
+      dEz += c4 * dz + inv4 * p4z;
     }
   }
 }
@@ -1958,34 +2050,70 @@ static __global__ void gpu_compute_basic_moments_tensor_accum(
     RealT mu_val[32];
     interp_radial_vals_ders(model, pair, r, mu_val, static_cast<RealT*>(nullptr));
 
-    RealT x_pow[kSus2MaxTensorRank + 1];
-    RealT y_pow[kSus2MaxTensorRank + 1];
-    RealT z_pow[kSus2MaxTensorRank + 1];
-    RealT inv_r_pow[kSus2MaxTensorRank + 1];
-    x_pow[0] = static_cast<RealT>(1.0);
-    y_pow[0] = static_cast<RealT>(1.0);
-    z_pow[0] = static_cast<RealT>(1.0);
-    inv_r_pow[0] = static_cast<RealT>(1.0);
     const RealT inv_r = static_cast<RealT>(1.0) / r;
-    for (int rank = 1; rank <= model.tensor_l; ++rank) {
-      x_pow[rank] = x_pow[rank - 1] * dx;
-      y_pow[rank] = y_pow[rank - 1] * dy;
-      z_pow[rank] = z_pow[rank - 1] * dz;
-      inv_r_pow[rank] = inv_r_pow[rank - 1] * inv_r;
-    }
+    const RealT inv_r2 = inv_r * inv_r;
+    const RealT inv_r3 = inv_r2 * inv_r;
+    const RealT inv_r4 = inv_r2 * inv_r2;
+    const RealT x2 = dx * dx;
+    const RealT y2 = dy * dy;
+    const RealT z2 = dz * dz;
+    const RealT xy = dx * dy;
+    const RealT xz = dx * dz;
+    const RealT yz = dy * dz;
 
     for (int group = 0; group < model.tensor_k; ++group) {
-      int basic = group * model.tensor_basic_per_group;
+      const int base = group * model.tensor_basic_per_group;
       const int mu_base = group * (model.tensor_l + 1);
-      for (int rank = 0; rank <= model.tensor_l; ++rank) {
-        const RealT radial = mu_val[mu_base + rank] * inv_r_pow[rank];
-        for (int a = rank; a >= 0; --a) {
-          for (int b = rank - a; b >= 0; --b) {
-            const int c = rank - a - b;
-            acc[basic] += radial * x_pow[a] * y_pow[b] * z_pow[c];
-            ++basic;
-          }
-        }
+      acc[base + 0] += mu_val[mu_base + 0];
+
+      if (model.tensor_l >= 1) {
+        const RealT s1 = mu_val[mu_base + 1] * inv_r;
+        acc[base + 1] += s1 * dx;
+        acc[base + 2] += s1 * dy;
+        acc[base + 3] += s1 * dz;
+      }
+
+      if (model.tensor_l >= 2) {
+        const RealT s2 = mu_val[mu_base + 2] * inv_r2;
+        acc[base + 4] += s2 * x2;
+        acc[base + 5] += s2 * xy;
+        acc[base + 6] += s2 * xz;
+        acc[base + 7] += s2 * y2;
+        acc[base + 8] += s2 * yz;
+        acc[base + 9] += s2 * z2;
+      }
+
+      if (model.tensor_l >= 3) {
+        const RealT s3 = mu_val[mu_base + 3] * inv_r3;
+        acc[base + 10] += s3 * x2 * dx;
+        acc[base + 11] += s3 * x2 * dy;
+        acc[base + 12] += s3 * x2 * dz;
+        acc[base + 13] += s3 * dx * y2;
+        acc[base + 14] += s3 * xy * dz;
+        acc[base + 15] += s3 * dx * z2;
+        acc[base + 16] += s3 * y2 * dy;
+        acc[base + 17] += s3 * y2 * dz;
+        acc[base + 18] += s3 * dy * z2;
+        acc[base + 19] += s3 * z2 * dz;
+      }
+
+      if (model.tensor_l >= 4) {
+        const RealT s4 = mu_val[mu_base + 4] * inv_r4;
+        acc[base + 20] += s4 * x2 * x2;
+        acc[base + 21] += s4 * x2 * dx * dy;
+        acc[base + 22] += s4 * x2 * dx * dz;
+        acc[base + 23] += s4 * x2 * y2;
+        acc[base + 24] += s4 * x2 * yz;
+        acc[base + 25] += s4 * x2 * z2;
+        acc[base + 26] += s4 * dx * y2 * dy;
+        acc[base + 27] += s4 * dx * y2 * dz;
+        acc[base + 28] += s4 * dx * dy * z2;
+        acc[base + 29] += s4 * dx * z2 * dz;
+        acc[base + 30] += s4 * y2 * y2;
+        acc[base + 31] += s4 * y2 * dy * dz;
+        acc[base + 32] += s4 * y2 * z2;
+        acc[base + 33] += s4 * dy * z2 * dz;
+        acc[base + 34] += s4 * z2 * z2;
       }
     }
   }

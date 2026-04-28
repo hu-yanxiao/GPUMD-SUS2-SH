@@ -1081,7 +1081,7 @@ g_{i,p} = dE_i / dB_{i,p}
 dE_i/dr_ij = sum_p g_{i,p} * d phi_p(r_ij)/dr_ij
 ```
 
-The optimization is only that `g_{i,p}` is loaded once per center atom and reused across all neighbors. Exact `l3k3` still uses the earlier hand-aggregated rank-0/1/2/3 implementation. Other standard tensor layouts, including `l2k3`, `l4k3`, and `l4k4`, use the generic cached tensor derivative path.
+The first version of this optimization only loaded `g_{i,p}` once per center atom and reused it across all neighbors. Exact `l3k3` used the earlier hand-aggregated rank-0/1/2/3 implementation, while other standard tensor layouts used a generic cached tensor derivative path.
 
 Runtime controls:
 
@@ -1134,4 +1134,82 @@ speedup = 1.17x
 
 Interpretation:
 
-The generic path gives non-`l3k3` tensor models the same center-gradient reuse benefit while preserving the exact formula. The current generic `l4` implementation is intentionally conservative; future model-specific code generation can specialize the rank-4 polynomial contraction more aggressively, but this pass establishes the correct and guarded general path up to the current expected maximum `l4k4`.
+This pass established the correct and guarded general path up to the current expected maximum `l4k4`, but the first generic `l4` implementation still spent too much time in rank/exponent loops.
+
+## Programmatic Rank-Block Tensor Path Up To l4k4
+
+Date: 2026-04-28
+
+The standard `lLkK` layouts are regular enough that they do not need separate handwritten kernels for every `L,K` combination. For each `k` group, the basic moments are ordered as rank blocks:
+
+```text
+rank 0: 1
+rank 1: x, y, z
+rank 2: xx, xy, xz, yy, yz, zz
+rank 3: xxx, xxy, xxz, xyy, xyz, xzz, yyy, yyz, yzz, zzz
+rank 4: xxxx, xxxy, xxxz, xxyy, xxyz, xxzz, xyyy, xyyz, xyzz, xzzz, yyyy, yyyz, yyzz, yzzz, zzzz
+```
+
+The implementation now detects the same standard `alpha_index_basic` layout and evaluates both directions with fixed rank blocks:
+
+```text
+basic accumulation:
+  B_i += s_rank(r_ij) * CartesianMonomial_rank(dx, dy, dz)
+
+force contraction:
+  dE_i/dr_ij =
+    radial_derivative_part * P_rank(dx, dy, dz)
+    + radial_value_part * grad_xyz P_rank(dx, dy, dz)
+```
+
+Here `P_rank` is the gradient-weighted polynomial for one rank block. This keeps the SUS2 mathematical expression unchanged; it only replaces the inner `(rank,a,b,c)` interpreter loops with a compact programmatic expansion shared by `l2k*`, `l3k*`, and `l4k*` layouts. The exact old `l3k3` path remains enabled for the known fastest Cu-Zr/MA case, but the non-exact tensor path is now also "hand-like" rather than fully generic.
+
+Correctness checks after rank-block contraction, using cache on/off parity:
+
+```text
+directory = /work/phy-weigw/20260321_Test/GPUMD-SUS2-v1.1-work-codex/codex_smoke/tensor_l4k4_cache_parity_20260428
+
+l3k3 Cu-Zr:
+  force_mae = 3.9370e-7 eV/A
+  force_rmse = 5.2757e-7 eV/A
+  force_max = 2.5481e-6 eV/A
+  thermo_max = 4.2898e-5
+
+l4k3 MA/Laguerre:
+  force_mae = 1.0801e-6 eV/A
+  force_rmse = 1.8777e-6 eV/A
+  force_max = 1.5453e-5 eV/A
+  thermo_max = 4.6116e-5
+
+l4k4 drug/Chebyshev:
+  force_mae = 1.1563e-6 eV/A
+  force_rmse = 1.6118e-6 eV/A
+  force_max = 5.8413e-6 eV/A
+  thermo_max = 5.4511e-7
+```
+
+Performance check on the same 98,304-atom `l4k3` MA/Laguerre case, 100 NPT steps:
+
+```text
+directory = /work/phy-weigw/20260321_Test/GPUMD-SUS2-v1.1-work-codex/codex_bench/tensor_l4k3_98k_cache_profile_20260428/on_rankblock_20260428
+
+old cache off:
+  speed = 1.50229e6 atom-step/s
+  basic ~= 6.92 ms
+  force ~= 18.76 ms
+
+old cache on:
+  speed = 1.75504e6 atom-step/s
+  basic ~= 6.91 ms
+  force ~= 9.07 ms
+
+rank-block cache on:
+  speed = 2.05907e6 atom-step/s
+  basic ~= 4.08 ms
+  force ~= 3.86 ms
+
+speedup vs old cache on = 1.17x
+speedup vs cache off = 1.37x
+```
+
+Takeaway: the useful pattern is not to maintain many handwritten `l2k3`, `l3k4`, `l4k4` branches. The robust version is to detect the regular tensor layout, then use one rank-block implementation covering the supported `L <= 4`, `K <= 4` family.
