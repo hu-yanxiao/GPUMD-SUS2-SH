@@ -38,6 +38,12 @@ tools/sus2_v11_codegen.py
 
 See [INSTALL.md](INSTALL.md).
 
+## Cluster Usage
+
+For the maintained server paths, A100 runtime modules, GPUMD `run.in` syntax,
+SUS2 precision modes, radial lookup-table controls, and LSF job template, see
+[docs/sus2-gpumd-usage.md](docs/sus2-gpumd-usage.md).
+
 ## Example GPUMD `run.in`
 
 ```text
