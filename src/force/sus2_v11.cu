@@ -94,6 +94,8 @@ struct SUS2HostModel {
 
 struct SUS2DeviceModel {
   int species_count;
+  int angular_channels;
+  int radial_basis_kind;
   int radial_funcs_count;
   int alpha_basic_count;
   int alpha_times_count;
@@ -891,7 +893,7 @@ void build_lut(const SUS2HostModel& model, int lut_size, double lut_inv_dr, std:
   }
 }
 
-void build_direct_chebyshev_tables(
+void build_direct_radial_tables(
   const SUS2HostModel& model,
   std::vector<float>& coeffs,
   std::vector<float>& scal_s)
@@ -1031,8 +1033,8 @@ bool parse_radial_direct(
     }
   }
 
-  if (use_direct && model.radial_basis_kind != RadialBasisKind::ChebyshevSSS) {
-    sus2_input_error("SUS2 GPUMD radial_direct currently supports only RBChebyshev_sss[_lmp].");
+  if (use_direct && model.rb_size > 16) {
+    sus2_input_error("SUS2 GPUMD radial_direct currently supports radial_basis_size <= 16.");
   }
   return use_direct;
 }
@@ -1312,7 +1314,133 @@ __device__ __forceinline__ int sus2_scalar_moment_id(const SUS2DeviceModel& mode
 }
 
 template <typename RealT>
-__device__ __forceinline__ void direct_chebyshev_vals_ders(
+__device__ __forceinline__ RealT sus2_device_softplus(RealT x)
+{
+  if (x > static_cast<RealT>(40.0)) {
+    return x;
+  }
+  if (x < static_cast<RealT>(-40.0)) {
+    return exp(x);
+  }
+  return log1p(exp(x));
+}
+
+template <typename RealT>
+__device__ __forceinline__ void jacobi_spec_device(
+  int block,
+  int& alpha,
+  int& beta,
+  RealT& linear_const,
+  RealT& linear_x)
+{
+  switch (block) {
+    case 0:
+      alpha = 0;
+      beta = 0;
+      linear_const = static_cast<RealT>(0.0);
+      linear_x = static_cast<RealT>(1.0);
+      break;
+    case 1:
+      alpha = 1;
+      beta = 0;
+      linear_const = static_cast<RealT>(0.5);
+      linear_x = static_cast<RealT>(1.5);
+      break;
+    case 2:
+      alpha = 1;
+      beta = 1;
+      linear_const = static_cast<RealT>(0.0);
+      linear_x = static_cast<RealT>(2.0);
+      break;
+    case 3:
+      alpha = 2;
+      beta = 0;
+      linear_const = static_cast<RealT>(1.0);
+      linear_x = static_cast<RealT>(2.0);
+      break;
+    case 4:
+      alpha = 2;
+      beta = 1;
+      linear_const = static_cast<RealT>(0.5);
+      linear_x = static_cast<RealT>(2.5);
+      break;
+    default:
+      alpha = 2;
+      beta = 2;
+      linear_const = static_cast<RealT>(0.0);
+      linear_x = static_cast<RealT>(3.0);
+      break;
+  }
+}
+
+template <typename RealT>
+__device__ __forceinline__ void jacobi_weight_terms_device(
+  int alpha,
+  int beta,
+  RealT x,
+  RealT& sqrt_weight,
+  RealT& log_weight_x)
+{
+  constexpr double kEpsDouble = 1.0e-12;
+  const RealT eps = static_cast<RealT>(kEpsDouble);
+  const RealT one_minus_x_raw = static_cast<RealT>(1.0) - x;
+  const RealT one_plus_x_raw = static_cast<RealT>(1.0) + x;
+  const RealT one_minus_x = one_minus_x_raw > eps ? one_minus_x_raw : eps;
+  const RealT one_plus_x = one_plus_x_raw > eps ? one_plus_x_raw : eps;
+
+  sqrt_weight = static_cast<RealT>(1.0);
+  log_weight_x = static_cast<RealT>(0.0);
+  if (alpha == 1) {
+    sqrt_weight *= sqrt(one_minus_x);
+  } else if (alpha == 2) {
+    sqrt_weight *= one_minus_x;
+  }
+  if (beta == 1) {
+    sqrt_weight *= sqrt(one_plus_x);
+  } else if (beta == 2) {
+    sqrt_weight *= one_plus_x;
+  }
+  if (alpha != 0) {
+    log_weight_x -= static_cast<RealT>(0.5 * alpha) / one_minus_x;
+  }
+  if (beta != 0) {
+    log_weight_x += static_cast<RealT>(0.5 * beta) / one_plus_x;
+  }
+}
+
+template <typename RealT>
+__device__ __forceinline__ void jacobi_coefficients_device(
+  int block,
+  int order,
+  RealT& coeff_const,
+  RealT& coeff_x,
+  RealT& prev_coeff)
+{
+  int alpha_i = 0;
+  int beta_i = 0;
+  RealT linear_const = static_cast<RealT>(0.0);
+  RealT linear_x = static_cast<RealT>(0.0);
+  jacobi_spec_device(block, alpha_i, beta_i, linear_const, linear_x);
+  const RealT alpha = static_cast<RealT>(alpha_i);
+  const RealT beta = static_cast<RealT>(beta_i);
+  const RealT n = static_cast<RealT>(order);
+  const RealT denom =
+    static_cast<RealT>(2.0) * n * (n + alpha + beta) *
+    (static_cast<RealT>(2.0) * n + alpha + beta - static_cast<RealT>(2.0));
+  const RealT b = static_cast<RealT>(2.0) * n + alpha + beta - static_cast<RealT>(1.0);
+  const RealT c = (static_cast<RealT>(2.0) * n + alpha + beta) *
+                  (static_cast<RealT>(2.0) * n + alpha + beta - static_cast<RealT>(2.0));
+  const RealT d = alpha * alpha - beta * beta;
+  const RealT e = static_cast<RealT>(2.0) * (n + alpha - static_cast<RealT>(1.0)) *
+                  (n + beta - static_cast<RealT>(1.0)) *
+                  (static_cast<RealT>(2.0) * n + alpha + beta);
+  coeff_const = b * d / denom;
+  coeff_x = b * c / denom;
+  prev_coeff = e / denom;
+}
+
+template <typename RealT, int RadialFuncs, int RbSize, int AngularChannels, bool StaticShape>
+__device__ __forceinline__ void direct_chebyshev_vals_ders_impl(
   const SUS2DeviceModel& model,
   int pair,
   RealT r,
@@ -1322,30 +1450,37 @@ __device__ __forceinline__ void direct_chebyshev_vals_ders(
   const RealT dr = r - static_cast<RealT>(model.max_dist);
   const RealT cutoff_f = dr * dr;
   const RealT cutoff_der = static_cast<RealT>(2.0) * dr;
+  const int radial_funcs = StaticShape ? RadialFuncs : model.radial_funcs_count;
+  const int rb_size = StaticShape ? RbSize : model.rb_size;
 
-  for (int mu = 0; mu < model.radial_funcs_count; ++mu) {
-    const size_t scal_base = (static_cast<size_t>(pair) * model.radial_funcs_count + mu) * 2;
+  for (int mu = 0; mu < RadialFuncs; ++mu) {
+    if (!StaticShape && mu >= radial_funcs) {
+      break;
+    }
+    const size_t scal_base = (static_cast<size_t>(pair) * radial_funcs + mu) * 2;
     const RealT scal = static_cast<RealT>(model.radial_direct_scal_s[scal_base + 0]);
     const RealT shift = static_cast<RealT>(model.radial_direct_scal_s[scal_base + 1]);
     const RealT z = static_cast<RealT>(0.5) * scal * (r - shift);
     const RealT ksi = tanh(z);
     const RealT mult = static_cast<RealT>(0.5) * scal * (static_cast<RealT>(1.0) - ksi * ksi);
-    const size_t coeff_base =
-      (static_cast<size_t>(pair) * model.radial_funcs_count + mu) * model.rb_size;
+    const size_t coeff_base = (static_cast<size_t>(pair) * radial_funcs + mu) * rb_size;
 
     RealT prev = static_cast<RealT>(1.0);
     RealT prev_x = static_cast<RealT>(0.0);
     RealT acc_s = static_cast<RealT>(model.radial_direct_coeffs[coeff_base]);
     RealT acc_sx = static_cast<RealT>(0.0);
 
-    if (model.rb_size > 1) {
+    if (rb_size > 1) {
       RealT curr = ksi;
       RealT curr_x = static_cast<RealT>(1.0);
       RealT coeff = static_cast<RealT>(model.radial_direct_coeffs[coeff_base + 1]);
       acc_s += coeff * curr;
       acc_sx += coeff * curr_x;
 
-      for (int xi = 2; xi < model.rb_size; ++xi) {
+      for (int xi = 2; xi < RbSize; ++xi) {
+        if (!StaticShape && xi >= rb_size) {
+          break;
+        }
         const RealT next = static_cast<RealT>(2.0) * ksi * curr - prev;
         const RealT next_x =
           static_cast<RealT>(2.0) * (curr + ksi * curr_x) - prev_x;
@@ -1366,8 +1501,8 @@ __device__ __forceinline__ void direct_chebyshev_vals_ders(
   }
 }
 
-template <typename RealT, int RadialFuncs, int RbSize>
-__device__ __forceinline__ void direct_chebyshev_vals_ders_static(
+template <typename RealT, int RadialFuncs, int RbSize, int AngularChannels, bool StaticShape>
+__device__ __forceinline__ void direct_jacobi_vals_ders_impl(
   const SUS2DeviceModel& model,
   int pair,
   RealT r,
@@ -1377,53 +1512,200 @@ __device__ __forceinline__ void direct_chebyshev_vals_ders_static(
   const RealT dr = r - static_cast<RealT>(model.max_dist);
   const RealT cutoff_f = dr * dr;
   const RealT cutoff_der = static_cast<RealT>(2.0) * dr;
+  const int radial_funcs = StaticShape ? RadialFuncs : model.radial_funcs_count;
+  const int rb_size = StaticShape ? RbSize : model.rb_size;
+  const int angular_channels = StaticShape ? AngularChannels : model.angular_channels;
+  const bool apply_weight = model.radial_basis_kind == static_cast<int>(RadialBasisKind::JacobiSSS);
 
-#pragma unroll
   for (int mu = 0; mu < RadialFuncs; ++mu) {
-    const size_t scal_base = (static_cast<size_t>(pair) * RadialFuncs + mu) * 2;
+    if (!StaticShape && mu >= radial_funcs) {
+      break;
+    }
+    const size_t scal_base = (static_cast<size_t>(pair) * radial_funcs + mu) * 2;
     const RealT scal = static_cast<RealT>(model.radial_direct_scal_s[scal_base + 0]);
     const RealT shift = static_cast<RealT>(model.radial_direct_scal_s[scal_base + 1]);
     const RealT z = static_cast<RealT>(0.5) * scal * (r - shift);
-    const RealT ksi = tanh(z);
-    const RealT mult = static_cast<RealT>(0.5) * scal * (static_cast<RealT>(1.0) - ksi * ksi);
-    const size_t coeff_base = (static_cast<size_t>(pair) * RadialFuncs + mu) * RbSize;
+    RealT x = tanh(z);
+    const RealT eps = static_cast<RealT>(1.0e-12);
+    const RealT x_min = -static_cast<RealT>(1.0) + eps;
+    const RealT x_max = static_cast<RealT>(1.0) - eps;
+    x = x < x_min ? x_min : (x > x_max ? x_max : x);
+    const RealT x_r = static_cast<RealT>(0.5) * scal * (static_cast<RealT>(1.0) - x * x);
+    const size_t coeff_base = (static_cast<size_t>(pair) * radial_funcs + mu) * rb_size;
+    const int block = mu / angular_channels;
 
-    RealT prev = static_cast<RealT>(1.0);
-    RealT prev_x = static_cast<RealT>(0.0);
-    RealT acc_s = static_cast<RealT>(model.radial_direct_coeffs[coeff_base]);
-    RealT acc_sx = static_cast<RealT>(0.0);
+    int alpha = 0;
+    int beta = 0;
+    RealT linear_const = static_cast<RealT>(0.0);
+    RealT linear_x = static_cast<RealT>(0.0);
+    jacobi_spec_device(block, alpha, beta, linear_const, linear_x);
 
-    if (RbSize > 1) {
-      RealT curr = ksi;
-      RealT curr_x = static_cast<RealT>(1.0);
-      RealT coeff = static_cast<RealT>(model.radial_direct_coeffs[coeff_base + 1]);
-      acc_s += coeff * curr;
-      acc_sx += coeff * curr_x;
+    RealT sqrt_weight = static_cast<RealT>(1.0);
+    RealT log_weight_x = static_cast<RealT>(0.0);
+    if (apply_weight) {
+      jacobi_weight_terms_device(alpha, beta, x, sqrt_weight, log_weight_x);
+    }
 
-#pragma unroll
-      for (int xi = 2; xi < RbSize; ++xi) {
-        const RealT next = static_cast<RealT>(2.0) * ksi * curr - prev;
-        const RealT next_x =
-          static_cast<RealT>(2.0) * (curr + ksi * curr_x) - prev_x;
-        coeff = static_cast<RealT>(model.radial_direct_coeffs[coeff_base + xi]);
-        acc_s += coeff * next;
-        acc_sx += coeff * next_x;
-        prev = curr;
-        prev_x = curr_x;
-        curr = next;
-        curr_x = next_x;
+    RealT y_prev = static_cast<RealT>(0.0);
+    RealT y_prev_x = static_cast<RealT>(0.0);
+    RealT y_curr = sqrt_weight;
+    RealT y_curr_x = sqrt_weight * log_weight_x;
+    RealT acc_s = static_cast<RealT>(model.radial_direct_coeffs[coeff_base]) * y_curr;
+    RealT acc_sx = static_cast<RealT>(model.radial_direct_coeffs[coeff_base]) * y_curr_x;
+
+    if (rb_size > 1) {
+      const RealT linear = linear_const + linear_x * x;
+      RealT y_next = linear * y_curr;
+      RealT y_next_x = linear_x * y_curr + linear * y_curr_x;
+      RealT radial_coeff = static_cast<RealT>(model.radial_direct_coeffs[coeff_base + 1]);
+      acc_s += radial_coeff * y_next;
+      acc_sx += radial_coeff * y_next_x;
+
+      y_prev = y_curr;
+      y_prev_x = y_curr_x;
+      y_curr = y_next;
+      y_curr_x = y_next_x;
+      for (int order = 2; order < RbSize; ++order) {
+        if (!StaticShape && order >= rb_size) {
+          break;
+        }
+        RealT coeff_const = static_cast<RealT>(0.0);
+        RealT coeff_x = static_cast<RealT>(0.0);
+        RealT prev_coeff = static_cast<RealT>(0.0);
+        jacobi_coefficients_device(block, order, coeff_const, coeff_x, prev_coeff);
+        const RealT recurrence_coeff = coeff_const + coeff_x * x;
+        y_next = recurrence_coeff * y_curr - prev_coeff * y_prev;
+        y_next_x =
+          coeff_x * y_curr + recurrence_coeff * y_curr_x - prev_coeff * y_prev_x;
+        radial_coeff = static_cast<RealT>(model.radial_direct_coeffs[coeff_base + order]);
+        acc_s += radial_coeff * y_next;
+        acc_sx += radial_coeff * y_next_x;
+        y_prev = y_curr;
+        y_prev_x = y_curr_x;
+        y_curr = y_next;
+        y_curr_x = y_next_x;
       }
     }
 
     vals[mu] = cutoff_f * acc_s;
     if (ders != nullptr) {
-      ders[mu] = cutoff_der * acc_s + cutoff_f * mult * acc_sx;
+      ders[mu] = cutoff_der * acc_s + cutoff_f * acc_sx * x_r;
     }
   }
+}
+
+template <typename RealT, int RadialFuncs, int RbSize, bool StaticShape>
+__device__ __forceinline__ void direct_laguerre_vals_ders_impl(
+  const SUS2DeviceModel& model,
+  int pair,
+  RealT r,
+  RealT* vals,
+  RealT* ders)
+{
+  const bool apply_exponential_envelope =
+    model.radial_basis_kind == static_cast<int>(RadialBasisKind::LaguerreLog1p) ||
+    model.radial_basis_kind == static_cast<int>(RadialBasisKind::LaguerreLog1pPositive);
+  const bool positive_params =
+    model.radial_basis_kind == static_cast<int>(RadialBasisKind::LaguerreLog1pPositive);
+  const int radial_funcs = StaticShape ? RadialFuncs : model.radial_funcs_count;
+  const int rb_size = StaticShape ? RbSize : model.rb_size;
+  const RealT dr = r - static_cast<RealT>(model.max_dist);
+  const RealT cutoff_f = dr * dr;
+  const RealT cutoff_der = static_cast<RealT>(2.0) * dr;
+
+  for (int mu = 0; mu < RadialFuncs; ++mu) {
+    if (!StaticShape && mu >= radial_funcs) {
+      break;
+    }
+    const size_t scal_base = (static_cast<size_t>(pair) * radial_funcs + mu) * 2;
+    RealT scal = static_cast<RealT>(model.radial_direct_scal_s[scal_base + 0]);
+    RealT rho = static_cast<RealT>(model.radial_direct_scal_s[scal_base + 1]);
+    if (positive_params) {
+      scal = static_cast<RealT>(kLaguerrePositiveParamFloor) + sus2_device_softplus(scal);
+      rho = static_cast<RealT>(kLaguerrePositiveParamFloor) + sus2_device_softplus(rho);
+    }
+    rho = rho > static_cast<RealT>(kLaguerreMinRho) ? rho : static_cast<RealT>(kLaguerreMinRho);
+
+    const RealT log_term = log1p(r / rho);
+    const RealT u = scal * log_term;
+    const RealT u_r = scal / (rho + r);
+    const RealT exp_factor =
+      apply_exponential_envelope ? exp(static_cast<RealT>(-0.5) * u) : static_cast<RealT>(1.0);
+    const size_t coeff_base = (static_cast<size_t>(pair) * radial_funcs + mu) * rb_size;
+
+    RealT phi_prev = static_cast<RealT>(0.0);
+    RealT dphi_prev = static_cast<RealT>(0.0);
+    RealT phi_curr = cutoff_f * exp_factor;
+    RealT dphi_curr = cutoff_der * exp_factor;
+    if (apply_exponential_envelope) {
+      dphi_curr -= static_cast<RealT>(0.5) * u_r * phi_curr;
+    }
+
+    RealT acc_s = static_cast<RealT>(model.radial_direct_coeffs[coeff_base]) * phi_curr;
+    RealT acc_sr = static_cast<RealT>(model.radial_direct_coeffs[coeff_base]) * dphi_curr;
+
+    for (int n = 0; n < RbSize - 1; ++n) {
+      if (!StaticShape && n >= rb_size - 1) {
+        break;
+      }
+      const RealT inv_np1 = static_cast<RealT>(1.0) / (static_cast<RealT>(n) + static_cast<RealT>(1.0));
+      const RealT recurrence_coeff =
+        (static_cast<RealT>(2.0 * n + 1.0) - u) * inv_np1;
+      const RealT prev_coeff = static_cast<RealT>(n) * inv_np1;
+      const RealT phi_next = recurrence_coeff * phi_curr - prev_coeff * phi_prev;
+      const RealT dphi_next =
+        -u_r * inv_np1 * phi_curr + recurrence_coeff * dphi_curr - prev_coeff * dphi_prev;
+      const RealT radial_coeff = static_cast<RealT>(model.radial_direct_coeffs[coeff_base + n + 1]);
+      acc_s += radial_coeff * phi_next;
+      acc_sr += radial_coeff * dphi_next;
+      phi_prev = phi_curr;
+      dphi_prev = dphi_curr;
+      phi_curr = phi_next;
+      dphi_curr = dphi_next;
+    }
+
+    vals[mu] = acc_s;
+    if (ders != nullptr) {
+      ders[mu] = acc_sr;
+    }
+  }
+}
+
+template <typename RealT, int RadialFuncs, int RbSize, int AngularChannels, bool StaticShape>
+__device__ __forceinline__ void direct_radial_vals_ders_impl(
+  const SUS2DeviceModel& model,
+  int pair,
+  RealT r,
+  RealT* vals,
+  RealT* ders)
+{
+  if (model.radial_basis_kind == static_cast<int>(RadialBasisKind::ChebyshevSSS)) {
+    direct_chebyshev_vals_ders_impl<RealT, RadialFuncs, RbSize, AngularChannels, StaticShape>(
+      model, pair, r, vals, ders);
+  } else if (
+    model.radial_basis_kind == static_cast<int>(RadialBasisKind::JacobiSSS) ||
+    model.radial_basis_kind == static_cast<int>(RadialBasisKind::JacobiSSSNoWeight)) {
+    direct_jacobi_vals_ders_impl<RealT, RadialFuncs, RbSize, AngularChannels, StaticShape>(
+      model, pair, r, vals, ders);
+  } else {
+    direct_laguerre_vals_ders_impl<RealT, RadialFuncs, RbSize, StaticShape>(
+      model, pair, r, vals, ders);
+  }
+}
+
+template <typename RealT>
+__device__ __noinline__ void direct_radial_vals_ders_dynamic(
+  const SUS2DeviceModel& model,
+  int pair,
+  RealT r,
+  RealT* vals,
+  RealT* ders)
+{
+  direct_radial_vals_ders_impl<RealT, 32, 16, 8, false>(model, pair, r, vals, ders);
 }
 
 template <typename RealT, int L, int K>
-__device__ __forceinline__ bool direct_chebyshev_vals_ders_lk_static(
+__device__ __forceinline__ bool direct_radial_vals_ders_lk_static(
   const SUS2DeviceModel& model,
   int pair,
   RealT r,
@@ -1431,43 +1713,14 @@ __device__ __forceinline__ bool direct_chebyshev_vals_ders_lk_static(
   RealT* ders)
 {
   constexpr int RadialFuncs = K * (L + 1);
-  if (model.radial_funcs_count != RadialFuncs) {
+  constexpr int AngularChannels = L + 1;
+  if (model.radial_funcs_count != RadialFuncs ||
+      model.radial_basis_kind != static_cast<int>(RadialBasisKind::ChebyshevSSS)) {
     return false;
   }
-  switch (model.rb_size) {
-    case 1:
-      direct_chebyshev_vals_ders_static<RealT, RadialFuncs, 1>(model, pair, r, vals, ders);
-      return true;
-    case 2:
-      direct_chebyshev_vals_ders_static<RealT, RadialFuncs, 2>(model, pair, r, vals, ders);
-      return true;
-    case 3:
-      direct_chebyshev_vals_ders_static<RealT, RadialFuncs, 3>(model, pair, r, vals, ders);
-      return true;
-    case 4:
-      direct_chebyshev_vals_ders_static<RealT, RadialFuncs, 4>(model, pair, r, vals, ders);
-      return true;
-    case 5:
-      direct_chebyshev_vals_ders_static<RealT, RadialFuncs, 5>(model, pair, r, vals, ders);
-      return true;
-    case 6:
-      direct_chebyshev_vals_ders_static<RealT, RadialFuncs, 6>(model, pair, r, vals, ders);
-      return true;
-    case 7:
-      direct_chebyshev_vals_ders_static<RealT, RadialFuncs, 7>(model, pair, r, vals, ders);
-      return true;
-    case 8:
-      direct_chebyshev_vals_ders_static<RealT, RadialFuncs, 8>(model, pair, r, vals, ders);
-      return true;
-    case 9:
-      direct_chebyshev_vals_ders_static<RealT, RadialFuncs, 9>(model, pair, r, vals, ders);
-      return true;
-    case 10:
-      direct_chebyshev_vals_ders_static<RealT, RadialFuncs, 10>(model, pair, r, vals, ders);
-      return true;
-    default:
-      return false;
-  }
+  direct_chebyshev_vals_ders_impl<RealT, RadialFuncs, 16, AngularChannels, false>(
+    model, pair, r, vals, ders);
+  return true;
 }
 
 template <typename RealT>
@@ -1479,15 +1732,7 @@ __device__ __forceinline__ void interp_radial_vals_ders(
   RealT* ders)
 {
   if (model.use_radial_direct) {
-    if (model.use_tensor_basic_fastpath && model.tensor_l == 2 && model.tensor_k == 3 &&
-        direct_chebyshev_vals_ders_lk_static<RealT, 2, 3>(model, pair, r, vals, ders)) {
-      return;
-    }
-    if (model.use_tensor_basic_fastpath && model.tensor_l == 3 && model.tensor_k == 3 &&
-        direct_chebyshev_vals_ders_lk_static<RealT, 3, 3>(model, pair, r, vals, ders)) {
-      return;
-    }
-    direct_chebyshev_vals_ders(model, pair, r, vals, ders);
+    direct_radial_vals_ders_dynamic(model, pair, r, vals, ders);
     return;
   }
 
@@ -1515,6 +1760,55 @@ __device__ __forceinline__ void interp_radial_vals_ders(
       ders[mu] = d0 + t * (d1 - d0);
     }
   }
+}
+
+template <int L, int K>
+struct Sus2DirectRadialStaticDispatch {
+  template <typename RealT>
+  __device__ __forceinline__ static void eval(
+    const SUS2DeviceModel& model,
+    int pair,
+    RealT r,
+    RealT* vals,
+    RealT* ders)
+  {
+    interp_radial_vals_ders(model, pair, r, vals, ders);
+  }
+};
+
+#define SUS2_DEFINE_DIRECT_RADIAL_STATIC_DISPATCH(LVAL, KVAL) \
+  template <> \
+  struct Sus2DirectRadialStaticDispatch<LVAL, KVAL> { \
+    template <typename RealT> \
+    __device__ __forceinline__ static void eval( \
+      const SUS2DeviceModel& model, \
+      int pair, \
+      RealT r, \
+      RealT* vals, \
+      RealT* ders) \
+    { \
+      if (model.use_radial_direct && \
+          direct_radial_vals_ders_lk_static<RealT, LVAL, KVAL>(model, pair, r, vals, ders)) { \
+        return; \
+      } \
+      interp_radial_vals_ders(model, pair, r, vals, ders); \
+    } \
+  }
+
+SUS2_DEFINE_DIRECT_RADIAL_STATIC_DISPATCH(2, 3);
+SUS2_DEFINE_DIRECT_RADIAL_STATIC_DISPATCH(3, 3);
+
+#undef SUS2_DEFINE_DIRECT_RADIAL_STATIC_DISPATCH
+
+template <typename RealT, int L, int K>
+__device__ __forceinline__ void interp_radial_vals_ders_lk_static(
+  const SUS2DeviceModel& model,
+  int pair,
+  RealT r,
+  RealT* vals,
+  RealT* ders)
+{
+  Sus2DirectRadialStaticDispatch<L, K>::template eval<RealT>(model, pair, r, vals, ders);
 }
 
 template <typename RealT>
@@ -1561,7 +1855,8 @@ __device__ __forceinline__ void add_l3k3_basic_moments(
   RealT* moments)
 {
   RealT mu_val[32];
-  interp_radial_vals_ders(model, pair, r, mu_val, static_cast<RealT*>(nullptr));
+  interp_radial_vals_ders_lk_static<RealT, 3, 3>(
+    model, pair, r, mu_val, static_cast<RealT*>(nullptr));
 
   const RealT inv_r = static_cast<RealT>(1.0) / r;
   const RealT inv_r2 = inv_r * inv_r;
@@ -1642,7 +1937,7 @@ __device__ __forceinline__ void compute_sus2_edge_derivative_l3k3(
 
   RealT mu_val[32];
   RealT mu_der[32];
-  interp_radial_vals_ders(model, pair, r, mu_val, mu_der);
+  interp_radial_vals_ders_lk_static<RealT, 3, 3>(model, pair, r, mu_val, mu_der);
 
   const RealT inv_r = static_cast<RealT>(1.0) / r;
   const RealT inv_r2 = inv_r * inv_r;
@@ -1726,7 +2021,7 @@ __device__ __forceinline__ void compute_sus2_edge_derivative_l3k3_cached(
 
   RealT mu_val[32];
   RealT mu_der[32];
-  interp_radial_vals_ders(model, pair, r, mu_val, mu_der);
+  interp_radial_vals_ders_lk_static<RealT, 3, 3>(model, pair, r, mu_val, mu_der);
 
   const RealT inv_r = static_cast<RealT>(1.0) / r;
   const RealT inv_r2 = inv_r * inv_r;
@@ -2018,7 +2313,7 @@ __device__ __forceinline__ void compute_sus2_edge_derivative_tensor_cached_stati
 
   RealT mu_val[32];
   RealT mu_der[32];
-  interp_radial_vals_ders(model, pair, r, mu_val, mu_der);
+  interp_radial_vals_ders_lk_static<RealT, L, K>(model, pair, r, mu_val, mu_der);
 
   const RealT inv_r = static_cast<RealT>(1.0) / r;
   const RealT inv_r2 = inv_r * inv_r;
@@ -2297,7 +2592,8 @@ static __global__ void gpu_compute_basic_moments(
     }
 
     RealT mu_val[32];
-    interp_radial_vals_ders(model, pair, r, mu_val, static_cast<RealT*>(nullptr));
+    interp_radial_vals_ders_lk_static<RealT, 3, 3>(
+      model, pair, r, mu_val, static_cast<RealT*>(nullptr));
 
     RealT dist_pow[8];
     RealT x_pow[8];
@@ -2374,7 +2670,8 @@ static __global__ void gpu_compute_basic_moments_l3k3_accum(
     const int pair = type_i * model.species_count + type[j];
 
     RealT mu_val[32];
-    interp_radial_vals_ders(model, pair, r, mu_val, static_cast<RealT*>(nullptr));
+    interp_radial_vals_ders_lk_static<RealT, 3, 3>(
+      model, pair, r, mu_val, static_cast<RealT*>(nullptr));
 
     const RealT inv_r = static_cast<RealT>(1.0) / r;
     const RealT inv_r2 = inv_r * inv_r;
@@ -2596,7 +2893,8 @@ static __global__ void gpu_compute_basic_moments_tensor_accum_static(
     const int pair = type_i * model.species_count + type[j];
 
     RealT mu_val[32];
-    interp_radial_vals_ders(model, pair, r, mu_val, static_cast<RealT*>(nullptr));
+    interp_radial_vals_ders_lk_static<RealT, L, K>(
+      model, pair, r, mu_val, static_cast<RealT*>(nullptr));
 
     const RealT inv_r = static_cast<RealT>(1.0) / r;
     const RealT inv_r2 = inv_r * inv_r;
@@ -3584,6 +3882,8 @@ SUS2_V11::SUS2_V11(
 {
   const SUS2HostModel host_model = load_model(file_potential);
   species_count_ = host_model.species_count;
+  angular_channels_ = host_model.angular_channels;
+  radial_basis_kind_ = static_cast<int>(host_model.radial_basis_kind);
   radial_funcs_count_ = host_model.radial_funcs_count;
   rb_size_ = host_model.rb_size;
   alpha_basic_count_ = host_model.alpha_basic_count;
@@ -3691,7 +3991,7 @@ SUS2_V11::SUS2_V11(
   if (use_radial_direct_) {
     std::vector<float> host_direct_coeffs;
     std::vector<float> host_direct_scal_s;
-    build_direct_chebyshev_tables(host_model, host_direct_coeffs, host_direct_scal_s);
+    build_direct_radial_tables(host_model, host_direct_coeffs, host_direct_scal_s);
     radial_direct_coeffs_.resize(host_direct_coeffs.size());
     radial_direct_scal_s_.resize(host_direct_scal_s.size());
     radial_direct_coeffs_.copy_from_host(host_direct_coeffs.data());
@@ -3720,7 +4020,7 @@ SUS2_V11::SUS2_V11(
 
   if (use_radial_direct_) {
     printf(
-      "Use SUS2 v1.1 GPUMD potential: radial_type=%s, species=%d, radial=%d, basics=%d, moments=%d, scalars=%d, cutoff=%g A, radial_eval=direct Chebyshev recurrence.\n",
+      "Use SUS2 v1.1 GPUMD potential: radial_type=%s, species=%d, radial=%d, basics=%d, moments=%d, scalars=%d, cutoff=%g A, radial_eval=direct basis recurrence.\n",
       host_model.radial_basis_type.c_str(),
       species_count_,
       radial_funcs_count_,
@@ -4041,6 +4341,8 @@ void SUS2_V11::compute(
 
   SUS2DeviceModel model{
     species_count_,
+    angular_channels_,
+    radial_basis_kind_,
     radial_funcs_count_,
     alpha_basic_count_,
     alpha_times_count_,

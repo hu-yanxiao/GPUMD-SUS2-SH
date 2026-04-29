@@ -49,6 +49,8 @@ private:
   void maybe_print_profile();
 
   int species_count_ = 0;
+  int angular_channels_ = 0;
+  int radial_basis_kind_ = 0;
   int radial_funcs_count_ = 0;
   int rb_size_ = 0;
   int alpha_basic_count_ = 0;
