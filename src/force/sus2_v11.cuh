@@ -74,6 +74,8 @@ private:
   GPU_Vector<int> alpha_moment_mapping_;
   GPU_Vector<float> lut_vals_;
   GPU_Vector<float> lut_ders_;
+  GPU_Vector<float> radial_direct_coeffs_;
+  GPU_Vector<float> radial_direct_scal_s_;
 
   GPU_Vector<int> neighbor_count_;
   GPU_Vector<int> neighbor_atom_;
@@ -96,6 +98,7 @@ private:
   bool use_tensor_force_grad_cache_ = true;
   bool use_float_moment_grads_ = false;
   bool use_float_moments_ = false;
+  bool use_radial_direct_ = false;
 
   GPU_Vector<double> moment_vals_;
   GPU_Vector<float> moment_vals_float_;

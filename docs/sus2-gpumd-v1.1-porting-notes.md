@@ -1413,3 +1413,65 @@ MA/Jacobi l3k3 model:
 The cache directory now keeps a `registry.json` index. For the Cu-Zr probe it contains one entry with the graph key, dimensions, compressed counts, object size, and original compile seconds. This is the piece future GPUMD runtime or build tooling should query before deciding whether to compile a new product graph core.
 
 Next technical step: connect a preserved graph core to runtime execution. The safest path is AOT/cached build integration first: detect the model fingerprint, locate `registry.json`, link or load the matching generated object/cubin if available, otherwise fall back to the current constant-table product graph. Runtime CUDA-driver module loading is possible, but should be added only after the AOT cache path is stable.
+
+## Optional Direct Chebyshev Radial Evaluation
+
+Added an experimental runtime switch that bypasses the radial lookup table for
+`RBChebyshev_sss[_lmp]` models:
+
+```text
+potential p.mtp Cu Zr sus2_radial_direct=1
+```
+
+or:
+
+```bash
+export SUS2_GPUMD_RADIAL_DIRECT=1
+```
+
+The default remains LUT for all radial families. Direct mode stores the
+Chebyshev fitted coefficients and per-element-pair `(scal, s)` values on the
+device and evaluates values/derivatives by the same recurrence used by the host
+LUT builder:
+
+```text
+x = tanh(0.5 * scal * (r - s))
+phi_0 = (r - rcut)^2
+phi_1 = x * phi_0
+phi_n = 2 * x * phi_{n-1} - phi_{n-2}
+```
+
+with the corresponding derivative recurrence. This borrows NEP's preference
+for cheap on-the-fly radial arithmetic when the basis recurrence is simple,
+while keeping Jacobi/Laguerre on the lookup-table path until separate direct
+kernels are justified and checked.
+
+Cu-Zr `RBChebyshev_sss_lmp` static check:
+
+```text
+directory = /work/phy-weigw/20260321_Test/GPUMD-SUS2-v1.1-work-codex/codex_smoke/cuzr_radial_direct_static_20260430
+mode = sus2_float, 2304 atoms, time_step 0, run 1
+thermo max_abs difference = 1.457e-3 eV total-energy scale
+force max_abs difference = 4.322e-5 eV/A
+```
+
+The small mismatch is expected because the default path is `dr=1e-4 A` table
+sampling plus interpolation, while direct mode evaluates the Chebyshev
+recurrence at the current distance. Both tests used the same `sus2_float=1`
+precision mode.
+
+Cu-Zr 1.024M atom NPT benchmark:
+
+```text
+directory = /work/phy-weigw/20260321_Test/GPUMD-SUS2-v1.1-work-codex/codex_bench/cuzr_radial_direct_1m_npt2000_20260430
+model = /work/phy-weigw/hyx/cu-zr/7.5/lmp/bench_npt2000_dt1fs_latest_iface/p.mtp
+settings = 1 A100, sus2_float=1, 1 fs, NPT, 2000 steps
+LUT default = 1.6612e7 atom-step/s, GPUMD process memory peak 9636 MiB
+direct Chebyshev = 1.55238e7 atom-step/s, GPUMD process memory peak 9608 MiB
+```
+
+Conclusion: for this l3k3 Cu-Zr model, direct Chebyshev recurrence is about
+6.6% slower than the lookup table. The reason is that `scaling_map = LK` gives
+each radial function its own `(scal, s)`, so direct mode performs repeated
+`tanh` and recurrence work per neighbor. The LUT path remains the recommended
+default; direct mode is useful as a controlled experiment or diagnostic path.

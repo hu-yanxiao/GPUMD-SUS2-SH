@@ -100,6 +100,7 @@ struct SUS2DeviceModel {
   int alpha_moments_count;
   int alpha_scalar_moments;
   int max_rank;
+  int rb_size;
   int lut_size;
   double max_dist;
   double lut_inv_dr;
@@ -114,6 +115,8 @@ struct SUS2DeviceModel {
   const int* alpha_moment_mapping;
   const float* lut_vals;
   const float* lut_ders;
+  const float* radial_direct_coeffs;
+  const float* radial_direct_scal_s;
   bool use_tensor_basic_fastpath;
   int tensor_l;
   int tensor_k;
@@ -122,6 +125,7 @@ struct SUS2DeviceModel {
   bool use_const_scalar_moments;
   bool use_const_float_coeffs;
   bool use_float_model_params;
+  bool use_radial_direct;
 };
 
 struct TensorBasicLayout {
@@ -887,6 +891,41 @@ void build_lut(const SUS2HostModel& model, int lut_size, double lut_inv_dr, std:
   }
 }
 
+void build_direct_chebyshev_tables(
+  const SUS2HostModel& model,
+  std::vector<float>& coeffs,
+  std::vector<float>& scal_s)
+{
+  const size_t pair_count = static_cast<size_t>(model.species_count) * model.species_count;
+  coeffs.assign(pair_count * model.radial_funcs_count * model.rb_size, 0.0f);
+  scal_s.assign(pair_count * model.radial_funcs_count * 2, 0.0f);
+
+  for (int zi = 0; zi < model.species_count; ++zi) {
+    for (int zj = 0; zj < model.species_count; ++zj) {
+      const int pair = zi * model.species_count + zj;
+      const int shift = model.species_count * zi + zj;
+      const float type_scale = static_cast<float>(
+        model.scaling * model.radial_type_coeffs[zi] * model.radial_type_coeffs[zj]);
+      for (int mu = 0; mu < model.radial_funcs_count; ++mu) {
+        const int scaling_block = model.mu_to_scaling_block[mu];
+        const int scal_offset =
+          2 * scaling_block * model.species_count * model.species_count + shift;
+        const size_t scal_base = (static_cast<size_t>(pair) * model.radial_funcs_count + mu) * 2;
+        scal_s[scal_base + 0] = static_cast<float>(model.scal_coeffs[scal_offset]);
+        scal_s[scal_base + 1] =
+          static_cast<float>(model.scal_coeffs[scal_offset + model.species_count * model.species_count]);
+
+        const size_t coeff_base =
+          (static_cast<size_t>(pair) * model.radial_funcs_count + mu) * model.rb_size;
+        for (int xi = 0; xi < model.rb_size; ++xi) {
+          coeffs[coeff_base + xi] =
+            static_cast<float>(model.radial_coeffs[mu * model.rb_size + xi]) * type_scale;
+        }
+      }
+    }
+  }
+}
+
 bool starts_with(const std::string& text, const std::string& prefix)
 {
   return text.size() >= prefix.size() && text.compare(0, prefix.size(), prefix) == 0;
@@ -969,6 +1008,33 @@ bool parse_float_moment_grads(
     }
   }
   return use_float;
+}
+
+bool parse_radial_direct(
+  const SUS2HostModel& model,
+  int num_potential_options,
+  const char** potential_options)
+{
+  bool use_direct = false;
+  const char* env = std::getenv("SUS2_GPUMD_RADIAL_DIRECT");
+  if (env != nullptr) {
+    use_direct = parse_bool_value(env, "SUS2_GPUMD_RADIAL_DIRECT");
+  }
+
+  const int option_begin = std::min(num_potential_options, model.species_count);
+  for (int i = option_begin; i < num_potential_options; ++i) {
+    const std::string option = potential_options[i] == nullptr ? "" : potential_options[i];
+    if (starts_with(option, "sus2_radial_direct=") || starts_with(option, "radial_direct=") ||
+        starts_with(option, "sus2_no_lut=")) {
+      const size_t eq = option.find('=');
+      use_direct = parse_bool_value(option.substr(eq + 1), option.substr(0, eq));
+    }
+  }
+
+  if (use_direct && model.radial_basis_kind != RadialBasisKind::ChebyshevSSS) {
+    sus2_input_error("SUS2 GPUMD radial_direct currently supports only RBChebyshev_sss[_lmp].");
+  }
+  return use_direct;
 }
 
 bool parse_float_moments(
@@ -1246,6 +1312,67 @@ __device__ __forceinline__ int sus2_scalar_moment_id(const SUS2DeviceModel& mode
 }
 
 template <typename RealT>
+__device__ __forceinline__ void direct_chebyshev_vals_ders(
+  const SUS2DeviceModel& model,
+  int pair,
+  RealT r,
+  RealT* vals,
+  RealT* ders)
+{
+  const RealT dr = r - static_cast<RealT>(model.max_dist);
+  const RealT cutoff_f = dr * dr;
+  const RealT cutoff_der = static_cast<RealT>(2.0) * dr;
+
+  for (int mu = 0; mu < model.radial_funcs_count; ++mu) {
+    const size_t scal_base = (static_cast<size_t>(pair) * model.radial_funcs_count + mu) * 2;
+    const RealT scal = static_cast<RealT>(model.radial_direct_scal_s[scal_base + 0]);
+    const RealT shift = static_cast<RealT>(model.radial_direct_scal_s[scal_base + 1]);
+    const RealT z = static_cast<RealT>(0.5) * scal * (r - shift);
+    const RealT ksi = tanh(z);
+    const RealT mult = static_cast<RealT>(0.5) * scal * (static_cast<RealT>(1.0) - ksi * ksi);
+    const size_t coeff_base =
+      (static_cast<size_t>(pair) * model.radial_funcs_count + mu) * model.rb_size;
+
+    RealT prev = static_cast<RealT>(0.0);
+    RealT prev_der = static_cast<RealT>(0.0);
+    RealT curr = cutoff_f;
+    RealT curr_der = cutoff_der;
+    RealT acc_val = static_cast<RealT>(model.radial_direct_coeffs[coeff_base]) * curr;
+    RealT acc_der = static_cast<RealT>(model.radial_direct_coeffs[coeff_base]) * curr_der;
+
+    if (model.rb_size > 1) {
+      RealT next = ksi * cutoff_f;
+      RealT next_der = mult * cutoff_f + cutoff_der * ksi;
+      RealT coeff = static_cast<RealT>(model.radial_direct_coeffs[coeff_base + 1]);
+      acc_val += coeff * next;
+      acc_der += coeff * next_der;
+      prev = curr;
+      prev_der = curr_der;
+      curr = next;
+      curr_der = next_der;
+
+      for (int xi = 2; xi < model.rb_size; ++xi) {
+        next = static_cast<RealT>(2.0) * ksi * curr - prev;
+        next_der =
+          static_cast<RealT>(2.0) * (mult * curr + ksi * curr_der) - prev_der;
+        coeff = static_cast<RealT>(model.radial_direct_coeffs[coeff_base + xi]);
+        acc_val += coeff * next;
+        acc_der += coeff * next_der;
+        prev = curr;
+        prev_der = curr_der;
+        curr = next;
+        curr_der = next_der;
+      }
+    }
+
+    vals[mu] = acc_val;
+    if (ders != nullptr) {
+      ders[mu] = acc_der;
+    }
+  }
+}
+
+template <typename RealT>
 __device__ __forceinline__ void interp_radial_vals_ders(
   const SUS2DeviceModel& model,
   int pair,
@@ -1253,6 +1380,11 @@ __device__ __forceinline__ void interp_radial_vals_ders(
   RealT* vals,
   RealT* ders)
 {
+  if (model.use_radial_direct) {
+    direct_chebyshev_vals_ders(model, pair, r, vals, ders);
+    return;
+  }
+
   const RealT scaled_r = r * static_cast<RealT>(model.lut_inv_dr);
   int lut_idx = static_cast<int>(floor(scaled_r));
   if (lut_idx < 0) {
@@ -3385,6 +3517,7 @@ SUS2_V11::SUS2_V11(
     parse_local_product_graph(host_model, num_potential_options, potential_options);
   use_tensor_force_grad_cache_ =
     parse_tensor_force_grad_cache(host_model, num_potential_options, potential_options);
+  use_radial_direct_ = parse_radial_direct(host_model, num_potential_options, potential_options);
   use_local_product_graph_ = use_local_product_graph_ && use_float_moments_ &&
                              alpha_moments_count_ <= kSus2LocalGraphMaxMoments;
   use_const_float_coeffs_ = use_float_moments_ &&
@@ -3449,35 +3582,59 @@ SUS2_V11::SUS2_V11(
       packed_mapping.size() * sizeof(unsigned short)));
   }
 
-  const int lut_span = parse_lut_span(host_model, num_potential_options, potential_options);
-  lut_size_ = lut_span + 2;
-  lut_inv_dr_ = static_cast<double>(lut_span) / rc;
-  std::vector<double> host_lut_vals_double;
-  std::vector<double> host_lut_ders_double;
-  build_lut(host_model, lut_size_, lut_inv_dr_, host_lut_vals_double, host_lut_ders_double);
-  std::vector<float> host_lut_vals(host_lut_vals_double.begin(), host_lut_vals_double.end());
-  std::vector<float> host_lut_ders(host_lut_ders_double.begin(), host_lut_ders_double.end());
-  lut_vals_.resize(host_lut_vals.size());
-  lut_ders_.resize(host_lut_ders.size());
-  lut_vals_.copy_from_host(host_lut_vals.data());
-  lut_ders_.copy_from_host(host_lut_ders.data());
+  if (use_radial_direct_) {
+    std::vector<float> host_direct_coeffs;
+    std::vector<float> host_direct_scal_s;
+    build_direct_chebyshev_tables(host_model, host_direct_coeffs, host_direct_scal_s);
+    radial_direct_coeffs_.resize(host_direct_coeffs.size());
+    radial_direct_scal_s_.resize(host_direct_scal_s.size());
+    radial_direct_coeffs_.copy_from_host(host_direct_coeffs.data());
+    radial_direct_scal_s_.copy_from_host(host_direct_scal_s.data());
+    lut_size_ = 0;
+    lut_inv_dr_ = 0.0;
+  } else {
+    const int lut_span = parse_lut_span(host_model, num_potential_options, potential_options);
+    lut_size_ = lut_span + 2;
+    lut_inv_dr_ = static_cast<double>(lut_span) / rc;
+    std::vector<double> host_lut_vals_double;
+    std::vector<double> host_lut_ders_double;
+    build_lut(host_model, lut_size_, lut_inv_dr_, host_lut_vals_double, host_lut_ders_double);
+    std::vector<float> host_lut_vals(host_lut_vals_double.begin(), host_lut_vals_double.end());
+    std::vector<float> host_lut_ders(host_lut_ders_double.begin(), host_lut_ders_double.end());
+    lut_vals_.resize(host_lut_vals.size());
+    lut_ders_.resize(host_lut_ders.size());
+    lut_vals_.copy_from_host(host_lut_vals.data());
+    lut_ders_.copy_from_host(host_lut_ders.data());
+  }
 
   neighbor_count_.resize(num_atoms);
   cell_contents_.resize(num_atoms);
   neighbor_cache_.initialize(rc, num_atoms, 512);
   resize_work_buffers(num_atoms);
 
-  printf(
-    "Use SUS2 v1.1 GPUMD potential: radial_type=%s, species=%d, radial=%d, basics=%d, moments=%d, scalars=%d, cutoff=%g A, LUT=%d (dr=%g A).\n",
-    host_model.radial_basis_type.c_str(),
-    species_count_,
-    radial_funcs_count_,
-    alpha_basic_count_,
-    alpha_moments_count_,
-    alpha_scalar_moments_,
-    rc,
-    lut_size_,
-    1.0 / lut_inv_dr_);
+  if (use_radial_direct_) {
+    printf(
+      "Use SUS2 v1.1 GPUMD potential: radial_type=%s, species=%d, radial=%d, basics=%d, moments=%d, scalars=%d, cutoff=%g A, radial_eval=direct Chebyshev recurrence.\n",
+      host_model.radial_basis_type.c_str(),
+      species_count_,
+      radial_funcs_count_,
+      alpha_basic_count_,
+      alpha_moments_count_,
+      alpha_scalar_moments_,
+      rc);
+  } else {
+    printf(
+      "Use SUS2 v1.1 GPUMD potential: radial_type=%s, species=%d, radial=%d, basics=%d, moments=%d, scalars=%d, cutoff=%g A, LUT=%d (dr=%g A).\n",
+      host_model.radial_basis_type.c_str(),
+      species_count_,
+      radial_funcs_count_,
+      alpha_basic_count_,
+      alpha_moments_count_,
+      alpha_scalar_moments_,
+      rc,
+      lut_size_,
+      1.0 / lut_inv_dr_);
+  }
   if (host_model.original_alpha_moments_count != alpha_moments_count_ ||
       host_model.original_alpha_times_count != alpha_times_count_) {
     printf(
@@ -3784,6 +3941,7 @@ void SUS2_V11::compute(
     alpha_moments_count_,
     alpha_scalar_moments_,
     max_rank_,
+    rb_size_,
     lut_size_,
     rc,
     lut_inv_dr_,
@@ -3796,8 +3954,10 @@ void SUS2_V11::compute(
     alpha_basic_.data(),
     alpha_times_.data(),
     alpha_moment_mapping_.data(),
-    lut_vals_.data(),
-    lut_ders_.data(),
+    use_radial_direct_ ? nullptr : lut_vals_.data(),
+    use_radial_direct_ ? nullptr : lut_ders_.data(),
+    use_radial_direct_ ? radial_direct_coeffs_.data() : nullptr,
+    use_radial_direct_ ? radial_direct_scal_s_.data() : nullptr,
     use_tensor_basic_fastpath_,
     tensor_l_,
     tensor_k_,
@@ -3805,7 +3965,8 @@ void SUS2_V11::compute(
     use_const_alpha_times_,
     use_const_scalar_moments_,
     use_const_float_coeffs_,
-    use_float_moments_};
+    use_float_moments_,
+    use_radial_direct_};
 
 #define SUS2_LAUNCH_TENSOR_BASIC_DYNAMIC(REAL_T, OUT_PTR) \
   do { \

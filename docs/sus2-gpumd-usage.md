@@ -158,6 +158,24 @@ export SUS2_GPUMD_LUT_DR=0.0001
 export SUS2_GPUMD_LUT_SPAN=...
 ```
 
+Experimental direct Chebyshev recurrence:
+
+```text
+potential p.mtp Cu Zr sus2_radial_direct=1
+```
+
+or:
+
+```bash
+export SUS2_GPUMD_RADIAL_DIRECT=1
+```
+
+This bypasses the radial lookup table and evaluates the
+`RBChebyshev_sss[_lmp]` radial values and derivatives by the same recurrence
+used to build the LUT. It is opt-in and currently rejects Jacobi/Laguerre
+families so the default behavior and broad radial-basis support stay table
+based.
+
 ## LSF Job Template
 
 Submit from the intended run directory so GPUMD sees the local `run.in`,

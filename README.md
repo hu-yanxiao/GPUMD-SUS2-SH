@@ -11,6 +11,7 @@ This repository is an overlay on top of upstream GPUMD, not a full GPUMD fork. I
 - Default radial evaluation: GPU lookup table for all supported radial basis types
 - Default LUT spacing: `dr = 1.0e-4 A`, matching the LAMMPS table convention
 - Runtime LUT controls: `sus2_lut_dr=...`, `sus2_lut_span=...`, `SUS2_GPUMD_LUT_DR`, `SUS2_GPUMD_LUT_SPAN`
+- Experimental direct radial switch for `RBChebyshev_sss[_lmp]`: `sus2_radial_direct=1` or `SUS2_GPUMD_RADIAL_DIRECT=1`
 - Optional memory-saving reverse-gradient workspace: `sus2_grad_float=1` or `SUS2_GPUMD_GRAD_FLOAT=1`
 - Optimized tensor path: automatic for standard `lLkK` `alpha_index_basic` layouts up to `l4k4`, using programmatic rank-block tensor contractions
 - Experimental product-graph controls: `sus2_fused_graph=...`, `sus2_local_product_graph=...`
@@ -66,6 +67,22 @@ or:
 ```bash
 export SUS2_GPUMD_LUT_DR=0.0001
 ```
+
+To test direct Chebyshev radial recurrence instead of lookup tables:
+
+```text
+potential p.mtp Cu Zr sus2_radial_direct=1
+```
+
+or:
+
+```bash
+export SUS2_GPUMD_RADIAL_DIRECT=1
+```
+
+The default remains LUT. The direct path currently accepts only
+`RBChebyshev_sss` and `RBChebyshev_sss_lmp`; other radial families continue to
+use the table path.
 
 To test the optional float moment-gradient workspace:
 
