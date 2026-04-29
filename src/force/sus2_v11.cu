@@ -1333,42 +1333,140 @@ __device__ __forceinline__ void direct_chebyshev_vals_ders(
     const size_t coeff_base =
       (static_cast<size_t>(pair) * model.radial_funcs_count + mu) * model.rb_size;
 
-    RealT prev = static_cast<RealT>(0.0);
-    RealT prev_der = static_cast<RealT>(0.0);
-    RealT curr = cutoff_f;
-    RealT curr_der = cutoff_der;
-    RealT acc_val = static_cast<RealT>(model.radial_direct_coeffs[coeff_base]) * curr;
-    RealT acc_der = static_cast<RealT>(model.radial_direct_coeffs[coeff_base]) * curr_der;
+    RealT prev = static_cast<RealT>(1.0);
+    RealT prev_x = static_cast<RealT>(0.0);
+    RealT acc_s = static_cast<RealT>(model.radial_direct_coeffs[coeff_base]);
+    RealT acc_sx = static_cast<RealT>(0.0);
 
     if (model.rb_size > 1) {
-      RealT next = ksi * cutoff_f;
-      RealT next_der = mult * cutoff_f + cutoff_der * ksi;
+      RealT curr = ksi;
+      RealT curr_x = static_cast<RealT>(1.0);
       RealT coeff = static_cast<RealT>(model.radial_direct_coeffs[coeff_base + 1]);
-      acc_val += coeff * next;
-      acc_der += coeff * next_der;
-      prev = curr;
-      prev_der = curr_der;
-      curr = next;
-      curr_der = next_der;
+      acc_s += coeff * curr;
+      acc_sx += coeff * curr_x;
 
       for (int xi = 2; xi < model.rb_size; ++xi) {
-        next = static_cast<RealT>(2.0) * ksi * curr - prev;
-        next_der =
-          static_cast<RealT>(2.0) * (mult * curr + ksi * curr_der) - prev_der;
+        const RealT next = static_cast<RealT>(2.0) * ksi * curr - prev;
+        const RealT next_x =
+          static_cast<RealT>(2.0) * (curr + ksi * curr_x) - prev_x;
         coeff = static_cast<RealT>(model.radial_direct_coeffs[coeff_base + xi]);
-        acc_val += coeff * next;
-        acc_der += coeff * next_der;
+        acc_s += coeff * next;
+        acc_sx += coeff * next_x;
         prev = curr;
-        prev_der = curr_der;
+        prev_x = curr_x;
         curr = next;
-        curr_der = next_der;
+        curr_x = next_x;
       }
     }
 
-    vals[mu] = acc_val;
+    vals[mu] = cutoff_f * acc_s;
     if (ders != nullptr) {
-      ders[mu] = acc_der;
+      ders[mu] = cutoff_der * acc_s + cutoff_f * mult * acc_sx;
     }
+  }
+}
+
+template <typename RealT, int RadialFuncs, int RbSize>
+__device__ __forceinline__ void direct_chebyshev_vals_ders_static(
+  const SUS2DeviceModel& model,
+  int pair,
+  RealT r,
+  RealT* vals,
+  RealT* ders)
+{
+  const RealT dr = r - static_cast<RealT>(model.max_dist);
+  const RealT cutoff_f = dr * dr;
+  const RealT cutoff_der = static_cast<RealT>(2.0) * dr;
+
+#pragma unroll
+  for (int mu = 0; mu < RadialFuncs; ++mu) {
+    const size_t scal_base = (static_cast<size_t>(pair) * RadialFuncs + mu) * 2;
+    const RealT scal = static_cast<RealT>(model.radial_direct_scal_s[scal_base + 0]);
+    const RealT shift = static_cast<RealT>(model.radial_direct_scal_s[scal_base + 1]);
+    const RealT z = static_cast<RealT>(0.5) * scal * (r - shift);
+    const RealT ksi = tanh(z);
+    const RealT mult = static_cast<RealT>(0.5) * scal * (static_cast<RealT>(1.0) - ksi * ksi);
+    const size_t coeff_base = (static_cast<size_t>(pair) * RadialFuncs + mu) * RbSize;
+
+    RealT prev = static_cast<RealT>(1.0);
+    RealT prev_x = static_cast<RealT>(0.0);
+    RealT acc_s = static_cast<RealT>(model.radial_direct_coeffs[coeff_base]);
+    RealT acc_sx = static_cast<RealT>(0.0);
+
+    if (RbSize > 1) {
+      RealT curr = ksi;
+      RealT curr_x = static_cast<RealT>(1.0);
+      RealT coeff = static_cast<RealT>(model.radial_direct_coeffs[coeff_base + 1]);
+      acc_s += coeff * curr;
+      acc_sx += coeff * curr_x;
+
+#pragma unroll
+      for (int xi = 2; xi < RbSize; ++xi) {
+        const RealT next = static_cast<RealT>(2.0) * ksi * curr - prev;
+        const RealT next_x =
+          static_cast<RealT>(2.0) * (curr + ksi * curr_x) - prev_x;
+        coeff = static_cast<RealT>(model.radial_direct_coeffs[coeff_base + xi]);
+        acc_s += coeff * next;
+        acc_sx += coeff * next_x;
+        prev = curr;
+        prev_x = curr_x;
+        curr = next;
+        curr_x = next_x;
+      }
+    }
+
+    vals[mu] = cutoff_f * acc_s;
+    if (ders != nullptr) {
+      ders[mu] = cutoff_der * acc_s + cutoff_f * mult * acc_sx;
+    }
+  }
+}
+
+template <typename RealT, int L, int K>
+__device__ __forceinline__ bool direct_chebyshev_vals_ders_lk_static(
+  const SUS2DeviceModel& model,
+  int pair,
+  RealT r,
+  RealT* vals,
+  RealT* ders)
+{
+  constexpr int RadialFuncs = K * (L + 1);
+  if (model.radial_funcs_count != RadialFuncs) {
+    return false;
+  }
+  switch (model.rb_size) {
+    case 1:
+      direct_chebyshev_vals_ders_static<RealT, RadialFuncs, 1>(model, pair, r, vals, ders);
+      return true;
+    case 2:
+      direct_chebyshev_vals_ders_static<RealT, RadialFuncs, 2>(model, pair, r, vals, ders);
+      return true;
+    case 3:
+      direct_chebyshev_vals_ders_static<RealT, RadialFuncs, 3>(model, pair, r, vals, ders);
+      return true;
+    case 4:
+      direct_chebyshev_vals_ders_static<RealT, RadialFuncs, 4>(model, pair, r, vals, ders);
+      return true;
+    case 5:
+      direct_chebyshev_vals_ders_static<RealT, RadialFuncs, 5>(model, pair, r, vals, ders);
+      return true;
+    case 6:
+      direct_chebyshev_vals_ders_static<RealT, RadialFuncs, 6>(model, pair, r, vals, ders);
+      return true;
+    case 7:
+      direct_chebyshev_vals_ders_static<RealT, RadialFuncs, 7>(model, pair, r, vals, ders);
+      return true;
+    case 8:
+      direct_chebyshev_vals_ders_static<RealT, RadialFuncs, 8>(model, pair, r, vals, ders);
+      return true;
+    case 9:
+      direct_chebyshev_vals_ders_static<RealT, RadialFuncs, 9>(model, pair, r, vals, ders);
+      return true;
+    case 10:
+      direct_chebyshev_vals_ders_static<RealT, RadialFuncs, 10>(model, pair, r, vals, ders);
+      return true;
+    default:
+      return false;
   }
 }
 
@@ -1381,6 +1479,14 @@ __device__ __forceinline__ void interp_radial_vals_ders(
   RealT* ders)
 {
   if (model.use_radial_direct) {
+    if (model.use_tensor_basic_fastpath && model.tensor_l == 2 && model.tensor_k == 3 &&
+        direct_chebyshev_vals_ders_lk_static<RealT, 2, 3>(model, pair, r, vals, ders)) {
+      return;
+    }
+    if (model.use_tensor_basic_fastpath && model.tensor_l == 3 && model.tensor_k == 3 &&
+        direct_chebyshev_vals_ders_lk_static<RealT, 3, 3>(model, pair, r, vals, ders)) {
+      return;
+    }
     direct_chebyshev_vals_ders(model, pair, r, vals, ders);
     return;
   }

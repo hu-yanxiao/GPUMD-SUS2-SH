@@ -1475,3 +1475,60 @@ Conclusion: for this l3k3 Cu-Zr model, direct Chebyshev recurrence is about
 each radial function its own `(scal, s)`, so direct mode performs repeated
 `tanh` and recurrence work per neighbor. The LUT path remains the recommended
 default; direct mode is useful as a controlled experiment or diagnostic path.
+
+## Direct Chebyshev Reorder And Static Expansion
+
+Optimized the direct Chebyshev path without changing the SUS2 mathematical
+expression:
+
+```text
+R_mu(r) = (r - rcut)^2 S_mu(x)
+S_mu(x) = sum_n c_{mu,n} T_n(x)
+dR_mu/dr = 2(r - rcut) S_mu(x) + (r - rcut)^2 dx/dr dS_mu/dx
+```
+
+The implementation now contracts `S_mu` and `dS_mu/dx` first, then applies the
+cutoff and cutoff derivative once. This replaces the earlier recurrence that
+mixed the cutoff into every Chebyshev order. The dynamic fallback uses the same
+rewrite.
+
+Added static direct Chebyshev expansion for the current common tensor layouts:
+
+```text
+l2k3 and l3k3
+rb_size = 1..10
+radial_funcs_count = K * (L + 1)
+```
+
+The first benchmark target was the Si `l2k3` model:
+
+```text
+directory = /work/phy-weigw/hyx/si/bench_l2k3_1m_gpumd_20260430
+model = /work/phy-weigw/hyx/si/p.mtp
+system = 1,000,000 atoms from 50x50x50 Si.vasp repeat
+settings = 1 A100, sus2_float=1, NPT, 1 fs, 2000 steps
+```
+
+Before this optimization:
+
+```text
+LUT float = 4.68750e7 atom-step/s
+direct float = 4.56153e7 atom-step/s
+direct/LUT = 0.9731
+```
+
+After this optimization, rerun with the same rebuilt binary:
+
+```text
+LUT float rerun = 4.69970e7 atom-step/s
+optimized direct float = 5.39460e7 atom-step/s
+optimized direct / previous direct = 1.18263
+optimized direct / LUT rerun = 1.14786
+```
+
+Takeaway: on this Si `l2k3` float model, direct Chebyshev now outperforms the
+LUT path by about 14.8%. The win comes from algebraic contraction plus
+compile-time `l2k3, rb_size=8` unrolling. This makes direct radial evaluation a
+real candidate for small Chebyshev models in `sus2_float` mode; double mode
+still favors LUT because repeated double `tanh` and recurrence arithmetic are
+more expensive.
