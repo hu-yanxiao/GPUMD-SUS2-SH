@@ -1704,6 +1704,41 @@ __device__ __noinline__ void direct_radial_vals_ders_dynamic(
   direct_radial_vals_ders_impl<RealT, 32, 16, 8, false>(model, pair, r, vals, ders);
 }
 
+template <typename RealT, int L, int K, int RbSize>
+__device__ __forceinline__ bool direct_radial_vals_ders_lkrb_static(
+  const SUS2DeviceModel& model,
+  int pair,
+  RealT r,
+  RealT* vals,
+  RealT* ders)
+{
+  constexpr int RadialFuncs = K * (L + 1);
+  constexpr int AngularChannels = L + 1;
+  if (model.radial_funcs_count != RadialFuncs || model.rb_size != RbSize) {
+    return false;
+  }
+
+  if (model.radial_basis_kind == static_cast<int>(RadialBasisKind::ChebyshevSSS)) {
+    direct_chebyshev_vals_ders_impl<RealT, RadialFuncs, RbSize, AngularChannels, true>(
+      model, pair, r, vals, ders);
+    return true;
+  }
+  if (model.radial_basis_kind == static_cast<int>(RadialBasisKind::JacobiSSS) ||
+      model.radial_basis_kind == static_cast<int>(RadialBasisKind::JacobiSSSNoWeight)) {
+    direct_jacobi_vals_ders_impl<RealT, RadialFuncs, RbSize, AngularChannels, true>(
+      model, pair, r, vals, ders);
+    return true;
+  }
+  if (model.radial_basis_kind == static_cast<int>(RadialBasisKind::LaguerreLog1p) ||
+      model.radial_basis_kind == static_cast<int>(RadialBasisKind::LaguerreLog1pNoEnv) ||
+      model.radial_basis_kind == static_cast<int>(RadialBasisKind::LaguerreLog1pPositive)) {
+    direct_laguerre_vals_ders_impl<RealT, RadialFuncs, RbSize, true>(
+      model, pair, r, vals, ders);
+    return true;
+  }
+  return false;
+}
+
 template <typename RealT, int L, int K>
 __device__ __forceinline__ bool direct_radial_vals_ders_lk_static(
   const SUS2DeviceModel& model,
@@ -1713,14 +1748,34 @@ __device__ __forceinline__ bool direct_radial_vals_ders_lk_static(
   RealT* ders)
 {
   constexpr int RadialFuncs = K * (L + 1);
-  constexpr int AngularChannels = L + 1;
-  if (model.radial_funcs_count != RadialFuncs ||
-      model.radial_basis_kind != static_cast<int>(RadialBasisKind::ChebyshevSSS)) {
+  if (model.radial_funcs_count != RadialFuncs) {
     return false;
   }
-  direct_chebyshev_vals_ders_impl<RealT, RadialFuncs, 16, AngularChannels, false>(
-    model, pair, r, vals, ders);
-  return true;
+
+  switch (model.rb_size) {
+    case 1:
+      return direct_radial_vals_ders_lkrb_static<RealT, L, K, 1>(model, pair, r, vals, ders);
+    case 2:
+      return direct_radial_vals_ders_lkrb_static<RealT, L, K, 2>(model, pair, r, vals, ders);
+    case 3:
+      return direct_radial_vals_ders_lkrb_static<RealT, L, K, 3>(model, pair, r, vals, ders);
+    case 4:
+      return direct_radial_vals_ders_lkrb_static<RealT, L, K, 4>(model, pair, r, vals, ders);
+    case 5:
+      return direct_radial_vals_ders_lkrb_static<RealT, L, K, 5>(model, pair, r, vals, ders);
+    case 6:
+      return direct_radial_vals_ders_lkrb_static<RealT, L, K, 6>(model, pair, r, vals, ders);
+    case 7:
+      return direct_radial_vals_ders_lkrb_static<RealT, L, K, 7>(model, pair, r, vals, ders);
+    case 8:
+      return direct_radial_vals_ders_lkrb_static<RealT, L, K, 8>(model, pair, r, vals, ders);
+    case 9:
+      return direct_radial_vals_ders_lkrb_static<RealT, L, K, 9>(model, pair, r, vals, ders);
+    case 10:
+      return direct_radial_vals_ders_lkrb_static<RealT, L, K, 10>(model, pair, r, vals, ders);
+    default:
+      return false;
+  }
 }
 
 template <typename RealT>
@@ -1797,6 +1852,20 @@ struct Sus2DirectRadialStaticDispatch {
 
 SUS2_DEFINE_DIRECT_RADIAL_STATIC_DISPATCH(2, 3);
 SUS2_DEFINE_DIRECT_RADIAL_STATIC_DISPATCH(3, 3);
+SUS2_DEFINE_DIRECT_RADIAL_STATIC_DISPATCH(1, 1);
+SUS2_DEFINE_DIRECT_RADIAL_STATIC_DISPATCH(1, 2);
+SUS2_DEFINE_DIRECT_RADIAL_STATIC_DISPATCH(1, 3);
+SUS2_DEFINE_DIRECT_RADIAL_STATIC_DISPATCH(1, 4);
+SUS2_DEFINE_DIRECT_RADIAL_STATIC_DISPATCH(2, 1);
+SUS2_DEFINE_DIRECT_RADIAL_STATIC_DISPATCH(2, 2);
+SUS2_DEFINE_DIRECT_RADIAL_STATIC_DISPATCH(2, 4);
+SUS2_DEFINE_DIRECT_RADIAL_STATIC_DISPATCH(3, 1);
+SUS2_DEFINE_DIRECT_RADIAL_STATIC_DISPATCH(3, 2);
+SUS2_DEFINE_DIRECT_RADIAL_STATIC_DISPATCH(3, 4);
+SUS2_DEFINE_DIRECT_RADIAL_STATIC_DISPATCH(4, 1);
+SUS2_DEFINE_DIRECT_RADIAL_STATIC_DISPATCH(4, 2);
+SUS2_DEFINE_DIRECT_RADIAL_STATIC_DISPATCH(4, 3);
+SUS2_DEFINE_DIRECT_RADIAL_STATIC_DISPATCH(4, 4);
 
 #undef SUS2_DEFINE_DIRECT_RADIAL_STATIC_DISPATCH
 
