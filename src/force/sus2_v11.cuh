@@ -55,6 +55,7 @@ private:
   int rb_size_ = 0;
   int alpha_basic_count_ = 0;
   int alpha_times_count_ = 0;
+  int alpha_time_group_count_ = 0;
   int alpha_moments_count_ = 0;
   int alpha_scalar_moments_ = 0;
   int max_rank_ = 0;
@@ -73,6 +74,7 @@ private:
   GPU_Vector<float> moment_coeffs_float_;
   GPU_Vector<int> alpha_basic_;
   GPU_Vector<int> alpha_times_;
+  GPU_Vector<int> alpha_time_groups_;
   GPU_Vector<int> alpha_moment_mapping_;
   GPU_Vector<float> lut_vals_;
   GPU_Vector<float> lut_ders_;
@@ -97,6 +99,8 @@ private:
   bool use_fused_energy_backward_ = true;
   bool use_fused_graph_ = true;
   bool use_local_product_graph_ = false;
+  bool use_product_assign_ = true;
+  bool product_assign_supported_ = false;
   bool use_tensor_force_grad_cache_ = true;
   bool use_float_moment_grads_ = false;
   bool use_float_moments_ = false;

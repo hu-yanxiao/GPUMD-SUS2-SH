@@ -1443,8 +1443,20 @@ phi_n = 2 * x * phi_{n-1} - phi_{n-2}
 
 with the corresponding derivative recurrence. This borrows NEP's preference
 for cheap on-the-fly radial arithmetic when the basis recurrence is simple,
-while keeping Jacobi/Laguerre on the lookup-table path until separate direct
-kernels are justified and checked.
+and was initially restricted to Chebyshev before the later Jacobi/Laguerre
+direct kernels were justified and checked.
+
+2026-05-01 production optimization update:
+
+- `product_assign` is now the default for supported tensor fast-path, fused
+  product-graph models. It can still be disabled with
+  `sus2_product_assign=0` or `SUS2_GPUMD_PRODUCT_ASSIGN=0`.
+- Jacobi direct recurrence now uses constant-memory recurrence coefficient
+  tables for the supported indexed Jacobi blocks instead of recomputing the
+  coefficient formula inside every edge/order evaluation.
+- The finite direct-radial static dispatch now also specializes Jacobi
+  weighted/no-weight and Laguerre env/noenv/positive variants at compile time.
+  Chebyshev keeps its existing direct recurrence path.
 
 Cu-Zr `RBChebyshev_sss_lmp` static check:
 

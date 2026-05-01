@@ -171,10 +171,26 @@ export SUS2_GPUMD_RADIAL_DIRECT=1
 ```
 
 This bypasses the radial lookup table and evaluates the
-`RBChebyshev_sss[_lmp]` radial values and derivatives by the same recurrence
-used to build the LUT. It is opt-in and currently rejects Jacobi/Laguerre
-families so the default behavior and broad radial-basis support stay table
-based.
+radial values and derivatives by the same recurrence used to build the LUT.
+Current direct mode supports `RBChebyshev_sss[_lmp]`,
+`RBJacobi_sss[_lmp]`, `RBJacobi_sss_noweight[_lmp]`, and the
+`RBLaguerre_log1p` family when `radial_basis_size <= 16`. LUT mode remains the
+default unless `sus2_radial_direct=1` or `SUS2_GPUMD_RADIAL_DIRECT=1` is set.
+
+Product-graph assign-forward is enabled by default for supported tensor
+fast-path models. It assigns each product moment once from grouped
+`alpha_index_times` destinations and skips the full `moment_vals` memset. To
+disable it for debugging or parity checks:
+
+```text
+potential p.mtp Cu Zr sus2_product_assign=0
+```
+
+or:
+
+```bash
+export SUS2_GPUMD_PRODUCT_ASSIGN=0
+```
 
 ## LSF Job Template
 
