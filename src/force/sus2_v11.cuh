@@ -79,6 +79,7 @@ private:
   GPU_Vector<int> l3k3_tensor_scalar_terms_;
   GPU_Vector<double> l3k3_tensor_scalar_coeffs_;
   GPU_Vector<float> l3k3_tensor_scalar_coeffs_float_;
+  GPU_Vector<int> l3k3_tensor_block_ops_;
   GPU_Vector<float> lut_vals_;
   GPU_Vector<float> lut_ders_;
   GPU_Vector<float> radial_direct_coeffs_;
@@ -106,10 +107,12 @@ private:
   bool product_assign_supported_ = false;
   bool use_tensor_force_grad_cache_ = true;
   bool use_l3k3_tensor_scalar_ = false;
+  bool use_l3k3_tensor_block_ = false;
   bool use_float_moment_grads_ = false;
   bool use_float_moments_ = false;
   bool use_radial_direct_ = false;
   int l3k3_tensor_scalar_term_count_ = 0;
+  int l3k3_tensor_block_op_count_ = 0;
 
   GPU_Vector<double> moment_vals_;
   GPU_Vector<float> moment_vals_float_;

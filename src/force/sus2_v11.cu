@@ -36,6 +36,7 @@ constexpr int kSus2L3K3TensorScalarBasic = 60;
 constexpr int kSus2TensorScalarMaxDegree = 5;
 constexpr int kSus2TensorScalarPackedInts = kSus2TensorScalarMaxDegree + 1;
 constexpr int kSus2TensorScalarBlockSize = 128;
+constexpr int kSus2TensorBlockOpInts = 2;
 constexpr double kLaguerreMinRho = 1.0e-8;
 constexpr double kLaguerrePositiveParamFloor = 1.0e-6;
 
@@ -153,6 +154,8 @@ struct SUS2DeviceModel {
   const int* l3k3_tensor_scalar_terms;
   const double* l3k3_tensor_scalar_coeffs;
   const float* l3k3_tensor_scalar_coeffs_float;
+  int l3k3_tensor_block_op_count;
+  const int* l3k3_tensor_block_ops;
   const float* lut_vals;
   const float* lut_ders;
   const float* radial_direct_coeffs;
@@ -167,6 +170,7 @@ struct SUS2DeviceModel {
   bool use_float_model_params;
   bool use_radial_direct;
   bool use_l3k3_tensor_scalar;
+  bool use_l3k3_tensor_block;
 };
 
 struct TensorBasicLayout {
@@ -181,6 +185,13 @@ struct L3K3TensorScalarPlan {
   int max_degree = 0;
   std::vector<int> terms;
   std::vector<double> coeffs;
+};
+
+struct L3K3TensorBlockPlan {
+  bool enabled = false;
+  int op_count = 0;
+  int component_group_count = 0;
+  std::vector<int> ops;
 };
 
 [[noreturn]] void sus2_input_error(const std::string& message)
@@ -909,6 +920,548 @@ L3K3TensorScalarPlan build_l3k3_tensor_scalar_plan(const SUS2HostModel& model)
   return plan;
 }
 
+using L3K3Component = std::vector<std::vector<int>>;
+
+struct L3K3TensorBlockHostBlock {
+  int id = -1;
+  int start = 0;
+  std::vector<int> ids;
+  std::vector<int> groups;
+  std::vector<L3K3Component> components;
+
+  int id_for(L3K3Component comp) const
+  {
+    for (auto& part : comp) {
+      std::sort(part.begin(), part.end());
+    }
+    for (size_t i = 0; i < components.size(); ++i) {
+      if (components[i] == comp) {
+        return ids[i];
+      }
+    }
+    return -1;
+  }
+};
+
+struct L3K3TensorBlockLabel {
+  int side = 0;
+  int index = 0;
+  int size = 0;
+};
+
+struct L3K3TensorBlockCandidate {
+  int component_count = 0;
+  std::vector<std::vector<int>> matrix;
+  std::vector<int> out_groups;
+  std::vector<std::vector<L3K3TensorBlockLabel>> grouped_labels;
+};
+
+std::vector<std::vector<int>> l3k3_sym_tuples(int rank)
+{
+  std::vector<std::vector<int>> out;
+  if (rank == 0) {
+    out.push_back(std::vector<int>());
+    return out;
+  }
+  for (int a = rank; a >= 0; --a) {
+    for (int b = rank - a; b >= 0; --b) {
+      const int c = rank - a - b;
+      std::vector<int> part;
+      part.insert(part.end(), a, 0);
+      part.insert(part.end(), b, 1);
+      part.insert(part.end(), c, 2);
+      out.push_back(part);
+    }
+  }
+  return out;
+}
+
+void l3k3_components_rec(
+  const std::vector<int>& groups,
+  int index,
+  L3K3Component& current,
+  std::vector<L3K3Component>& out)
+{
+  if (index == static_cast<int>(groups.size())) {
+    out.push_back(current);
+    return;
+  }
+  const std::vector<std::vector<int>> parts = l3k3_sym_tuples(groups[index]);
+  for (const auto& part : parts) {
+    current.push_back(part);
+    l3k3_components_rec(groups, index + 1, current, out);
+    current.pop_back();
+  }
+}
+
+std::vector<L3K3Component> l3k3_components(const std::vector<int>& groups)
+{
+  std::vector<L3K3Component> out;
+  if (groups.empty()) {
+    out.push_back(L3K3Component());
+    return out;
+  }
+  L3K3Component current;
+  l3k3_components_rec(groups, 0, current, out);
+  return out;
+}
+
+L3K3TensorBlockHostBlock make_l3k3_tensor_block(
+  int id,
+  int start,
+  int count,
+  const std::vector<int>& groups)
+{
+  L3K3TensorBlockHostBlock block;
+  block.id = id;
+  block.start = start;
+  block.groups = groups;
+  block.ids.reserve(count);
+  for (int k = 0; k < count; ++k) {
+    block.ids.push_back(start + k);
+  }
+  block.components = l3k3_components(groups);
+  if (static_cast<int>(block.components.size()) != count) {
+    return L3K3TensorBlockHostBlock{};
+  }
+  return block;
+}
+
+void l3k3_coarsen_labels_rec(
+  const std::vector<L3K3TensorBlockLabel>& labels,
+  int pos,
+  std::vector<int>& sizes,
+  std::vector<std::vector<L3K3TensorBlockLabel>>& grouped,
+  std::vector<L3K3TensorBlockCandidate>& out,
+  const std::vector<std::vector<int>>& matrix)
+{
+  if (pos == static_cast<int>(labels.size())) {
+    L3K3TensorBlockCandidate candidate;
+    candidate.matrix = matrix;
+    candidate.out_groups = sizes;
+    candidate.grouped_labels = grouped;
+    candidate.component_count = static_cast<int>(l3k3_components(sizes).size());
+    out.push_back(candidate);
+    return;
+  }
+  int total = 0;
+  std::vector<L3K3TensorBlockLabel> label_group;
+  for (int end = pos; end < static_cast<int>(labels.size()); ++end) {
+    total += labels[end].size;
+    label_group.push_back(labels[end]);
+    sizes.push_back(total);
+    grouped.push_back(label_group);
+    l3k3_coarsen_labels_rec(labels, end + 1, sizes, grouped, out, matrix);
+    sizes.pop_back();
+    grouped.pop_back();
+  }
+}
+
+void l3k3_add_candidate_coarsenings(
+  const std::vector<L3K3TensorBlockLabel>& labels,
+  const std::vector<std::vector<int>>& matrix,
+  std::vector<L3K3TensorBlockCandidate>& out)
+{
+  if (labels.empty()) {
+    L3K3TensorBlockCandidate candidate;
+    candidate.matrix = matrix;
+    candidate.component_count = 1;
+    out.push_back(candidate);
+    return;
+  }
+  std::vector<int> order(labels.size());
+  for (size_t i = 0; i < order.size(); ++i) {
+    order[i] = static_cast<int>(i);
+  }
+  do {
+    std::vector<L3K3TensorBlockLabel> permuted;
+    permuted.reserve(labels.size());
+    for (int id : order) {
+      permuted.push_back(labels[id]);
+    }
+    std::vector<int> sizes;
+    std::vector<std::vector<L3K3TensorBlockLabel>> grouped;
+    l3k3_coarsen_labels_rec(permuted, 0, sizes, grouped, out, matrix);
+  } while (std::next_permutation(order.begin(), order.end()));
+}
+
+void l3k3_contraction_matrices_rec(
+  const std::vector<int>& groups_a,
+  const std::vector<int>& groups_b,
+  int cell,
+  std::vector<int>& rem_a,
+  std::vector<int>& rem_b,
+  std::vector<std::vector<int>>& matrix,
+  std::vector<std::vector<std::vector<int>>>& out)
+{
+  const int rows = static_cast<int>(groups_a.size());
+  const int cols = static_cast<int>(groups_b.size());
+  if (cell == rows * cols) {
+    out.push_back(matrix);
+    return;
+  }
+  const int i = cell / cols;
+  const int j = cell % cols;
+  const int max_value = std::min(rem_a[i], rem_b[j]);
+  for (int value = 0; value <= max_value; ++value) {
+    matrix[i][j] = value;
+    rem_a[i] -= value;
+    rem_b[j] -= value;
+    l3k3_contraction_matrices_rec(groups_a, groups_b, cell + 1, rem_a, rem_b, matrix, out);
+    rem_a[i] += value;
+    rem_b[j] += value;
+  }
+  matrix[i][j] = 0;
+}
+
+std::vector<std::vector<std::vector<int>>> l3k3_contraction_matrices(
+  const std::vector<int>& groups_a,
+  const std::vector<int>& groups_b)
+{
+  if (groups_a.empty() || groups_b.empty()) {
+    return std::vector<std::vector<std::vector<int>>>{std::vector<std::vector<int>>()};
+  }
+  std::vector<std::vector<std::vector<int>>> out;
+  std::vector<int> rem_a = groups_a;
+  std::vector<int> rem_b = groups_b;
+  std::vector<std::vector<int>> matrix(groups_a.size(), std::vector<int>(groups_b.size(), 0));
+  l3k3_contraction_matrices_rec(groups_a, groups_b, 0, rem_a, rem_b, matrix, out);
+  return out;
+}
+
+int l3k3_matrix_value(const std::vector<std::vector<int>>& matrix, int i, int j)
+{
+  return matrix.empty() ? 0 : matrix[i][j];
+}
+
+bool l3k3_split_output_component(
+  const L3K3Component& out_component,
+  const std::vector<std::vector<L3K3TensorBlockLabel>>& grouped_labels,
+  std::map<std::pair<int, int>, std::vector<int>>& assignments)
+{
+  assignments.clear();
+  if (out_component.size() != grouped_labels.size()) {
+    return false;
+  }
+  for (size_t g = 0; g < grouped_labels.size(); ++g) {
+    int offset = 0;
+    for (const auto& label : grouped_labels[g]) {
+      if (offset + label.size > static_cast<int>(out_component[g].size())) {
+        return false;
+      }
+      assignments[std::make_pair(label.side, label.index)] = std::vector<int>(
+        out_component[g].begin() + offset, out_component[g].begin() + offset + label.size);
+      offset += label.size;
+    }
+    if (offset != static_cast<int>(out_component[g].size())) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void l3k3_generated_rows_rec(
+  int pair_index,
+  const std::vector<std::pair<int, int>>& pairs,
+  const L3K3TensorBlockHostBlock& block_a,
+  const L3K3TensorBlockHostBlock& block_b,
+  std::vector<std::vector<int>>& comp_a,
+  std::vector<std::vector<int>>& comp_b,
+  std::map<std::pair<int, int>, int>& rows,
+  bool& ok)
+{
+  if (!ok) {
+    return;
+  }
+  if (pair_index == static_cast<int>(pairs.size())) {
+    const int id_a = block_a.id_for(comp_a);
+    const int id_b = block_b.id_for(comp_b);
+    if (id_a < 0 || id_b < 0) {
+      ok = false;
+      return;
+    }
+    rows[std::make_pair(id_a, id_b)] += 1;
+    return;
+  }
+  const int ai = pairs[pair_index].first;
+  const int bi = pairs[pair_index].second;
+  for (int value = 0; value < 3; ++value) {
+    comp_a[ai].push_back(value);
+    comp_b[bi].push_back(value);
+    l3k3_generated_rows_rec(pair_index + 1, pairs, block_a, block_b, comp_a, comp_b, rows, ok);
+    comp_b[bi].pop_back();
+    comp_a[ai].pop_back();
+  }
+}
+
+bool l3k3_generated_rows(
+  const L3K3TensorBlockHostBlock& block_a,
+  const L3K3TensorBlockHostBlock& block_b,
+  const std::vector<std::vector<int>>& matrix,
+  const std::vector<std::vector<L3K3TensorBlockLabel>>& grouped_labels,
+  const L3K3Component& out_component,
+  std::vector<std::array<int, 3>>& out_rows)
+{
+  std::map<std::pair<int, int>, std::vector<int>> assignments;
+  if (!l3k3_split_output_component(out_component, grouped_labels, assignments)) {
+    return false;
+  }
+  std::vector<std::vector<int>> comp_a(block_a.groups.size());
+  std::vector<std::vector<int>> comp_b(block_b.groups.size());
+  for (size_t i = 0; i < block_a.groups.size(); ++i) {
+    const auto found = assignments.find(std::make_pair(0, static_cast<int>(i)));
+    if (found != assignments.end()) {
+      comp_a[i] = found->second;
+    }
+  }
+  for (size_t j = 0; j < block_b.groups.size(); ++j) {
+    const auto found = assignments.find(std::make_pair(1, static_cast<int>(j)));
+    if (found != assignments.end()) {
+      comp_b[j] = found->second;
+    }
+  }
+  std::vector<std::pair<int, int>> pairs;
+  for (size_t i = 0; i < block_a.groups.size(); ++i) {
+    for (size_t j = 0; j < block_b.groups.size(); ++j) {
+      const int count = l3k3_matrix_value(matrix, static_cast<int>(i), static_cast<int>(j));
+      for (int k = 0; k < count; ++k) {
+        pairs.push_back(std::make_pair(static_cast<int>(i), static_cast<int>(j)));
+      }
+    }
+  }
+  std::map<std::pair<int, int>, int> row_map;
+  bool ok = true;
+  l3k3_generated_rows_rec(0, pairs, block_a, block_b, comp_a, comp_b, row_map, ok);
+  if (!ok) {
+    return false;
+  }
+  out_rows.clear();
+  for (const auto& row : row_map) {
+    out_rows.push_back(std::array<int, 3>{{row.first.first, row.first.second, row.second}});
+  }
+  return true;
+}
+
+bool l3k3_candidate_matches(
+  const SUS2HostModel& model,
+  const std::vector<int>& group_begin,
+  const std::vector<int>& group_len,
+  int group_index,
+  const L3K3TensorBlockHostBlock& block_a,
+  const L3K3TensorBlockHostBlock& block_b,
+  const L3K3TensorBlockCandidate& candidate)
+{
+  const std::vector<L3K3Component> out_components = l3k3_components(candidate.out_groups);
+  if (group_index + static_cast<int>(out_components.size()) > static_cast<int>(group_begin.size())) {
+    return false;
+  }
+  for (size_t component = 0; component < out_components.size(); ++component) {
+    const int g = group_index + static_cast<int>(component);
+    std::vector<std::array<int, 3>> expected;
+    if (!l3k3_generated_rows(
+          block_a,
+          block_b,
+          candidate.matrix,
+          candidate.grouped_labels,
+          out_components[component],
+          expected)) {
+      return false;
+    }
+    std::vector<std::array<int, 3>> actual;
+    actual.reserve(group_len[g]);
+    for (int k = 0; k < group_len[g]; ++k) {
+      const int t = group_begin[g] + k;
+      actual.push_back(std::array<int, 3>{{model.alpha_times[t * 4 + 0], model.alpha_times[t * 4 + 1], model.alpha_times[t * 4 + 2]}});
+    }
+    std::sort(actual.begin(), actual.end());
+    if (actual != expected) {
+      return false;
+    }
+  }
+  return true;
+}
+
+L3K3TensorBlockPlan build_l3k3_tensor_block_plan(const SUS2HostModel& model)
+{
+  L3K3TensorBlockPlan plan;
+  const TensorBasicLayout layout = detect_tensor_alpha_basic_layout(model);
+  if (!layout.enabled || layout.l != 3 || layout.k != 3 ||
+      model.alpha_basic_count != kSus2L3K3TensorScalarBasic ||
+      !supports_product_assign(model)) {
+    return plan;
+  }
+
+  std::vector<int> group_begin;
+  std::vector<int> group_len;
+  std::vector<int> group_dst;
+  std::vector<int> dst_to_group(model.alpha_moments_count, -1);
+  for (int t = 0; t < model.alpha_times_count;) {
+    const int begin = t;
+    const int dst = model.alpha_times[t * 4 + 3];
+    do {
+      ++t;
+    } while (t < model.alpha_times_count && model.alpha_times[t * 4 + 3] == dst);
+    group_begin.push_back(begin);
+    group_len.push_back(t - begin);
+    group_dst.push_back(dst);
+    if (dst < 0 || dst >= model.alpha_moments_count || dst_to_group[dst] >= 0) {
+      return L3K3TensorBlockPlan{};
+    }
+    dst_to_group[dst] = static_cast<int>(group_begin.size()) - 1;
+  }
+
+  std::vector<L3K3TensorBlockHostBlock> blocks;
+  std::vector<int> moment_to_block(model.alpha_moments_count, -1);
+  const int starts[4] = {0, 1, 4, 10};
+  const int counts[4] = {1, 3, 6, 10};
+  for (int group = 0; group < 3; ++group) {
+    for (int rank = 0; rank < 4; ++rank) {
+      std::vector<int> tensor_groups;
+      if (rank > 0) {
+        tensor_groups.push_back(rank);
+      }
+      L3K3TensorBlockHostBlock block =
+        make_l3k3_tensor_block(static_cast<int>(blocks.size()), group * 20 + starts[rank], counts[rank], tensor_groups);
+      if (block.id < 0) {
+        return L3K3TensorBlockPlan{};
+      }
+      blocks.push_back(block);
+      for (int id : block.ids) {
+        moment_to_block[id] = block.id;
+      }
+    }
+  }
+
+  for (int cursor = model.alpha_basic_count; cursor < model.alpha_moments_count;) {
+    if (moment_to_block[cursor] >= 0) {
+      ++cursor;
+      continue;
+    }
+    const int group_index = dst_to_group[cursor];
+    if (group_index < 0) {
+      return L3K3TensorBlockPlan{};
+    }
+    int src_block_a = -1;
+    int src_block_b = -1;
+    for (int k = 0; k < group_len[group_index]; ++k) {
+      const int t = group_begin[group_index] + k;
+      const int src0 = model.alpha_times[t * 4 + 0];
+      const int src1 = model.alpha_times[t * 4 + 1];
+      if (src0 < 0 || src0 >= model.alpha_moments_count || src1 < 0 ||
+          src1 >= model.alpha_moments_count || moment_to_block[src0] < 0 ||
+          moment_to_block[src1] < 0) {
+        return L3K3TensorBlockPlan{};
+      }
+      if (k == 0) {
+        src_block_a = moment_to_block[src0];
+        src_block_b = moment_to_block[src1];
+      } else if (src_block_a != moment_to_block[src0] || src_block_b != moment_to_block[src1]) {
+        return L3K3TensorBlockPlan{};
+      }
+    }
+    const L3K3TensorBlockHostBlock& block_a = blocks[src_block_a];
+    const L3K3TensorBlockHostBlock& block_b = blocks[src_block_b];
+
+    std::vector<L3K3TensorBlockCandidate> candidates;
+    const auto matrices = l3k3_contraction_matrices(block_a.groups, block_b.groups);
+    for (const auto& matrix : matrices) {
+      std::vector<L3K3TensorBlockLabel> labels;
+      bool valid = true;
+      int free_rank = 0;
+      for (size_t i = 0; i < block_a.groups.size(); ++i) {
+        int used = 0;
+        for (size_t j = 0; j < block_b.groups.size(); ++j) {
+          used += l3k3_matrix_value(matrix, static_cast<int>(i), static_cast<int>(j));
+        }
+        const int remaining = block_a.groups[i] - used;
+        if (remaining < 0) {
+          valid = false;
+        } else if (remaining > 0) {
+          L3K3TensorBlockLabel label;
+          label.side = 0;
+          label.index = static_cast<int>(i);
+          label.size = remaining;
+          labels.push_back(label);
+          free_rank += remaining;
+        }
+      }
+      for (size_t j = 0; j < block_b.groups.size(); ++j) {
+        int used = 0;
+        for (size_t i = 0; i < block_a.groups.size(); ++i) {
+          used += l3k3_matrix_value(matrix, static_cast<int>(i), static_cast<int>(j));
+        }
+        const int remaining = block_b.groups[j] - used;
+        if (remaining < 0) {
+          valid = false;
+        } else if (remaining > 0) {
+          L3K3TensorBlockLabel label;
+          label.side = 1;
+          label.index = static_cast<int>(j);
+          label.size = remaining;
+          labels.push_back(label);
+          free_rank += remaining;
+        }
+      }
+      if (!valid || free_rank > 3) {
+        continue;
+      }
+      l3k3_add_candidate_coarsenings(labels, matrix, candidates);
+    }
+    std::sort(
+      candidates.begin(),
+      candidates.end(),
+      [](const L3K3TensorBlockCandidate& lhs, const L3K3TensorBlockCandidate& rhs) {
+        return lhs.component_count > rhs.component_count;
+      });
+
+    const L3K3TensorBlockCandidate* matched = nullptr;
+    for (const auto& candidate : candidates) {
+      if (candidate.component_count <= 0 || cursor + candidate.component_count > model.alpha_moments_count) {
+        continue;
+      }
+      bool contiguous_dst = true;
+      for (int k = 0; k < candidate.component_count; ++k) {
+        const int g = group_index + k;
+        if (g >= static_cast<int>(group_dst.size()) || group_dst[g] != cursor + k) {
+          contiguous_dst = false;
+          break;
+        }
+      }
+      if (contiguous_dst &&
+          l3k3_candidate_matches(model, group_begin, group_len, group_index, block_a, block_b, candidate)) {
+        matched = &candidate;
+        break;
+      }
+    }
+    if (matched == nullptr) {
+      return L3K3TensorBlockPlan{};
+    }
+
+    L3K3TensorBlockHostBlock block = make_l3k3_tensor_block(
+      static_cast<int>(blocks.size()), cursor, matched->component_count, matched->out_groups);
+    if (block.id < 0) {
+      return L3K3TensorBlockPlan{};
+    }
+    plan.ops.push_back(group_index);
+    plan.ops.push_back(matched->component_count);
+    plan.component_group_count += matched->component_count;
+    blocks.push_back(block);
+    for (int id : block.ids) {
+      moment_to_block[id] = block.id;
+    }
+    cursor += matched->component_count;
+  }
+
+  for (int moment : model.alpha_moment_mapping) {
+    if (moment < 0 || moment >= model.alpha_moments_count || moment_to_block[moment] < 0) {
+      return L3K3TensorBlockPlan{};
+    }
+  }
+  plan.enabled = true;
+  plan.op_count = static_cast<int>(plan.ops.size() / kSus2TensorBlockOpInts);
+  return plan;
+}
+
 SUS2HostModel load_model(const std::string& path)
 {
   const std::string text = read_text_file(path);
@@ -1340,6 +1893,35 @@ bool parse_l3k3_tensor_scalar(
     }
   }
   return use_tensor_scalar;
+}
+
+bool parse_l3k3_tensor_block(
+  const SUS2HostModel& model,
+  int num_potential_options,
+  const char** potential_options)
+{
+  bool use_tensor_block = false;
+  const char* env = std::getenv("SUS2_GPUMD_L3K3_TENSOR_BLOCK");
+  if (env != nullptr) {
+    use_tensor_block = parse_bool_value(env, "SUS2_GPUMD_L3K3_TENSOR_BLOCK");
+  }
+  const char* generic_env = std::getenv("SUS2_GPUMD_TENSOR_BLOCK");
+  if (generic_env != nullptr) {
+    use_tensor_block = parse_bool_value(generic_env, "SUS2_GPUMD_TENSOR_BLOCK");
+  }
+
+  const int option_begin = std::min(num_potential_options, model.species_count);
+  for (int i = option_begin; i < num_potential_options; ++i) {
+    const std::string option = potential_options[i] == nullptr ? "" : potential_options[i];
+    if (starts_with(option, "sus2_l3k3_tensor_block=") ||
+        starts_with(option, "l3k3_tensor_block=") ||
+        starts_with(option, "sus2_tensor_block=") ||
+        starts_with(option, "tensor_block=")) {
+      const size_t eq = option.find('=');
+      use_tensor_block = parse_bool_value(option.substr(eq + 1), option.substr(0, eq));
+    }
+  }
+  return use_tensor_block;
 }
 
 bool parse_fused_graph(
@@ -4031,6 +4613,89 @@ static __global__ void gpu_forward_energy_backward_const_u16_assign_group_table(
   }
 }
 
+template <typename RealT, typename GradT>
+static __global__ void gpu_l3k3_tensor_block_energy_backward(
+  int N,
+  SUS2DeviceModel model,
+  const int* type,
+  RealT* moments,
+  GradT* grads,
+  double* potential)
+{
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= N || model.l3k3_tensor_block_op_count <= 0 || model.alpha_time_groups == nullptr ||
+      model.l3k3_tensor_block_ops == nullptr) {
+    return;
+  }
+
+  for (int op = 0; op < model.l3k3_tensor_block_op_count; ++op) {
+    const int op_offset = op * kSus2TensorBlockOpInts;
+    const int group_begin = model.l3k3_tensor_block_ops[op_offset + 0];
+    const int component_count = model.l3k3_tensor_block_ops[op_offset + 1];
+    for (int component = 0; component < component_count; ++component) {
+      const int group_offset = (group_begin + component) * 3;
+      const int begin = model.alpha_time_groups[group_offset + 0];
+      const int len = model.alpha_time_groups[group_offset + 1];
+      const int dst = model.alpha_time_groups[group_offset + 2];
+      RealT dst_value = static_cast<RealT>(0.0);
+      for (int k = 0; k < len; ++k) {
+        const int offset = (begin + k) * 4;
+        int src0;
+        int src1;
+        int mult;
+        if (model.use_const_alpha_times) {
+          src0 = static_cast<int>(c_sus2_alpha_times_u16[offset + 0]);
+          src1 = static_cast<int>(c_sus2_alpha_times_u16[offset + 1]);
+          mult = static_cast<int>(c_sus2_alpha_times_u16[offset + 2]);
+        } else {
+          src0 = model.alpha_times[offset + 0];
+          src1 = model.alpha_times[offset + 1];
+          mult = model.alpha_times[offset + 2];
+        }
+        dst_value += static_cast<RealT>(mult) * moments[static_cast<size_t>(src0) * N + i] *
+                     moments[static_cast<size_t>(src1) * N + i];
+      }
+      moments[static_cast<size_t>(dst) * N + i] = dst_value;
+    }
+  }
+
+  sus2_init_site_energy_and_scalar_grads(N, model, i, type, moments, grads, potential);
+
+  for (int op = model.l3k3_tensor_block_op_count - 1; op >= 0; --op) {
+    const int op_offset = op * kSus2TensorBlockOpInts;
+    const int group_begin = model.l3k3_tensor_block_ops[op_offset + 0];
+    const int component_count = model.l3k3_tensor_block_ops[op_offset + 1];
+    for (int component = component_count - 1; component >= 0; --component) {
+      const int group_offset = (group_begin + component) * 3;
+      const int begin = model.alpha_time_groups[group_offset + 0];
+      const int len = model.alpha_time_groups[group_offset + 1];
+      const int dst = model.alpha_time_groups[group_offset + 2];
+      const RealT dst_grad =
+        static_cast<RealT>(load_sus2_grad(grads, N, dst, i));
+      for (int k = len - 1; k >= 0; --k) {
+        const int offset = (begin + k) * 4;
+        int src0;
+        int src1;
+        int mult;
+        if (model.use_const_alpha_times) {
+          src0 = static_cast<int>(c_sus2_alpha_times_u16[offset + 0]);
+          src1 = static_cast<int>(c_sus2_alpha_times_u16[offset + 1]);
+          mult = static_cast<int>(c_sus2_alpha_times_u16[offset + 2]);
+        } else {
+          src0 = model.alpha_times[offset + 0];
+          src1 = model.alpha_times[offset + 1];
+          mult = model.alpha_times[offset + 2];
+        }
+        const RealT gdst = dst_grad * static_cast<RealT>(mult);
+        add_sus2_grad(
+          grads, static_cast<size_t>(src1) * N + i, gdst * moments[static_cast<size_t>(src0) * N + i]);
+        add_sus2_grad(
+          grads, static_cast<size_t>(src0) * N + i, gdst * moments[static_cast<size_t>(src1) * N + i]);
+      }
+    }
+  }
+}
+
 template <typename GradT, typename RealT>
 static __global__ void gpu_compute_forces(
   int N,
@@ -4609,24 +5274,35 @@ SUS2_V11::SUS2_V11(
   use_radial_direct_ = parse_radial_direct(host_model, num_potential_options, potential_options);
   const bool request_l3k3_tensor_scalar =
     parse_l3k3_tensor_scalar(host_model, num_potential_options, potential_options);
+  const bool request_l3k3_tensor_block =
+    parse_l3k3_tensor_block(host_model, num_potential_options, potential_options);
   L3K3TensorScalarPlan l3k3_tensor_scalar_plan;
-  if (request_l3k3_tensor_scalar) {
+  L3K3TensorBlockPlan l3k3_tensor_block_plan;
+  if (request_l3k3_tensor_scalar && request_l3k3_tensor_block) {
+    sus2_input_error("SUS2 v1.1 tensor_scalar and tensor_block paths are mutually exclusive.");
+  }
+  if (request_l3k3_tensor_block) {
+    l3k3_tensor_block_plan = build_l3k3_tensor_block_plan(host_model);
+    use_l3k3_tensor_block_ = l3k3_tensor_block_plan.enabled;
+    l3k3_tensor_block_op_count_ = l3k3_tensor_block_plan.op_count;
+  } else if (request_l3k3_tensor_scalar) {
     l3k3_tensor_scalar_plan = build_l3k3_tensor_scalar_plan(host_model);
     use_l3k3_tensor_scalar_ = l3k3_tensor_scalar_plan.enabled;
     l3k3_tensor_scalar_term_count_ =
       static_cast<int>(l3k3_tensor_scalar_plan.coeffs.size());
   }
-  if (use_l3k3_tensor_scalar_) {
+  if (use_l3k3_tensor_scalar_ || use_l3k3_tensor_block_) {
     use_tensor_force_grad_cache_ = true;
     use_pairwise_no_atomic_force_ = false;
   }
   use_local_product_graph_ = use_local_product_graph_ && use_float_moments_ &&
                              alpha_moments_count_ <= kSus2LocalGraphMaxMoments &&
-                             !use_l3k3_tensor_scalar_;
+                             !use_l3k3_tensor_scalar_ && !use_l3k3_tensor_block_;
   product_assign_supported_ = supports_product_assign(host_model);
   use_product_assign_ = use_product_assign_ && product_assign_supported_ &&
                         use_fused_graph_ && !use_local_product_graph_ &&
-                        use_tensor_basic_fastpath_ && !use_l3k3_tensor_scalar_;
+                        use_tensor_basic_fastpath_ && !use_l3k3_tensor_scalar_ &&
+                        !use_l3k3_tensor_block_;
   use_const_float_coeffs_ = use_float_moments_ &&
                             host_model.species_count <= kSus2MaxConstSpecies &&
                             host_model.alpha_scalar_moments <= kSus2MaxConstScalarMoments;
@@ -4719,6 +5395,10 @@ SUS2_V11::SUS2_V11(
         host_l3k3_tensor_scalar_coeffs_float.data());
     }
   }
+  if (use_l3k3_tensor_block_) {
+    l3k3_tensor_block_ops_.resize(l3k3_tensor_block_plan.ops.size());
+    l3k3_tensor_block_ops_.copy_from_host(l3k3_tensor_block_plan.ops.data());
+  }
 
   if (use_radial_direct_) {
     std::vector<float> host_direct_coeffs;
@@ -4799,19 +5479,20 @@ SUS2_V11::SUS2_V11(
       tensor_l_,
       tensor_k_);
   }
-  if (use_const_alpha_times_ && !use_l3k3_tensor_scalar_) {
+  if (use_const_alpha_times_ && !use_l3k3_tensor_scalar_ && !use_l3k3_tensor_block_) {
     printf("SUS2 v1.1 GPUMD product-rule table: constant-memory uint16 alpha_index_times.\n");
   }
-  if (use_const_scalar_moments_ && !use_l3k3_tensor_scalar_) {
+  if (use_const_scalar_moments_ && !use_l3k3_tensor_scalar_ && !use_l3k3_tensor_block_) {
     printf("SUS2 v1.1 GPUMD scalar mapping: constant-memory uint16 alpha_moment_mapping.\n");
   }
   if (use_const_float_coeffs_) {
     printf("SUS2 v1.1 GPUMD float coefficients: constant-memory shift/species/moment coeffs.\n");
   }
-  if (use_fused_energy_backward_ && !use_l3k3_tensor_scalar_) {
+  if (use_fused_energy_backward_ && !use_l3k3_tensor_scalar_ && !use_l3k3_tensor_block_) {
     printf("SUS2 v1.1 GPUMD reverse path: fused site-energy gradient and product backward kernel.\n");
   }
-  if (use_fused_graph_ && !use_local_product_graph_ && !use_l3k3_tensor_scalar_) {
+  if (use_fused_graph_ && !use_local_product_graph_ && !use_l3k3_tensor_scalar_ &&
+      !use_l3k3_tensor_block_) {
     printf("SUS2 v1.1 GPUMD product graph path: fused forward/site-gradient/backward kernel.\n");
   }
   if (use_product_assign_) {
@@ -4819,7 +5500,7 @@ SUS2_V11::SUS2_V11(
       "SUS2 v1.1 GPUMD product graph micro-optimization: product moments use assign-forward and skip moment-value memset.\n");
   } else if (
     parse_product_assign(host_model, num_potential_options, potential_options) &&
-    !use_l3k3_tensor_scalar_) {
+    !use_l3k3_tensor_scalar_ && !use_l3k3_tensor_block_) {
     printf(
       "SUS2 v1.1 GPUMD product graph micro-optimization: product assign requested but unsupported for this path (supported=%s, fused=%s, local=%s, tensor_basic=%s).\n",
       product_assign_supported_ ? "yes" : "no",
@@ -4839,6 +5520,15 @@ SUS2_V11::SUS2_V11(
   } else if (request_l3k3_tensor_scalar) {
     printf(
       "SUS2 v1.1 GPUMD tensor-scalar path: requested but unsupported for this model; using product graph fallback.\n");
+  }
+  if (use_l3k3_tensor_block_) {
+    printf(
+      "SUS2 v1.1 GPUMD tensor-block path: l3k3 block DAG, ops=%d, component_groups=%d.\n",
+      l3k3_tensor_block_op_count_,
+      l3k3_tensor_block_plan.component_group_count);
+  } else if (request_l3k3_tensor_block) {
+    printf(
+      "SUS2 v1.1 GPUMD tensor-block path: requested but unsupported for this model; using product graph fallback.\n");
   }
   if (use_tensor_basic_fastpath_ && use_tensor_force_grad_cache_) {
     printf("SUS2 v1.1 GPUMD force path: cached tensor center basic gradients.\n");
@@ -5074,6 +5764,12 @@ void SUS2_V11::compute(
   if (use_l3k3_tensor_scalar_) {
     // The l3k3 tensor-scalar path overwrites the 60 basic moments and their
     // gradients directly; product moments are not materialized.
+  } else if (use_l3k3_tensor_block_) {
+    if (use_float_moment_grads_) {
+      CHECK(gpuMemset(moment_grads_float_.data(), 0, moment_size * sizeof(float)));
+    } else {
+      CHECK(gpuMemset(moment_grads_.data(), 0, moment_size * sizeof(double)));
+    }
   } else if (use_local_product_graph) {
     if (!use_tensor_basic_fastpath_) {
       CHECK(gpuMemset(moment_vals_float_.data(), 0, basic_moment_size * sizeof(float)));
@@ -5134,6 +5830,8 @@ void SUS2_V11::compute(
     use_l3k3_tensor_scalar_ ? l3k3_tensor_scalar_coeffs_.data() : nullptr,
     (use_l3k3_tensor_scalar_ && use_float_moments_) ? l3k3_tensor_scalar_coeffs_float_.data()
                                                      : nullptr,
+    l3k3_tensor_block_op_count_,
+    use_l3k3_tensor_block_ ? l3k3_tensor_block_ops_.data() : nullptr,
     use_radial_direct_ ? nullptr : lut_vals_.data(),
     use_radial_direct_ ? nullptr : lut_ders_.data(),
     use_radial_direct_ ? radial_direct_coeffs_.data() : nullptr,
@@ -5147,7 +5845,8 @@ void SUS2_V11::compute(
     use_const_float_coeffs_,
     use_float_moments_,
     use_radial_direct_,
-    use_l3k3_tensor_scalar_};
+    use_l3k3_tensor_scalar_,
+    use_l3k3_tensor_block_};
 
 #define SUS2_LAUNCH_TENSOR_BASIC_DYNAMIC(REAL_T, OUT_PTR) \
   do { \
@@ -5221,6 +5920,7 @@ void SUS2_V11::compute(
   profile_t = profile_start();
   const bool use_exact_l3k3_tensor = use_tensor_basic_fastpath_ && tensor_l_ == 3 && tensor_k_ == 3;
   const bool use_l3k3_tensor_scalar = use_l3k3_tensor_scalar_ && use_exact_l3k3_tensor;
+  const bool use_l3k3_tensor_block = use_l3k3_tensor_block_ && use_exact_l3k3_tensor;
 
   if (use_exact_l3k3_tensor) {
     if (use_float_moments_) {
@@ -5324,6 +6024,35 @@ void SUS2_V11::compute(
         potential.data());
     } else {
       gpu_l3k3_tensor_scalar_energy_backward<double, double><<<grid_size, kBlockSize>>>(
+        num_atoms,
+        model,
+        type.data(),
+        moment_vals_.data(),
+        moment_grads_.data(),
+        potential.data());
+    }
+    GPU_CHECK_KERNEL
+    profile_stop(profile_forward, profile_t);
+  } else if (use_l3k3_tensor_block) {
+    profile_t = profile_start();
+    if (use_float_moments_) {
+      gpu_l3k3_tensor_block_energy_backward<float, float><<<grid_size, kBlockSize>>>(
+        num_atoms,
+        model,
+        type.data(),
+        moment_vals_float_.data(),
+        moment_grads_float_.data(),
+        potential.data());
+    } else if (use_float_moment_grads_) {
+      gpu_l3k3_tensor_block_energy_backward<double, float><<<grid_size, kBlockSize>>>(
+        num_atoms,
+        model,
+        type.data(),
+        moment_vals_.data(),
+        moment_grads_float_.data(),
+        potential.data());
+    } else {
+      gpu_l3k3_tensor_block_energy_backward<double, double><<<grid_size, kBlockSize>>>(
         num_atoms,
         model,
         type.data(),
