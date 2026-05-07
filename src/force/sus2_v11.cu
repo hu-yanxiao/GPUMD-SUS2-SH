@@ -37,6 +37,9 @@ constexpr int kSus2TensorScalarMaxDegree = 5;
 constexpr int kSus2TensorScalarPackedInts = kSus2TensorScalarMaxDegree + 1;
 constexpr int kSus2TensorScalarBlockSize = 128;
 constexpr int kSus2TensorBlockOpInts = 6;
+constexpr int kSus2TensorBlockOpRowInts = 2;
+constexpr int kSus2TensorBlockRowWords = 2;
+constexpr int kSus2TensorBlockRowMaxU16 = 65535;
 constexpr int kSus2TensorBlockGeneric = 0;
 constexpr int kSus2TensorBlockScalarScalar = 1;
 constexpr int kSus2TensorBlockScalarTensor = 2;
@@ -179,6 +182,9 @@ struct SUS2DeviceModel {
   const float* l3k3_tensor_scalar_coeffs_float;
   int l3k3_tensor_block_op_count;
   const int* l3k3_tensor_block_ops;
+  const int* l3k3_tensor_block_op_rows;
+  int l3k3_tensor_block_row_count;
+  const unsigned int* l3k3_tensor_block_rows;
   const float* lut_vals;
   const float* lut_ders;
   const float* radial_direct_coeffs;
@@ -221,9 +227,12 @@ struct L3K3TensorBlockPlan {
   int candidate_count = 0;
   int matched_candidate_count = 0;
   int generic_row_count = 0;
+  int row_count = 0;
   int selected_cost_units = 0;
   std::array<int, kSus2TensorBlockMatMatTransScalar + 1> op_kind_counts{};
   std::vector<int> ops;
+  std::vector<int> op_rows;
+  std::vector<unsigned int> rows;
 };
 
 struct TensorAutoDecision {
@@ -1323,6 +1332,58 @@ bool l3k3_candidate_matches(
   return true;
 }
 
+unsigned int pack_l3k3_tensor_block_row_pair(int low, int high)
+{
+  return static_cast<unsigned int>(low) |
+         (static_cast<unsigned int>(high) << 16);
+}
+
+bool append_l3k3_tensor_block_rows(
+  const SUS2HostModel& model,
+  const std::vector<int>& group_begin,
+  const std::vector<int>& group_len,
+  const std::vector<int>& group_dst,
+  int group_index,
+  int component_count,
+  const L3K3TensorBlockHostBlock& block_a,
+  const L3K3TensorBlockHostBlock& block_b,
+  int dst_start,
+  std::vector<unsigned int>& rows)
+{
+  for (int component = 0; component < component_count; ++component) {
+    const int g = group_index + component;
+    if (g < 0 || g >= static_cast<int>(group_begin.size())) {
+      return false;
+    }
+    const int dst_rel = group_dst[g] - dst_start;
+    if (dst_rel < 0 || dst_rel >= component_count) {
+      return false;
+    }
+    for (int k = 0; k < group_len[g]; ++k) {
+      const int t = group_begin[g] + k;
+      const int src0 = model.alpha_times[t * 4 + 0];
+      const int src1 = model.alpha_times[t * 4 + 1];
+      const int mult = model.alpha_times[t * 4 + 2];
+      const int dst = model.alpha_times[t * 4 + 3];
+      const int src0_rel = src0 - block_a.start;
+      const int src1_rel = src1 - block_b.start;
+      if (dst != group_dst[g] || src0_rel < 0 ||
+          src0_rel >= static_cast<int>(block_a.ids.size()) || src1_rel < 0 ||
+          src1_rel >= static_cast<int>(block_b.ids.size())) {
+        return false;
+      }
+      if (dst_rel > kSus2TensorBlockRowMaxU16 || src0_rel > kSus2TensorBlockRowMaxU16 ||
+          src1_rel > kSus2TensorBlockRowMaxU16 || mult < 0 ||
+          mult > kSus2TensorBlockRowMaxU16) {
+        return false;
+      }
+      rows.push_back(pack_l3k3_tensor_block_row_pair(dst_rel, src0_rel));
+      rows.push_back(pack_l3k3_tensor_block_row_pair(src1_rel, mult));
+    }
+  }
+  return true;
+}
+
 bool l3k3_matrix_1x1(const std::vector<std::vector<int>>& matrix, int value)
 {
   return matrix.size() == 1 && matrix[0].size() == 1 && matrix[0][0] == value;
@@ -1832,12 +1893,31 @@ L3K3TensorBlockPlan build_l3k3_tensor_block_plan(const SUS2HostModel& model)
     if (block.id < 0) {
       return L3K3TensorBlockPlan{};
     }
+    const int selected_row_begin =
+      static_cast<int>(plan.rows.size() / kSus2TensorBlockRowWords);
+    if (!append_l3k3_tensor_block_rows(
+          model,
+          group_begin,
+          group_len,
+          group_dst,
+          group_index,
+          matched->component_count,
+          block_a,
+          block_b,
+          cursor,
+          plan.rows)) {
+      return L3K3TensorBlockPlan{};
+    }
+    const int selected_row_count =
+      static_cast<int>(plan.rows.size() / kSus2TensorBlockRowWords) - selected_row_begin;
     plan.ops.push_back(group_index);
     plan.ops.push_back(matched->component_count);
     plan.ops.push_back(selected_op_kind);
     plan.ops.push_back(block_a.start);
     plan.ops.push_back(block_b.start);
     plan.ops.push_back(cursor);
+    plan.op_rows.push_back(selected_row_begin);
+    plan.op_rows.push_back(selected_row_count);
     if (selected_op_kind != kSus2TensorBlockGeneric) {
       ++plan.fast_op_count;
     } else {
@@ -1864,6 +1944,7 @@ L3K3TensorBlockPlan build_l3k3_tensor_block_plan(const SUS2HostModel& model)
   }
   plan.enabled = true;
   plan.op_count = static_cast<int>(plan.ops.size() / kSus2TensorBlockOpInts);
+  plan.row_count = static_cast<int>(plan.rows.size() / kSus2TensorBlockRowWords);
   return plan;
 }
 
@@ -1902,6 +1983,7 @@ TensorAutoDecision choose_tensor_auto_plan(
          << ", candidate_matches=" << block_plan.matched_candidate_count << "/"
          << block_plan.candidate_count
          << ", generic_rows=" << block_plan.generic_row_count
+         << ", specific_rows=" << block_plan.row_count
          << ", cost_units=" << block_plan.selected_cost_units
          << ", op_histogram=" << format_l3k3_tensor_block_histogram(block_plan)
          << "; tensor-block selected";
@@ -5262,6 +5344,13 @@ __device__ __forceinline__ void l3k3_tensor_block_add_row_grad(
   l3k3_tensor_block_add_grad(grads, N, a, a_offset, atom, static_cast<double>(gdst * bv));
 }
 
+__device__ __forceinline__ unsigned int l3k3_tensor_block_row_word(
+  const SUS2DeviceModel& model,
+  int index)
+{
+  return __ldg(model.l3k3_tensor_block_rows + index);
+}
+
 template <typename RealT>
 __device__ __forceinline__ bool l3k3_tensor_block_forward_fast(
   int N,
@@ -5751,8 +5840,9 @@ static __global__ void gpu_l3k3_tensor_block_energy_backward(
   double* potential)
 {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= N || model.l3k3_tensor_block_op_count <= 0 || model.alpha_time_groups == nullptr ||
-      model.l3k3_tensor_block_ops == nullptr) {
+  if (i >= N || model.l3k3_tensor_block_op_count <= 0 ||
+      model.l3k3_tensor_block_ops == nullptr || model.l3k3_tensor_block_op_rows == nullptr ||
+      model.l3k3_tensor_block_rows == nullptr) {
     return;
   }
 
@@ -5762,32 +5852,27 @@ static __global__ void gpu_l3k3_tensor_block_energy_backward(
         l3k3_tensor_block_forward_fast(N, i, model, op_offset, moments)) {
       continue;
     }
-    const int group_begin = model.l3k3_tensor_block_ops[op_offset + 0];
     const int component_count = model.l3k3_tensor_block_ops[op_offset + 1];
+    const int a = model.l3k3_tensor_block_ops[op_offset + 3];
+    const int b = model.l3k3_tensor_block_ops[op_offset + 4];
+    const int d = model.l3k3_tensor_block_ops[op_offset + 5];
+    const int row_op_offset = op * kSus2TensorBlockOpRowInts;
+    const int row_begin = model.l3k3_tensor_block_op_rows[row_op_offset + 0];
+    const int row_count = model.l3k3_tensor_block_op_rows[row_op_offset + 1];
     for (int component = 0; component < component_count; ++component) {
-      const int group_offset = (group_begin + component) * 3;
-      const int begin = model.alpha_time_groups[group_offset + 0];
-      const int len = model.alpha_time_groups[group_offset + 1];
-      const int dst = model.alpha_time_groups[group_offset + 2];
-      RealT dst_value = static_cast<RealT>(0.0);
-      for (int k = 0; k < len; ++k) {
-        const int offset = (begin + k) * 4;
-        int src0;
-        int src1;
-        int mult;
-        if (model.use_const_alpha_times) {
-          src0 = static_cast<int>(c_sus2_alpha_times_u16[offset + 0]);
-          src1 = static_cast<int>(c_sus2_alpha_times_u16[offset + 1]);
-          mult = static_cast<int>(c_sus2_alpha_times_u16[offset + 2]);
-        } else {
-          src0 = model.alpha_times[offset + 0];
-          src1 = model.alpha_times[offset + 1];
-          mult = model.alpha_times[offset + 2];
-        }
-        dst_value += static_cast<RealT>(mult) * moments[static_cast<size_t>(src0) * N + i] *
-                     moments[static_cast<size_t>(src1) * N + i];
-      }
-      moments[static_cast<size_t>(dst) * N + i] = dst_value;
+      moments[static_cast<size_t>(d + component) * N + i] = static_cast<RealT>(0.0);
+    }
+    for (int row = 0; row < row_count; ++row) {
+      const int row_offset = (row_begin + row) * kSus2TensorBlockRowWords;
+      const unsigned int word0 = l3k3_tensor_block_row_word(model, row_offset + 0);
+      const unsigned int word1 = l3k3_tensor_block_row_word(model, row_offset + 1);
+      const int dst = d + static_cast<int>(word0 & 0xffffu);
+      const int src0 = a + static_cast<int>(word0 >> 16);
+      const int src1 = b + static_cast<int>(word1 & 0xffffu);
+      const int mult = static_cast<int>(word1 >> 16);
+      moments[static_cast<size_t>(dst) * N + i] +=
+        static_cast<RealT>(mult) * moments[static_cast<size_t>(src0) * N + i] *
+        moments[static_cast<size_t>(src1) * N + i];
     }
   }
 
@@ -5799,35 +5884,27 @@ static __global__ void gpu_l3k3_tensor_block_energy_backward(
         l3k3_tensor_block_backward_fast<RealT, GradT>(N, i, model, op_offset, moments, grads)) {
       continue;
     }
-    const int group_begin = model.l3k3_tensor_block_ops[op_offset + 0];
-    const int component_count = model.l3k3_tensor_block_ops[op_offset + 1];
-    for (int component = component_count - 1; component >= 0; --component) {
-      const int group_offset = (group_begin + component) * 3;
-      const int begin = model.alpha_time_groups[group_offset + 0];
-      const int len = model.alpha_time_groups[group_offset + 1];
-      const int dst = model.alpha_time_groups[group_offset + 2];
+    const int a = model.l3k3_tensor_block_ops[op_offset + 3];
+    const int b = model.l3k3_tensor_block_ops[op_offset + 4];
+    const int d = model.l3k3_tensor_block_ops[op_offset + 5];
+    const int row_op_offset = op * kSus2TensorBlockOpRowInts;
+    const int row_begin = model.l3k3_tensor_block_op_rows[row_op_offset + 0];
+    const int row_count = model.l3k3_tensor_block_op_rows[row_op_offset + 1];
+    for (int row = row_count - 1; row >= 0; --row) {
+      const int row_offset = (row_begin + row) * kSus2TensorBlockRowWords;
+      const unsigned int word0 = l3k3_tensor_block_row_word(model, row_offset + 0);
+      const unsigned int word1 = l3k3_tensor_block_row_word(model, row_offset + 1);
+      const int dst = d + static_cast<int>(word0 & 0xffffu);
+      const int src0 = a + static_cast<int>(word0 >> 16);
+      const int src1 = b + static_cast<int>(word1 & 0xffffu);
+      const int mult = static_cast<int>(word1 >> 16);
       const RealT dst_grad =
         static_cast<RealT>(load_sus2_grad(grads, N, dst, i));
-      for (int k = len - 1; k >= 0; --k) {
-        const int offset = (begin + k) * 4;
-        int src0;
-        int src1;
-        int mult;
-        if (model.use_const_alpha_times) {
-          src0 = static_cast<int>(c_sus2_alpha_times_u16[offset + 0]);
-          src1 = static_cast<int>(c_sus2_alpha_times_u16[offset + 1]);
-          mult = static_cast<int>(c_sus2_alpha_times_u16[offset + 2]);
-        } else {
-          src0 = model.alpha_times[offset + 0];
-          src1 = model.alpha_times[offset + 1];
-          mult = model.alpha_times[offset + 2];
-        }
-        const RealT gdst = dst_grad * static_cast<RealT>(mult);
-        add_sus2_grad(
-          grads, static_cast<size_t>(src1) * N + i, gdst * moments[static_cast<size_t>(src0) * N + i]);
-        add_sus2_grad(
-          grads, static_cast<size_t>(src0) * N + i, gdst * moments[static_cast<size_t>(src1) * N + i]);
-      }
+      const RealT gdst = dst_grad * static_cast<RealT>(mult);
+      add_sus2_grad(
+        grads, static_cast<size_t>(src1) * N + i, gdst * moments[static_cast<size_t>(src0) * N + i]);
+      add_sus2_grad(
+        grads, static_cast<size_t>(src0) * N + i, gdst * moments[static_cast<size_t>(src1) * N + i]);
     }
   }
 }
@@ -6549,6 +6626,11 @@ SUS2_V11::SUS2_V11(
   if (use_l3k3_tensor_block_) {
     l3k3_tensor_block_ops_.resize(l3k3_tensor_block_plan.ops.size());
     l3k3_tensor_block_ops_.copy_from_host(l3k3_tensor_block_plan.ops.data());
+    l3k3_tensor_block_op_rows_.resize(l3k3_tensor_block_plan.op_rows.size());
+    l3k3_tensor_block_op_rows_.copy_from_host(l3k3_tensor_block_plan.op_rows.data());
+    l3k3_tensor_block_rows_.resize(l3k3_tensor_block_plan.rows.size());
+    l3k3_tensor_block_rows_.copy_from_host(l3k3_tensor_block_plan.rows.data());
+    l3k3_tensor_block_row_count_ = l3k3_tensor_block_plan.row_count;
   }
 
   if (use_radial_direct_) {
@@ -6680,7 +6762,7 @@ SUS2_V11::SUS2_V11(
   }
   if (use_l3k3_tensor_block_) {
     printf(
-      "SUS2 v1.1 GPUMD tensor-block path: graph-specific tensor l%dk%d block DAG, ops=%d, fast_ops=%d, generic_ops=%d, component_groups=%d, candidate_matches=%d/%d, generic_rows=%d, cost_units=%d, fast_forward=%s, fast_backward=%s, op_histogram=%s.\n",
+      "SUS2 v1.1 GPUMD tensor-block path: graph-specific tensor l%dk%d block DAG, ops=%d, fast_ops=%d, generic_ops=%d, component_groups=%d, candidate_matches=%d/%d, generic_rows=%d, specific_rows=%d, cost_units=%d, fast_forward=%s, fast_backward=%s, op_histogram=%s.\n",
       tensor_l_,
       tensor_k_,
       l3k3_tensor_block_op_count_,
@@ -6690,6 +6772,7 @@ SUS2_V11::SUS2_V11(
       l3k3_tensor_block_plan.matched_candidate_count,
       l3k3_tensor_block_plan.candidate_count,
       l3k3_tensor_block_plan.generic_row_count,
+      l3k3_tensor_block_plan.row_count,
       l3k3_tensor_block_plan.selected_cost_units,
       use_l3k3_tensor_block_fast_forward_ ? "yes" : "no",
       use_l3k3_tensor_block_fast_backward_ ? "yes" : "no",
@@ -7000,6 +7083,9 @@ void SUS2_V11::compute(
                                                      : nullptr,
     l3k3_tensor_block_op_count_,
     use_l3k3_tensor_block_ ? l3k3_tensor_block_ops_.data() : nullptr,
+    use_l3k3_tensor_block_ ? l3k3_tensor_block_op_rows_.data() : nullptr,
+    l3k3_tensor_block_row_count_,
+    use_l3k3_tensor_block_ ? l3k3_tensor_block_rows_.data() : nullptr,
     use_radial_direct_ ? nullptr : lut_vals_.data(),
     use_radial_direct_ ? nullptr : lut_ders_.data(),
     use_radial_direct_ ? radial_direct_coeffs_.data() : nullptr,
