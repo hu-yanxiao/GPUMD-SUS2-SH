@@ -729,6 +729,11 @@ int tensor_basic_count_per_group(int l)
   return (l + 1) * (l + 2) * (l + 3) / 6;
 }
 
+int tensor_symmetric_component_count(int rank)
+{
+  return (rank + 1) * (rank + 2) / 2;
+}
+
 TensorBasicLayout detect_tensor_alpha_basic_layout(const SUS2HostModel& model)
 {
   TensorBasicLayout layout;
@@ -1522,8 +1527,7 @@ L3K3TensorBlockPlan build_l3k3_tensor_block_plan(const SUS2HostModel& model)
 {
   L3K3TensorBlockPlan plan;
   const TensorBasicLayout layout = detect_tensor_alpha_basic_layout(model);
-  if (!layout.enabled || layout.l != 3 || layout.k != 3 ||
-      model.alpha_basic_count != kSus2L3K3TensorScalarBasic ||
+  if (!layout.enabled || layout.l < 1 || layout.l > 4 || layout.k < 1 || layout.k > 4 ||
       !supports_product_assign(model)) {
     return plan;
   }
@@ -1549,16 +1553,24 @@ L3K3TensorBlockPlan build_l3k3_tensor_block_plan(const SUS2HostModel& model)
 
   std::vector<L3K3TensorBlockHostBlock> blocks;
   std::vector<int> moment_to_block(model.alpha_moments_count, -1);
-  const int starts[4] = {0, 1, 4, 10};
-  const int counts[4] = {1, 3, 6, 10};
-  for (int group = 0; group < 3; ++group) {
-    for (int rank = 0; rank < 4; ++rank) {
+  std::vector<int> starts(layout.l + 1, 0);
+  std::vector<int> counts(layout.l + 1, 0);
+  for (int rank = 0; rank <= layout.l; ++rank) {
+    counts[rank] = tensor_symmetric_component_count(rank);
+    starts[rank] = rank == 0 ? 0 : starts[rank - 1] + counts[rank - 1];
+  }
+  for (int group = 0; group < layout.k; ++group) {
+    for (int rank = 0; rank <= layout.l; ++rank) {
       std::vector<int> tensor_groups;
       if (rank > 0) {
         tensor_groups.push_back(rank);
       }
       L3K3TensorBlockHostBlock block =
-        make_l3k3_tensor_block(static_cast<int>(blocks.size()), group * 20 + starts[rank], counts[rank], tensor_groups);
+        make_l3k3_tensor_block(
+          static_cast<int>(blocks.size()),
+          group * layout.basic_per_group + starts[rank],
+          counts[rank],
+          tensor_groups);
       if (block.id < 0) {
         return L3K3TensorBlockPlan{};
       }
@@ -1639,7 +1651,7 @@ L3K3TensorBlockPlan build_l3k3_tensor_block_plan(const SUS2HostModel& model)
           free_rank += remaining;
         }
       }
-      if (!valid || free_rank > 3) {
+      if (!valid || free_rank > layout.l) {
         continue;
       }
       l3k3_add_candidate_coarsenings(labels, matrix, candidates);
@@ -1679,7 +1691,9 @@ L3K3TensorBlockPlan build_l3k3_tensor_block_plan(const SUS2HostModel& model)
     if (block.id < 0) {
       return L3K3TensorBlockPlan{};
     }
-    const int op_kind = classify_l3k3_tensor_block_op(block_a, block_b, *matched);
+    const int op_kind = (layout.l == 3 && layout.k == 3)
+      ? classify_l3k3_tensor_block_op(block_a, block_b, *matched)
+      : kSus2TensorBlockGeneric;
     plan.ops.push_back(group_index);
     plan.ops.push_back(matched->component_count);
     plan.ops.push_back(op_kind);
@@ -6431,7 +6445,9 @@ SUS2_V11::SUS2_V11(
   }
   if (use_l3k3_tensor_block_) {
     printf(
-      "SUS2 v1.1 GPUMD tensor-block path: l3k3 block DAG, ops=%d, fast_ops=%d, component_groups=%d, fast_forward=%s, fast_backward=%s.\n",
+      "SUS2 v1.1 GPUMD tensor-block path: tensor l%dk%d block DAG, ops=%d, fast_ops=%d, component_groups=%d, fast_forward=%s, fast_backward=%s.\n",
+      tensor_l_,
+      tensor_k_,
       l3k3_tensor_block_op_count_,
       l3k3_tensor_block_plan.fast_op_count,
       l3k3_tensor_block_plan.component_group_count,
@@ -6833,7 +6849,7 @@ void SUS2_V11::compute(
   profile_t = profile_start();
   const bool use_exact_l3k3_tensor = use_tensor_basic_fastpath_ && tensor_l_ == 3 && tensor_k_ == 3;
   const bool use_l3k3_tensor_scalar = use_l3k3_tensor_scalar_ && use_exact_l3k3_tensor;
-  const bool use_l3k3_tensor_block = use_l3k3_tensor_block_ && use_exact_l3k3_tensor;
+  const bool use_l3k3_tensor_block = use_l3k3_tensor_block_ && use_tensor_basic_fastpath_;
 
   if (use_exact_l3k3_tensor) {
     if (use_float_moments_) {
