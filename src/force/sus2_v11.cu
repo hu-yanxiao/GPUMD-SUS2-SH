@@ -36,7 +36,30 @@ constexpr int kSus2L3K3TensorScalarBasic = 60;
 constexpr int kSus2TensorScalarMaxDegree = 5;
 constexpr int kSus2TensorScalarPackedInts = kSus2TensorScalarMaxDegree + 1;
 constexpr int kSus2TensorScalarBlockSize = 128;
-constexpr int kSus2TensorBlockOpInts = 2;
+constexpr int kSus2TensorBlockOpInts = 6;
+constexpr int kSus2TensorBlockGeneric = 0;
+constexpr int kSus2TensorBlockScalarScalar = 1;
+constexpr int kSus2TensorBlockScalarTensor = 2;
+constexpr int kSus2TensorBlockTensorScalar = 3;
+constexpr int kSus2TensorBlockDot11 = 4;
+constexpr int kSus2TensorBlockDot22 = 5;
+constexpr int kSus2TensorBlockDot33 = 6;
+constexpr int kSus2TensorBlockVecSym2ToVec = 7;
+constexpr int kSus2TensorBlockSym2VecToVec = 8;
+constexpr int kSus2TensorBlockVecSym3ToSym2 = 9;
+constexpr int kSus2TensorBlockSym3VecToSym2 = 10;
+constexpr int kSus2TensorBlockSym2Sym3ToVec = 11;
+constexpr int kSus2TensorBlockSym3Sym2ToVec = 12;
+constexpr int kSus2TensorBlockSym2Sym2ToSym2 = 13;
+constexpr int kSus2TensorBlockSym2Sym2ToMatAB = 14;
+constexpr int kSus2TensorBlockSym2Sym2ToMatBA = 15;
+constexpr int kSus2TensorBlockVecVecOuterAB = 16;
+constexpr int kSus2TensorBlockVecVecOuterBA = 17;
+constexpr int kSus2TensorBlockVecVecToSym2 = 18;
+constexpr int kSus2TensorBlockSym2MatScalar = 19;
+constexpr int kSus2TensorBlockMatSym2Scalar = 20;
+constexpr int kSus2TensorBlockMatMatSameScalar = 21;
+constexpr int kSus2TensorBlockMatMatTransScalar = 22;
 constexpr double kLaguerreMinRho = 1.0e-8;
 constexpr double kLaguerrePositiveParamFloor = 1.0e-6;
 
@@ -191,6 +214,7 @@ struct L3K3TensorBlockPlan {
   bool enabled = false;
   int op_count = 0;
   int component_group_count = 0;
+  int fast_op_count = 0;
   std::vector<int> ops;
 };
 
@@ -1281,6 +1305,217 @@ bool l3k3_candidate_matches(
   return true;
 }
 
+bool l3k3_matrix_1x1(const std::vector<std::vector<int>>& matrix, int value)
+{
+  return matrix.size() == 1 && matrix[0].size() == 1 && matrix[0][0] == value;
+}
+
+bool l3k3_matrix_1x2(const std::vector<std::vector<int>>& matrix, int value0, int value1)
+{
+  return matrix.size() == 1 && matrix[0].size() == 2 &&
+         matrix[0][0] == value0 && matrix[0][1] == value1;
+}
+
+bool l3k3_matrix_2x1(const std::vector<std::vector<int>>& matrix, int value0, int value1)
+{
+  return matrix.size() == 2 && matrix[0].size() == 1 && matrix[1].size() == 1 &&
+         matrix[0][0] == value0 && matrix[1][0] == value1;
+}
+
+bool l3k3_matrix_2x2(
+  const std::vector<std::vector<int>>& matrix,
+  int value00,
+  int value01,
+  int value10,
+  int value11)
+{
+  return matrix.size() == 2 && matrix[0].size() == 2 && matrix[1].size() == 2 &&
+         matrix[0][0] == value00 && matrix[0][1] == value01 &&
+         matrix[1][0] == value10 && matrix[1][1] == value11;
+}
+
+bool l3k3_label_matches(
+  const L3K3TensorBlockLabel& label,
+  int side,
+  int index,
+  int size)
+{
+  return label.side == side && label.index == index && label.size == size;
+}
+
+bool l3k3_labels_single_group(
+  const std::vector<std::vector<L3K3TensorBlockLabel>>& labels,
+  int side,
+  int index,
+  int size)
+{
+  return labels.size() == 1 && labels[0].size() == 1 &&
+         l3k3_label_matches(labels[0][0], side, index, size);
+}
+
+bool l3k3_labels_two_groups(
+  const std::vector<std::vector<L3K3TensorBlockLabel>>& labels,
+  int side0,
+  int index0,
+  int size0,
+  int side1,
+  int index1,
+  int size1)
+{
+  return labels.size() == 2 && labels[0].size() == 1 && labels[1].size() == 1 &&
+         l3k3_label_matches(labels[0][0], side0, index0, size0) &&
+         l3k3_label_matches(labels[1][0], side1, index1, size1);
+}
+
+bool l3k3_labels_coarsened_two(
+  const std::vector<std::vector<L3K3TensorBlockLabel>>& labels,
+  int side0,
+  int index0,
+  int size0,
+  int side1,
+  int index1,
+  int size1)
+{
+  return labels.size() == 1 && labels[0].size() == 2 &&
+         l3k3_label_matches(labels[0][0], side0, index0, size0) &&
+         l3k3_label_matches(labels[0][1], side1, index1, size1);
+}
+
+bool l3k3_labels_side_groups(
+  const std::vector<std::vector<L3K3TensorBlockLabel>>& labels,
+  int side,
+  const std::vector<int>& groups)
+{
+  if (labels.size() != groups.size()) {
+    return false;
+  }
+  for (size_t i = 0; i < groups.size(); ++i) {
+    if (labels[i].size() != 1 ||
+        !l3k3_label_matches(labels[i][0], side, static_cast<int>(i), groups[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool l3k3_groups_equal(const std::vector<int>& groups, std::initializer_list<int> expected)
+{
+  return groups == std::vector<int>(expected);
+}
+
+int classify_l3k3_tensor_block_op(
+  const L3K3TensorBlockHostBlock& block_a,
+  const L3K3TensorBlockHostBlock& block_b,
+  const L3K3TensorBlockCandidate& candidate)
+{
+  const std::vector<int>& groups_a = block_a.groups;
+  const std::vector<int>& groups_b = block_b.groups;
+  const std::vector<int>& out_groups = candidate.out_groups;
+  const auto& matrix = candidate.matrix;
+  const auto& labels = candidate.grouped_labels;
+
+  if (groups_a.empty() && groups_b.empty() && matrix.empty() && out_groups.empty()) {
+    return kSus2TensorBlockScalarScalar;
+  }
+  if (groups_a.empty() && matrix.empty() && out_groups == groups_b &&
+      l3k3_labels_side_groups(labels, 1, groups_b)) {
+    return kSus2TensorBlockScalarTensor;
+  }
+  if (groups_b.empty() && matrix.empty() && out_groups == groups_a &&
+      l3k3_labels_side_groups(labels, 0, groups_a)) {
+    return kSus2TensorBlockTensorScalar;
+  }
+  if (l3k3_groups_equal(groups_a, {1}) && l3k3_groups_equal(groups_b, {1}) &&
+      l3k3_matrix_1x1(matrix, 1) && out_groups.empty()) {
+    return kSus2TensorBlockDot11;
+  }
+  if (l3k3_groups_equal(groups_a, {2}) && l3k3_groups_equal(groups_b, {2}) &&
+      l3k3_matrix_1x1(matrix, 2) && out_groups.empty()) {
+    return kSus2TensorBlockDot22;
+  }
+  if (l3k3_groups_equal(groups_a, {3}) && l3k3_groups_equal(groups_b, {3}) &&
+      l3k3_matrix_1x1(matrix, 3) && out_groups.empty()) {
+    return kSus2TensorBlockDot33;
+  }
+  if (l3k3_groups_equal(groups_a, {1}) && l3k3_groups_equal(groups_b, {2}) &&
+      l3k3_matrix_1x1(matrix, 1) && l3k3_groups_equal(out_groups, {1}) &&
+      l3k3_labels_single_group(labels, 1, 0, 1)) {
+    return kSus2TensorBlockVecSym2ToVec;
+  }
+  if (l3k3_groups_equal(groups_a, {2}) && l3k3_groups_equal(groups_b, {1}) &&
+      l3k3_matrix_1x1(matrix, 1) && l3k3_groups_equal(out_groups, {1}) &&
+      l3k3_labels_single_group(labels, 0, 0, 1)) {
+    return kSus2TensorBlockSym2VecToVec;
+  }
+  if (l3k3_groups_equal(groups_a, {1}) && l3k3_groups_equal(groups_b, {3}) &&
+      l3k3_matrix_1x1(matrix, 1) && l3k3_groups_equal(out_groups, {2}) &&
+      l3k3_labels_single_group(labels, 1, 0, 2)) {
+    return kSus2TensorBlockVecSym3ToSym2;
+  }
+  if (l3k3_groups_equal(groups_a, {3}) && l3k3_groups_equal(groups_b, {1}) &&
+      l3k3_matrix_1x1(matrix, 1) && l3k3_groups_equal(out_groups, {2}) &&
+      l3k3_labels_single_group(labels, 0, 0, 2)) {
+    return kSus2TensorBlockSym3VecToSym2;
+  }
+  if (l3k3_groups_equal(groups_a, {2}) && l3k3_groups_equal(groups_b, {3}) &&
+      l3k3_matrix_1x1(matrix, 2) && l3k3_groups_equal(out_groups, {1}) &&
+      l3k3_labels_single_group(labels, 1, 0, 1)) {
+    return kSus2TensorBlockSym2Sym3ToVec;
+  }
+  if (l3k3_groups_equal(groups_a, {3}) && l3k3_groups_equal(groups_b, {2}) &&
+      l3k3_matrix_1x1(matrix, 2) && l3k3_groups_equal(out_groups, {1}) &&
+      l3k3_labels_single_group(labels, 0, 0, 1)) {
+    return kSus2TensorBlockSym3Sym2ToVec;
+  }
+  if (l3k3_groups_equal(groups_a, {2}) && l3k3_groups_equal(groups_b, {2}) &&
+      l3k3_matrix_1x1(matrix, 1) && l3k3_groups_equal(out_groups, {2}) &&
+      l3k3_labels_coarsened_two(labels, 0, 0, 1, 1, 0, 1)) {
+    return kSus2TensorBlockSym2Sym2ToSym2;
+  }
+  if (l3k3_groups_equal(groups_a, {2}) && l3k3_groups_equal(groups_b, {2}) &&
+      l3k3_matrix_1x1(matrix, 1) && l3k3_groups_equal(out_groups, {1, 1}) &&
+      l3k3_labels_two_groups(labels, 0, 0, 1, 1, 0, 1)) {
+    return kSus2TensorBlockSym2Sym2ToMatAB;
+  }
+  if (l3k3_groups_equal(groups_a, {2}) && l3k3_groups_equal(groups_b, {2}) &&
+      l3k3_matrix_1x1(matrix, 1) && l3k3_groups_equal(out_groups, {1, 1}) &&
+      l3k3_labels_two_groups(labels, 1, 0, 1, 0, 0, 1)) {
+    return kSus2TensorBlockSym2Sym2ToMatBA;
+  }
+  if (l3k3_groups_equal(groups_a, {1}) && l3k3_groups_equal(groups_b, {1}) &&
+      l3k3_matrix_1x1(matrix, 0) && l3k3_groups_equal(out_groups, {1, 1}) &&
+      l3k3_labels_two_groups(labels, 0, 0, 1, 1, 0, 1)) {
+    return kSus2TensorBlockVecVecOuterAB;
+  }
+  if (l3k3_groups_equal(groups_a, {1}) && l3k3_groups_equal(groups_b, {1}) &&
+      l3k3_matrix_1x1(matrix, 0) && l3k3_groups_equal(out_groups, {1, 1}) &&
+      l3k3_labels_two_groups(labels, 1, 0, 1, 0, 0, 1)) {
+    return kSus2TensorBlockVecVecOuterBA;
+  }
+  if (l3k3_groups_equal(groups_a, {1}) && l3k3_groups_equal(groups_b, {1}) &&
+      l3k3_matrix_1x1(matrix, 0) && l3k3_groups_equal(out_groups, {2}) &&
+      l3k3_labels_coarsened_two(labels, 0, 0, 1, 1, 0, 1)) {
+    return kSus2TensorBlockVecVecToSym2;
+  }
+  if (l3k3_groups_equal(groups_a, {2}) && l3k3_groups_equal(groups_b, {1, 1}) &&
+      l3k3_matrix_1x2(matrix, 1, 1) && out_groups.empty()) {
+    return kSus2TensorBlockSym2MatScalar;
+  }
+  if (l3k3_groups_equal(groups_a, {1, 1}) && l3k3_groups_equal(groups_b, {2}) &&
+      l3k3_matrix_2x1(matrix, 1, 1) && out_groups.empty()) {
+    return kSus2TensorBlockMatSym2Scalar;
+  }
+  if (l3k3_groups_equal(groups_a, {1, 1}) && l3k3_groups_equal(groups_b, {1, 1}) &&
+      l3k3_matrix_2x2(matrix, 1, 0, 0, 1) && out_groups.empty()) {
+    return kSus2TensorBlockMatMatSameScalar;
+  }
+  if (l3k3_groups_equal(groups_a, {1, 1}) && l3k3_groups_equal(groups_b, {1, 1}) &&
+      l3k3_matrix_2x2(matrix, 0, 1, 1, 0) && out_groups.empty()) {
+    return kSus2TensorBlockMatMatTransScalar;
+  }
+  return kSus2TensorBlockGeneric;
+}
+
 L3K3TensorBlockPlan build_l3k3_tensor_block_plan(const SUS2HostModel& model)
 {
   L3K3TensorBlockPlan plan;
@@ -1442,8 +1677,16 @@ L3K3TensorBlockPlan build_l3k3_tensor_block_plan(const SUS2HostModel& model)
     if (block.id < 0) {
       return L3K3TensorBlockPlan{};
     }
+    const int op_kind = classify_l3k3_tensor_block_op(block_a, block_b, *matched);
     plan.ops.push_back(group_index);
     plan.ops.push_back(matched->component_count);
+    plan.ops.push_back(op_kind);
+    plan.ops.push_back(block_a.start);
+    plan.ops.push_back(block_b.start);
+    plan.ops.push_back(cursor);
+    if (op_kind != kSus2TensorBlockGeneric) {
+      ++plan.fast_op_count;
+    }
     plan.component_group_count += matched->component_count;
     blocks.push_back(block);
     for (int id : block.ids) {
@@ -4613,6 +4856,639 @@ static __global__ void gpu_forward_energy_backward_const_u16_assign_group_table(
   }
 }
 
+__device__ __forceinline__ int l3k3_sym2_offset(int a, int b)
+{
+  if (a > b) {
+    const int tmp = a;
+    a = b;
+    b = tmp;
+  }
+  if (a == 0) {
+    return b;
+  }
+  if (a == 1) {
+    return b + 2;
+  }
+  return 5;
+}
+
+__device__ __forceinline__ int l3k3_sym3_offset(int a, int b, int c)
+{
+  if (a > b) {
+    const int tmp = a;
+    a = b;
+    b = tmp;
+  }
+  if (b > c) {
+    const int tmp = b;
+    b = c;
+    c = tmp;
+  }
+  if (a > b) {
+    const int tmp = a;
+    a = b;
+    b = tmp;
+  }
+  if (a == 0) {
+    if (b == 0) {
+      return c;
+    }
+    return b == 1 ? c + 2 : 5;
+  }
+  if (a == 1) {
+    return b == 1 ? c + 5 : 8;
+  }
+  return 9;
+}
+
+__device__ __forceinline__ int l3k3_mat_offset(int a, int b)
+{
+  return a * 3 + b;
+}
+
+template <typename RealT>
+__device__ __forceinline__ RealT l3k3_tensor_block_moment(
+  const RealT* moments,
+  int N,
+  int start,
+  int component,
+  int atom)
+{
+  return moments[static_cast<size_t>(start + component) * N + atom];
+}
+
+template <typename RealT>
+__device__ __forceinline__ void l3k3_tensor_block_store(
+  RealT* moments,
+  int N,
+  int start,
+  int component,
+  int atom,
+  RealT value)
+{
+  moments[static_cast<size_t>(start + component) * N + atom] = value;
+}
+
+template <typename RealT, typename GradT>
+__device__ __forceinline__ RealT l3k3_tensor_block_grad(
+  const GradT* grads,
+  int N,
+  int start,
+  int component,
+  int atom)
+{
+  return static_cast<RealT>(load_sus2_grad(grads, N, start + component, atom));
+}
+
+template <typename GradT>
+__device__ __forceinline__ void l3k3_tensor_block_add_grad(
+  GradT* grads,
+  int N,
+  int start,
+  int component,
+  int atom,
+  double value)
+{
+  add_sus2_grad(grads, static_cast<size_t>(start + component) * N + atom, value);
+}
+
+template <typename RealT>
+__device__ __forceinline__ bool l3k3_tensor_block_forward_fast(
+  int N,
+  int atom,
+  const SUS2DeviceModel& model,
+  int op_offset,
+  RealT* moments)
+{
+  const int component_count = model.l3k3_tensor_block_ops[op_offset + 1];
+  const int kind = model.l3k3_tensor_block_ops[op_offset + 2];
+  const int a = model.l3k3_tensor_block_ops[op_offset + 3];
+  const int b = model.l3k3_tensor_block_ops[op_offset + 4];
+  const int d = model.l3k3_tensor_block_ops[op_offset + 5];
+
+  switch (kind) {
+    case kSus2TensorBlockScalarScalar: {
+      l3k3_tensor_block_store(
+        moments, N, d, 0, atom,
+        l3k3_tensor_block_moment(moments, N, a, 0, atom) *
+          l3k3_tensor_block_moment(moments, N, b, 0, atom));
+      return true;
+    }
+    case kSus2TensorBlockScalarTensor: {
+      const RealT scalar = l3k3_tensor_block_moment(moments, N, a, 0, atom);
+      for (int c = 0; c < component_count; ++c) {
+        l3k3_tensor_block_store(
+          moments, N, d, c, atom,
+          scalar * l3k3_tensor_block_moment(moments, N, b, c, atom));
+      }
+      return true;
+    }
+    case kSus2TensorBlockTensorScalar: {
+      const RealT scalar = l3k3_tensor_block_moment(moments, N, b, 0, atom);
+      for (int c = 0; c < component_count; ++c) {
+        l3k3_tensor_block_store(
+          moments, N, d, c, atom,
+          l3k3_tensor_block_moment(moments, N, a, c, atom) * scalar);
+      }
+      return true;
+    }
+    case kSus2TensorBlockDot11: {
+      RealT sum = static_cast<RealT>(0);
+      for (int x = 0; x < 3; ++x) {
+        sum += l3k3_tensor_block_moment(moments, N, a, x, atom) *
+               l3k3_tensor_block_moment(moments, N, b, x, atom);
+      }
+      l3k3_tensor_block_store(moments, N, d, 0, atom, sum);
+      return true;
+    }
+    case kSus2TensorBlockDot22: {
+      RealT sum = static_cast<RealT>(0);
+      for (int x = 0; x < 3; ++x) {
+        for (int y = 0; y < 3; ++y) {
+          const int offset = l3k3_sym2_offset(x, y);
+          sum += l3k3_tensor_block_moment(moments, N, a, offset, atom) *
+                 l3k3_tensor_block_moment(moments, N, b, offset, atom);
+        }
+      }
+      l3k3_tensor_block_store(moments, N, d, 0, atom, sum);
+      return true;
+    }
+    case kSus2TensorBlockDot33: {
+      RealT sum = static_cast<RealT>(0);
+      for (int x = 0; x < 3; ++x) {
+        for (int y = 0; y < 3; ++y) {
+          for (int z = 0; z < 3; ++z) {
+            const int offset = l3k3_sym3_offset(x, y, z);
+            sum += l3k3_tensor_block_moment(moments, N, a, offset, atom) *
+                   l3k3_tensor_block_moment(moments, N, b, offset, atom);
+          }
+        }
+      }
+      l3k3_tensor_block_store(moments, N, d, 0, atom, sum);
+      return true;
+    }
+    case kSus2TensorBlockVecSym2ToVec: {
+      for (int y = 0; y < 3; ++y) {
+        RealT sum = static_cast<RealT>(0);
+        for (int x = 0; x < 3; ++x) {
+          sum += l3k3_tensor_block_moment(moments, N, a, x, atom) *
+                 l3k3_tensor_block_moment(moments, N, b, l3k3_sym2_offset(x, y), atom);
+        }
+        l3k3_tensor_block_store(moments, N, d, y, atom, sum);
+      }
+      return true;
+    }
+    case kSus2TensorBlockSym2VecToVec: {
+      for (int x = 0; x < 3; ++x) {
+        RealT sum = static_cast<RealT>(0);
+        for (int y = 0; y < 3; ++y) {
+          sum += l3k3_tensor_block_moment(moments, N, a, l3k3_sym2_offset(x, y), atom) *
+                 l3k3_tensor_block_moment(moments, N, b, y, atom);
+        }
+        l3k3_tensor_block_store(moments, N, d, x, atom, sum);
+      }
+      return true;
+    }
+    case kSus2TensorBlockVecSym3ToSym2: {
+      for (int y = 0; y < 3; ++y) {
+        for (int z = y; z < 3; ++z) {
+          RealT sum = static_cast<RealT>(0);
+          for (int x = 0; x < 3; ++x) {
+            sum += l3k3_tensor_block_moment(moments, N, a, x, atom) *
+                   l3k3_tensor_block_moment(moments, N, b, l3k3_sym3_offset(x, y, z), atom);
+          }
+          l3k3_tensor_block_store(moments, N, d, l3k3_sym2_offset(y, z), atom, sum);
+        }
+      }
+      return true;
+    }
+    case kSus2TensorBlockSym3VecToSym2: {
+      for (int x = 0; x < 3; ++x) {
+        for (int y = x; y < 3; ++y) {
+          RealT sum = static_cast<RealT>(0);
+          for (int z = 0; z < 3; ++z) {
+            sum += l3k3_tensor_block_moment(moments, N, a, l3k3_sym3_offset(x, y, z), atom) *
+                   l3k3_tensor_block_moment(moments, N, b, z, atom);
+          }
+          l3k3_tensor_block_store(moments, N, d, l3k3_sym2_offset(x, y), atom, sum);
+        }
+      }
+      return true;
+    }
+    case kSus2TensorBlockSym2Sym3ToVec: {
+      for (int z = 0; z < 3; ++z) {
+        RealT sum = static_cast<RealT>(0);
+        for (int x = 0; x < 3; ++x) {
+          for (int y = 0; y < 3; ++y) {
+            sum += l3k3_tensor_block_moment(moments, N, a, l3k3_sym2_offset(x, y), atom) *
+                   l3k3_tensor_block_moment(moments, N, b, l3k3_sym3_offset(x, y, z), atom);
+          }
+        }
+        l3k3_tensor_block_store(moments, N, d, z, atom, sum);
+      }
+      return true;
+    }
+    case kSus2TensorBlockSym3Sym2ToVec: {
+      for (int x = 0; x < 3; ++x) {
+        RealT sum = static_cast<RealT>(0);
+        for (int y = 0; y < 3; ++y) {
+          for (int z = 0; z < 3; ++z) {
+            sum += l3k3_tensor_block_moment(moments, N, a, l3k3_sym3_offset(x, y, z), atom) *
+                   l3k3_tensor_block_moment(moments, N, b, l3k3_sym2_offset(y, z), atom);
+          }
+        }
+        l3k3_tensor_block_store(moments, N, d, x, atom, sum);
+      }
+      return true;
+    }
+    case kSus2TensorBlockSym2Sym2ToSym2: {
+      for (int x = 0; x < 3; ++x) {
+        for (int y = x; y < 3; ++y) {
+          RealT sum = static_cast<RealT>(0);
+          for (int z = 0; z < 3; ++z) {
+            sum += l3k3_tensor_block_moment(moments, N, a, l3k3_sym2_offset(x, z), atom) *
+                   l3k3_tensor_block_moment(moments, N, b, l3k3_sym2_offset(y, z), atom);
+          }
+          l3k3_tensor_block_store(moments, N, d, l3k3_sym2_offset(x, y), atom, sum);
+        }
+      }
+      return true;
+    }
+    case kSus2TensorBlockSym2Sym2ToMatAB:
+    case kSus2TensorBlockSym2Sym2ToMatBA: {
+      for (int x = 0; x < 3; ++x) {
+        for (int y = 0; y < 3; ++y) {
+          RealT sum = static_cast<RealT>(0);
+          for (int z = 0; z < 3; ++z) {
+            const int a_offset = kind == kSus2TensorBlockSym2Sym2ToMatAB
+              ? l3k3_sym2_offset(x, z)
+              : l3k3_sym2_offset(y, z);
+            const int b_offset = kind == kSus2TensorBlockSym2Sym2ToMatAB
+              ? l3k3_sym2_offset(y, z)
+              : l3k3_sym2_offset(x, z);
+            sum += l3k3_tensor_block_moment(moments, N, a, a_offset, atom) *
+                   l3k3_tensor_block_moment(moments, N, b, b_offset, atom);
+          }
+          l3k3_tensor_block_store(moments, N, d, l3k3_mat_offset(x, y), atom, sum);
+        }
+      }
+      return true;
+    }
+    case kSus2TensorBlockVecVecOuterAB:
+    case kSus2TensorBlockVecVecOuterBA: {
+      for (int x = 0; x < 3; ++x) {
+        for (int y = 0; y < 3; ++y) {
+          const int a_offset = kind == kSus2TensorBlockVecVecOuterAB ? x : y;
+          const int b_offset = kind == kSus2TensorBlockVecVecOuterAB ? y : x;
+          l3k3_tensor_block_store(
+            moments, N, d, l3k3_mat_offset(x, y), atom,
+            l3k3_tensor_block_moment(moments, N, a, a_offset, atom) *
+              l3k3_tensor_block_moment(moments, N, b, b_offset, atom));
+        }
+      }
+      return true;
+    }
+    case kSus2TensorBlockVecVecToSym2: {
+      for (int x = 0; x < 3; ++x) {
+        for (int y = x; y < 3; ++y) {
+          l3k3_tensor_block_store(
+            moments, N, d, l3k3_sym2_offset(x, y), atom,
+            l3k3_tensor_block_moment(moments, N, a, x, atom) *
+              l3k3_tensor_block_moment(moments, N, b, y, atom));
+        }
+      }
+      return true;
+    }
+    case kSus2TensorBlockSym2MatScalar: {
+      RealT sum = static_cast<RealT>(0);
+      for (int x = 0; x < 3; ++x) {
+        for (int y = 0; y < 3; ++y) {
+          sum += l3k3_tensor_block_moment(moments, N, a, l3k3_sym2_offset(x, y), atom) *
+                 l3k3_tensor_block_moment(moments, N, b, l3k3_mat_offset(x, y), atom);
+        }
+      }
+      l3k3_tensor_block_store(moments, N, d, 0, atom, sum);
+      return true;
+    }
+    case kSus2TensorBlockMatSym2Scalar: {
+      RealT sum = static_cast<RealT>(0);
+      for (int x = 0; x < 3; ++x) {
+        for (int y = 0; y < 3; ++y) {
+          sum += l3k3_tensor_block_moment(moments, N, a, l3k3_mat_offset(x, y), atom) *
+                 l3k3_tensor_block_moment(moments, N, b, l3k3_sym2_offset(x, y), atom);
+        }
+      }
+      l3k3_tensor_block_store(moments, N, d, 0, atom, sum);
+      return true;
+    }
+    case kSus2TensorBlockMatMatSameScalar:
+    case kSus2TensorBlockMatMatTransScalar: {
+      RealT sum = static_cast<RealT>(0);
+      for (int x = 0; x < 3; ++x) {
+        for (int y = 0; y < 3; ++y) {
+          const int b_offset = kind == kSus2TensorBlockMatMatSameScalar
+            ? l3k3_mat_offset(x, y)
+            : l3k3_mat_offset(y, x);
+          sum += l3k3_tensor_block_moment(moments, N, a, l3k3_mat_offset(x, y), atom) *
+                 l3k3_tensor_block_moment(moments, N, b, b_offset, atom);
+        }
+      }
+      l3k3_tensor_block_store(moments, N, d, 0, atom, sum);
+      return true;
+    }
+    default:
+      return false;
+  }
+}
+
+template <typename RealT, typename GradT>
+__device__ __forceinline__ bool l3k3_tensor_block_backward_fast(
+  int N,
+  int atom,
+  const SUS2DeviceModel& model,
+  int op_offset,
+  const RealT* moments,
+  GradT* grads)
+{
+  const int component_count = model.l3k3_tensor_block_ops[op_offset + 1];
+  const int kind = model.l3k3_tensor_block_ops[op_offset + 2];
+  const int a = model.l3k3_tensor_block_ops[op_offset + 3];
+  const int b = model.l3k3_tensor_block_ops[op_offset + 4];
+  const int d = model.l3k3_tensor_block_ops[op_offset + 5];
+
+  switch (kind) {
+    case kSus2TensorBlockScalarScalar: {
+      const RealT gd = l3k3_tensor_block_grad<RealT>(grads, N, d, 0, atom);
+      const RealT av = l3k3_tensor_block_moment(moments, N, a, 0, atom);
+      const RealT bv = l3k3_tensor_block_moment(moments, N, b, 0, atom);
+      l3k3_tensor_block_add_grad(grads, N, a, 0, atom, static_cast<double>(gd * bv));
+      l3k3_tensor_block_add_grad(grads, N, b, 0, atom, static_cast<double>(gd * av));
+      return true;
+    }
+    case kSus2TensorBlockScalarTensor: {
+      const RealT scalar = l3k3_tensor_block_moment(moments, N, a, 0, atom);
+      RealT scalar_grad = static_cast<RealT>(0);
+      for (int c = 0; c < component_count; ++c) {
+        const RealT gd = l3k3_tensor_block_grad<RealT>(grads, N, d, c, atom);
+        const RealT tv = l3k3_tensor_block_moment(moments, N, b, c, atom);
+        scalar_grad += gd * tv;
+        l3k3_tensor_block_add_grad(grads, N, b, c, atom, static_cast<double>(gd * scalar));
+      }
+      l3k3_tensor_block_add_grad(grads, N, a, 0, atom, static_cast<double>(scalar_grad));
+      return true;
+    }
+    case kSus2TensorBlockTensorScalar: {
+      const RealT scalar = l3k3_tensor_block_moment(moments, N, b, 0, atom);
+      RealT scalar_grad = static_cast<RealT>(0);
+      for (int c = 0; c < component_count; ++c) {
+        const RealT gd = l3k3_tensor_block_grad<RealT>(grads, N, d, c, atom);
+        const RealT tv = l3k3_tensor_block_moment(moments, N, a, c, atom);
+        scalar_grad += gd * tv;
+        l3k3_tensor_block_add_grad(grads, N, a, c, atom, static_cast<double>(gd * scalar));
+      }
+      l3k3_tensor_block_add_grad(grads, N, b, 0, atom, static_cast<double>(scalar_grad));
+      return true;
+    }
+    case kSus2TensorBlockDot11: {
+      const RealT gd = l3k3_tensor_block_grad<RealT>(grads, N, d, 0, atom);
+      for (int x = 0; x < 3; ++x) {
+        const RealT av = l3k3_tensor_block_moment(moments, N, a, x, atom);
+        const RealT bv = l3k3_tensor_block_moment(moments, N, b, x, atom);
+        l3k3_tensor_block_add_grad(grads, N, a, x, atom, static_cast<double>(gd * bv));
+        l3k3_tensor_block_add_grad(grads, N, b, x, atom, static_cast<double>(gd * av));
+      }
+      return true;
+    }
+    case kSus2TensorBlockDot22: {
+      const RealT gd = l3k3_tensor_block_grad<RealT>(grads, N, d, 0, atom);
+      for (int x = 0; x < 3; ++x) {
+        for (int y = 0; y < 3; ++y) {
+          const int offset = l3k3_sym2_offset(x, y);
+          const RealT av = l3k3_tensor_block_moment(moments, N, a, offset, atom);
+          const RealT bv = l3k3_tensor_block_moment(moments, N, b, offset, atom);
+          l3k3_tensor_block_add_grad(grads, N, a, offset, atom, static_cast<double>(gd * bv));
+          l3k3_tensor_block_add_grad(grads, N, b, offset, atom, static_cast<double>(gd * av));
+        }
+      }
+      return true;
+    }
+    case kSus2TensorBlockDot33: {
+      const RealT gd = l3k3_tensor_block_grad<RealT>(grads, N, d, 0, atom);
+      for (int x = 0; x < 3; ++x) {
+        for (int y = 0; y < 3; ++y) {
+          for (int z = 0; z < 3; ++z) {
+            const int offset = l3k3_sym3_offset(x, y, z);
+            const RealT av = l3k3_tensor_block_moment(moments, N, a, offset, atom);
+            const RealT bv = l3k3_tensor_block_moment(moments, N, b, offset, atom);
+            l3k3_tensor_block_add_grad(grads, N, a, offset, atom, static_cast<double>(gd * bv));
+            l3k3_tensor_block_add_grad(grads, N, b, offset, atom, static_cast<double>(gd * av));
+          }
+        }
+      }
+      return true;
+    }
+    case kSus2TensorBlockVecSym2ToVec: {
+      for (int y = 0; y < 3; ++y) {
+        const RealT gd = l3k3_tensor_block_grad<RealT>(grads, N, d, y, atom);
+        for (int x = 0; x < 3; ++x) {
+          const int b_offset = l3k3_sym2_offset(x, y);
+          const RealT av = l3k3_tensor_block_moment(moments, N, a, x, atom);
+          const RealT bv = l3k3_tensor_block_moment(moments, N, b, b_offset, atom);
+          l3k3_tensor_block_add_grad(grads, N, a, x, atom, static_cast<double>(gd * bv));
+          l3k3_tensor_block_add_grad(grads, N, b, b_offset, atom, static_cast<double>(gd * av));
+        }
+      }
+      return true;
+    }
+    case kSus2TensorBlockSym2VecToVec: {
+      for (int x = 0; x < 3; ++x) {
+        const RealT gd = l3k3_tensor_block_grad<RealT>(grads, N, d, x, atom);
+        for (int y = 0; y < 3; ++y) {
+          const int a_offset = l3k3_sym2_offset(x, y);
+          const RealT av = l3k3_tensor_block_moment(moments, N, a, a_offset, atom);
+          const RealT bv = l3k3_tensor_block_moment(moments, N, b, y, atom);
+          l3k3_tensor_block_add_grad(grads, N, a, a_offset, atom, static_cast<double>(gd * bv));
+          l3k3_tensor_block_add_grad(grads, N, b, y, atom, static_cast<double>(gd * av));
+        }
+      }
+      return true;
+    }
+    case kSus2TensorBlockVecSym3ToSym2: {
+      for (int y = 0; y < 3; ++y) {
+        for (int z = y; z < 3; ++z) {
+          const RealT gd = l3k3_tensor_block_grad<RealT>(grads, N, d, l3k3_sym2_offset(y, z), atom);
+          for (int x = 0; x < 3; ++x) {
+            const int b_offset = l3k3_sym3_offset(x, y, z);
+            const RealT av = l3k3_tensor_block_moment(moments, N, a, x, atom);
+            const RealT bv = l3k3_tensor_block_moment(moments, N, b, b_offset, atom);
+            l3k3_tensor_block_add_grad(grads, N, a, x, atom, static_cast<double>(gd * bv));
+            l3k3_tensor_block_add_grad(grads, N, b, b_offset, atom, static_cast<double>(gd * av));
+          }
+        }
+      }
+      return true;
+    }
+    case kSus2TensorBlockSym3VecToSym2: {
+      for (int x = 0; x < 3; ++x) {
+        for (int y = x; y < 3; ++y) {
+          const RealT gd = l3k3_tensor_block_grad<RealT>(grads, N, d, l3k3_sym2_offset(x, y), atom);
+          for (int z = 0; z < 3; ++z) {
+            const int a_offset = l3k3_sym3_offset(x, y, z);
+            const RealT av = l3k3_tensor_block_moment(moments, N, a, a_offset, atom);
+            const RealT bv = l3k3_tensor_block_moment(moments, N, b, z, atom);
+            l3k3_tensor_block_add_grad(grads, N, a, a_offset, atom, static_cast<double>(gd * bv));
+            l3k3_tensor_block_add_grad(grads, N, b, z, atom, static_cast<double>(gd * av));
+          }
+        }
+      }
+      return true;
+    }
+    case kSus2TensorBlockSym2Sym3ToVec: {
+      for (int z = 0; z < 3; ++z) {
+        const RealT gd = l3k3_tensor_block_grad<RealT>(grads, N, d, z, atom);
+        for (int x = 0; x < 3; ++x) {
+          for (int y = 0; y < 3; ++y) {
+            const int a_offset = l3k3_sym2_offset(x, y);
+            const int b_offset = l3k3_sym3_offset(x, y, z);
+            const RealT av = l3k3_tensor_block_moment(moments, N, a, a_offset, atom);
+            const RealT bv = l3k3_tensor_block_moment(moments, N, b, b_offset, atom);
+            l3k3_tensor_block_add_grad(grads, N, a, a_offset, atom, static_cast<double>(gd * bv));
+            l3k3_tensor_block_add_grad(grads, N, b, b_offset, atom, static_cast<double>(gd * av));
+          }
+        }
+      }
+      return true;
+    }
+    case kSus2TensorBlockSym3Sym2ToVec: {
+      for (int x = 0; x < 3; ++x) {
+        const RealT gd = l3k3_tensor_block_grad<RealT>(grads, N, d, x, atom);
+        for (int y = 0; y < 3; ++y) {
+          for (int z = 0; z < 3; ++z) {
+            const int a_offset = l3k3_sym3_offset(x, y, z);
+            const int b_offset = l3k3_sym2_offset(y, z);
+            const RealT av = l3k3_tensor_block_moment(moments, N, a, a_offset, atom);
+            const RealT bv = l3k3_tensor_block_moment(moments, N, b, b_offset, atom);
+            l3k3_tensor_block_add_grad(grads, N, a, a_offset, atom, static_cast<double>(gd * bv));
+            l3k3_tensor_block_add_grad(grads, N, b, b_offset, atom, static_cast<double>(gd * av));
+          }
+        }
+      }
+      return true;
+    }
+    case kSus2TensorBlockSym2Sym2ToSym2: {
+      for (int x = 0; x < 3; ++x) {
+        for (int y = x; y < 3; ++y) {
+          const RealT gd = l3k3_tensor_block_grad<RealT>(grads, N, d, l3k3_sym2_offset(x, y), atom);
+          for (int z = 0; z < 3; ++z) {
+            const int a_offset = l3k3_sym2_offset(x, z);
+            const int b_offset = l3k3_sym2_offset(y, z);
+            const RealT av = l3k3_tensor_block_moment(moments, N, a, a_offset, atom);
+            const RealT bv = l3k3_tensor_block_moment(moments, N, b, b_offset, atom);
+            l3k3_tensor_block_add_grad(grads, N, a, a_offset, atom, static_cast<double>(gd * bv));
+            l3k3_tensor_block_add_grad(grads, N, b, b_offset, atom, static_cast<double>(gd * av));
+          }
+        }
+      }
+      return true;
+    }
+    case kSus2TensorBlockSym2Sym2ToMatAB:
+    case kSus2TensorBlockSym2Sym2ToMatBA: {
+      for (int x = 0; x < 3; ++x) {
+        for (int y = 0; y < 3; ++y) {
+          const RealT gd = l3k3_tensor_block_grad<RealT>(grads, N, d, l3k3_mat_offset(x, y), atom);
+          for (int z = 0; z < 3; ++z) {
+            const int a_offset = kind == kSus2TensorBlockSym2Sym2ToMatAB
+              ? l3k3_sym2_offset(x, z)
+              : l3k3_sym2_offset(y, z);
+            const int b_offset = kind == kSus2TensorBlockSym2Sym2ToMatAB
+              ? l3k3_sym2_offset(y, z)
+              : l3k3_sym2_offset(x, z);
+            const RealT av = l3k3_tensor_block_moment(moments, N, a, a_offset, atom);
+            const RealT bv = l3k3_tensor_block_moment(moments, N, b, b_offset, atom);
+            l3k3_tensor_block_add_grad(grads, N, a, a_offset, atom, static_cast<double>(gd * bv));
+            l3k3_tensor_block_add_grad(grads, N, b, b_offset, atom, static_cast<double>(gd * av));
+          }
+        }
+      }
+      return true;
+    }
+    case kSus2TensorBlockVecVecOuterAB:
+    case kSus2TensorBlockVecVecOuterBA: {
+      for (int x = 0; x < 3; ++x) {
+        for (int y = 0; y < 3; ++y) {
+          const int a_offset = kind == kSus2TensorBlockVecVecOuterAB ? x : y;
+          const int b_offset = kind == kSus2TensorBlockVecVecOuterAB ? y : x;
+          const RealT gd = l3k3_tensor_block_grad<RealT>(grads, N, d, l3k3_mat_offset(x, y), atom);
+          const RealT av = l3k3_tensor_block_moment(moments, N, a, a_offset, atom);
+          const RealT bv = l3k3_tensor_block_moment(moments, N, b, b_offset, atom);
+          l3k3_tensor_block_add_grad(grads, N, a, a_offset, atom, static_cast<double>(gd * bv));
+          l3k3_tensor_block_add_grad(grads, N, b, b_offset, atom, static_cast<double>(gd * av));
+        }
+      }
+      return true;
+    }
+    case kSus2TensorBlockVecVecToSym2: {
+      for (int x = 0; x < 3; ++x) {
+        for (int y = x; y < 3; ++y) {
+          const RealT gd = l3k3_tensor_block_grad<RealT>(grads, N, d, l3k3_sym2_offset(x, y), atom);
+          const RealT av = l3k3_tensor_block_moment(moments, N, a, x, atom);
+          const RealT bv = l3k3_tensor_block_moment(moments, N, b, y, atom);
+          l3k3_tensor_block_add_grad(grads, N, a, x, atom, static_cast<double>(gd * bv));
+          l3k3_tensor_block_add_grad(grads, N, b, y, atom, static_cast<double>(gd * av));
+        }
+      }
+      return true;
+    }
+    case kSus2TensorBlockSym2MatScalar: {
+      const RealT gd = l3k3_tensor_block_grad<RealT>(grads, N, d, 0, atom);
+      for (int x = 0; x < 3; ++x) {
+        for (int y = 0; y < 3; ++y) {
+          const int a_offset = l3k3_sym2_offset(x, y);
+          const int b_offset = l3k3_mat_offset(x, y);
+          const RealT av = l3k3_tensor_block_moment(moments, N, a, a_offset, atom);
+          const RealT bv = l3k3_tensor_block_moment(moments, N, b, b_offset, atom);
+          l3k3_tensor_block_add_grad(grads, N, a, a_offset, atom, static_cast<double>(gd * bv));
+          l3k3_tensor_block_add_grad(grads, N, b, b_offset, atom, static_cast<double>(gd * av));
+        }
+      }
+      return true;
+    }
+    case kSus2TensorBlockMatSym2Scalar: {
+      const RealT gd = l3k3_tensor_block_grad<RealT>(grads, N, d, 0, atom);
+      for (int x = 0; x < 3; ++x) {
+        for (int y = 0; y < 3; ++y) {
+          const int a_offset = l3k3_mat_offset(x, y);
+          const int b_offset = l3k3_sym2_offset(x, y);
+          const RealT av = l3k3_tensor_block_moment(moments, N, a, a_offset, atom);
+          const RealT bv = l3k3_tensor_block_moment(moments, N, b, b_offset, atom);
+          l3k3_tensor_block_add_grad(grads, N, a, a_offset, atom, static_cast<double>(gd * bv));
+          l3k3_tensor_block_add_grad(grads, N, b, b_offset, atom, static_cast<double>(gd * av));
+        }
+      }
+      return true;
+    }
+    case kSus2TensorBlockMatMatSameScalar:
+    case kSus2TensorBlockMatMatTransScalar: {
+      const RealT gd = l3k3_tensor_block_grad<RealT>(grads, N, d, 0, atom);
+      for (int x = 0; x < 3; ++x) {
+        for (int y = 0; y < 3; ++y) {
+          const int a_offset = l3k3_mat_offset(x, y);
+          const int b_offset = kind == kSus2TensorBlockMatMatSameScalar
+            ? l3k3_mat_offset(x, y)
+            : l3k3_mat_offset(y, x);
+          const RealT av = l3k3_tensor_block_moment(moments, N, a, a_offset, atom);
+          const RealT bv = l3k3_tensor_block_moment(moments, N, b, b_offset, atom);
+          l3k3_tensor_block_add_grad(grads, N, a, a_offset, atom, static_cast<double>(gd * bv));
+          l3k3_tensor_block_add_grad(grads, N, b, b_offset, atom, static_cast<double>(gd * av));
+        }
+      }
+      return true;
+    }
+    default:
+      return false;
+  }
+}
+
 template <typename RealT, typename GradT>
 static __global__ void gpu_l3k3_tensor_block_energy_backward(
   int N,
@@ -4630,6 +5506,9 @@ static __global__ void gpu_l3k3_tensor_block_energy_backward(
 
   for (int op = 0; op < model.l3k3_tensor_block_op_count; ++op) {
     const int op_offset = op * kSus2TensorBlockOpInts;
+    if (l3k3_tensor_block_forward_fast(N, i, model, op_offset, moments)) {
+      continue;
+    }
     const int group_begin = model.l3k3_tensor_block_ops[op_offset + 0];
     const int component_count = model.l3k3_tensor_block_ops[op_offset + 1];
     for (int component = 0; component < component_count; ++component) {
@@ -4663,6 +5542,9 @@ static __global__ void gpu_l3k3_tensor_block_energy_backward(
 
   for (int op = model.l3k3_tensor_block_op_count - 1; op >= 0; --op) {
     const int op_offset = op * kSus2TensorBlockOpInts;
+    if (l3k3_tensor_block_backward_fast<RealT, GradT>(N, i, model, op_offset, moments, grads)) {
+      continue;
+    }
     const int group_begin = model.l3k3_tensor_block_ops[op_offset + 0];
     const int component_count = model.l3k3_tensor_block_ops[op_offset + 1];
     for (int component = component_count - 1; component >= 0; --component) {
@@ -5523,8 +6405,9 @@ SUS2_V11::SUS2_V11(
   }
   if (use_l3k3_tensor_block_) {
     printf(
-      "SUS2 v1.1 GPUMD tensor-block path: l3k3 block DAG, ops=%d, component_groups=%d.\n",
+      "SUS2 v1.1 GPUMD tensor-block path: l3k3 block DAG, ops=%d, fast_ops=%d, component_groups=%d.\n",
       l3k3_tensor_block_op_count_,
+      l3k3_tensor_block_plan.fast_op_count,
       l3k3_tensor_block_plan.component_group_count);
   } else if (request_l3k3_tensor_block) {
     printf(
