@@ -217,6 +217,12 @@ struct L3K3TensorBlockPlan {
   int op_count = 0;
   int component_group_count = 0;
   int fast_op_count = 0;
+  int generic_op_count = 0;
+  int candidate_count = 0;
+  int matched_candidate_count = 0;
+  int generic_row_count = 0;
+  int selected_cost_units = 0;
+  std::array<int, kSus2TensorBlockMatMatTransScalar + 1> op_kind_counts{};
   std::vector<int> ops;
 };
 
@@ -1528,6 +1534,118 @@ int classify_l3k3_tensor_block_op(
   return kSus2TensorBlockGeneric;
 }
 
+const char* l3k3_tensor_block_kind_name(int kind)
+{
+  switch (kind) {
+    case kSus2TensorBlockGeneric:
+      return "generic";
+    case kSus2TensorBlockScalarScalar:
+      return "scalar_scalar";
+    case kSus2TensorBlockScalarTensor:
+      return "scalar_tensor";
+    case kSus2TensorBlockTensorScalar:
+      return "tensor_scalar";
+    case kSus2TensorBlockDot11:
+      return "dot11";
+    case kSus2TensorBlockDot22:
+      return "dot22";
+    case kSus2TensorBlockDot33:
+      return "dot33";
+    case kSus2TensorBlockVecSym2ToVec:
+      return "vec_sym2_vec";
+    case kSus2TensorBlockSym2VecToVec:
+      return "sym2_vec_vec";
+    case kSus2TensorBlockVecSym3ToSym2:
+      return "vec_sym3_sym2";
+    case kSus2TensorBlockSym3VecToSym2:
+      return "sym3_vec_sym2";
+    case kSus2TensorBlockSym2Sym3ToVec:
+      return "sym2_sym3_vec";
+    case kSus2TensorBlockSym3Sym2ToVec:
+      return "sym3_sym2_vec";
+    case kSus2TensorBlockSym2Sym2ToSym2:
+      return "sym2_sym2_sym2";
+    case kSus2TensorBlockSym2Sym2ToMatAB:
+      return "sym2_sym2_mat_ab";
+    case kSus2TensorBlockSym2Sym2ToMatBA:
+      return "sym2_sym2_mat_ba";
+    case kSus2TensorBlockVecVecOuterAB:
+      return "vec_vec_outer_ab";
+    case kSus2TensorBlockVecVecOuterBA:
+      return "vec_vec_outer_ba";
+    case kSus2TensorBlockVecVecToSym2:
+      return "vec_vec_sym2";
+    case kSus2TensorBlockSym2MatScalar:
+      return "sym2_mat_scalar";
+    case kSus2TensorBlockMatSym2Scalar:
+      return "mat_sym2_scalar";
+    case kSus2TensorBlockMatMatSameScalar:
+      return "mat_mat_same_scalar";
+    case kSus2TensorBlockMatMatTransScalar:
+      return "mat_mat_trans_scalar";
+    default:
+      return "unknown";
+  }
+}
+
+int l3k3_tensor_block_fast_row_count(int kind, int component_count, int generic_rows)
+{
+  switch (kind) {
+    case kSus2TensorBlockScalarScalar:
+      return 1;
+    case kSus2TensorBlockScalarTensor:
+    case kSus2TensorBlockTensorScalar:
+      return component_count;
+    case kSus2TensorBlockDot11:
+      return 3;
+    case kSus2TensorBlockDot22:
+      return 6;
+    case kSus2TensorBlockDot33:
+      return 10;
+    case kSus2TensorBlockVecSym2ToVec:
+    case kSus2TensorBlockSym2VecToVec:
+      return 9;
+    case kSus2TensorBlockVecSym3ToSym2:
+    case kSus2TensorBlockSym3VecToSym2:
+    case kSus2TensorBlockSym2Sym3ToVec:
+    case kSus2TensorBlockSym3Sym2ToVec:
+    case kSus2TensorBlockSym2Sym2ToSym2:
+      return 18;
+    case kSus2TensorBlockSym2Sym2ToMatAB:
+    case kSus2TensorBlockSym2Sym2ToMatBA:
+      return 27;
+    case kSus2TensorBlockVecVecOuterAB:
+    case kSus2TensorBlockVecVecOuterBA:
+    case kSus2TensorBlockSym2MatScalar:
+    case kSus2TensorBlockMatSym2Scalar:
+    case kSus2TensorBlockMatMatSameScalar:
+    case kSus2TensorBlockMatMatTransScalar:
+      return 9;
+    case kSus2TensorBlockVecVecToSym2:
+      return 6;
+    default:
+      return generic_rows;
+  }
+}
+
+std::string format_l3k3_tensor_block_histogram(const L3K3TensorBlockPlan& plan)
+{
+  std::ostringstream out;
+  bool first = true;
+  for (int kind = 0; kind < static_cast<int>(plan.op_kind_counts.size()); ++kind) {
+    const int count = plan.op_kind_counts[kind];
+    if (count <= 0) {
+      continue;
+    }
+    if (!first) {
+      out << ",";
+    }
+    out << l3k3_tensor_block_kind_name(kind) << ":" << count;
+    first = false;
+  }
+  return first ? "none" : out.str();
+}
+
 L3K3TensorBlockPlan build_l3k3_tensor_block_plan(const SUS2HostModel& model)
 {
   L3K3TensorBlockPlan plan;
@@ -1661,14 +1779,12 @@ L3K3TensorBlockPlan build_l3k3_tensor_block_plan(const SUS2HostModel& model)
       }
       l3k3_add_candidate_coarsenings(labels, matrix, candidates);
     }
-    std::sort(
-      candidates.begin(),
-      candidates.end(),
-      [](const L3K3TensorBlockCandidate& lhs, const L3K3TensorBlockCandidate& rhs) {
-        return lhs.component_count > rhs.component_count;
-      });
+    plan.candidate_count += static_cast<int>(candidates.size());
 
     const L3K3TensorBlockCandidate* matched = nullptr;
+    int selected_op_kind = kSus2TensorBlockGeneric;
+    int selected_generic_rows = 0;
+    int selected_cost = 0;
     for (const auto& candidate : candidates) {
       if (candidate.component_count <= 0 || cursor + candidate.component_count > model.alpha_moments_count) {
         continue;
@@ -1683,8 +1799,28 @@ L3K3TensorBlockPlan build_l3k3_tensor_block_plan(const SUS2HostModel& model)
       }
       if (contiguous_dst &&
           l3k3_candidate_matches(model, group_begin, group_len, group_index, block_a, block_b, candidate)) {
-        matched = &candidate;
-        break;
+        const int op_kind = (layout.l == 3 && layout.k == 3)
+          ? classify_l3k3_tensor_block_op(block_a, block_b, candidate)
+          : kSus2TensorBlockGeneric;
+        int generic_rows = 0;
+        for (int component = 0; component < candidate.component_count; ++component) {
+          generic_rows += group_len[group_index + component];
+        }
+        const int fast_rows =
+          l3k3_tensor_block_fast_row_count(op_kind, candidate.component_count, generic_rows);
+        const int cost = 2 * fast_rows;
+        ++plan.matched_candidate_count;
+        if (matched == nullptr ||
+            candidate.component_count > matched->component_count ||
+            (candidate.component_count == matched->component_count &&
+             (cost < selected_cost ||
+              (cost == selected_cost && op_kind != kSus2TensorBlockGeneric &&
+               selected_op_kind == kSus2TensorBlockGeneric)))) {
+          matched = &candidate;
+          selected_op_kind = op_kind;
+          selected_generic_rows = generic_rows;
+          selected_cost = cost;
+        }
       }
     }
     if (matched == nullptr) {
@@ -1696,19 +1832,24 @@ L3K3TensorBlockPlan build_l3k3_tensor_block_plan(const SUS2HostModel& model)
     if (block.id < 0) {
       return L3K3TensorBlockPlan{};
     }
-    const int op_kind = (layout.l == 3 && layout.k == 3)
-      ? classify_l3k3_tensor_block_op(block_a, block_b, *matched)
-      : kSus2TensorBlockGeneric;
     plan.ops.push_back(group_index);
     plan.ops.push_back(matched->component_count);
-    plan.ops.push_back(op_kind);
+    plan.ops.push_back(selected_op_kind);
     plan.ops.push_back(block_a.start);
     plan.ops.push_back(block_b.start);
     plan.ops.push_back(cursor);
-    if (op_kind != kSus2TensorBlockGeneric) {
+    if (selected_op_kind != kSus2TensorBlockGeneric) {
       ++plan.fast_op_count;
+    } else {
+      ++plan.generic_op_count;
+      plan.generic_row_count += selected_generic_rows;
+    }
+    if (selected_op_kind >= 0 &&
+        selected_op_kind < static_cast<int>(plan.op_kind_counts.size())) {
+      ++plan.op_kind_counts[selected_op_kind];
     }
     plan.component_group_count += matched->component_count;
+    plan.selected_cost_units += selected_cost;
     blocks.push_back(block);
     for (int id : block.ids) {
       moment_to_block[id] = block.id;
@@ -1752,10 +1893,17 @@ TensorAutoDecision choose_tensor_auto_plan(
          << ", scalars=" << model.alpha_scalar_moments
          << ", moments=" << model.alpha_moments_count
          << ", product_rules=" << model.alpha_times_count
+         << ", graph_specific=yes"
          << ", tensor_ops=" << block_plan.op_count
          << ", fast_ops=" << block_plan.fast_op_count
+         << ", generic_ops=" << block_plan.generic_op_count
          << ", fast_fraction=" << std::fixed << std::setprecision(3) << fast_fraction
          << ", component_groups=" << block_plan.component_group_count
+         << ", candidate_matches=" << block_plan.matched_candidate_count << "/"
+         << block_plan.candidate_count
+         << ", generic_rows=" << block_plan.generic_row_count
+         << ", cost_units=" << block_plan.selected_cost_units
+         << ", op_histogram=" << format_l3k3_tensor_block_histogram(block_plan)
          << "; tensor-block selected";
   decision.use_tensor_block = true;
   decision.reason = reason.str();
@@ -6532,14 +6680,20 @@ SUS2_V11::SUS2_V11(
   }
   if (use_l3k3_tensor_block_) {
     printf(
-      "SUS2 v1.1 GPUMD tensor-block path: tensor l%dk%d block DAG, ops=%d, fast_ops=%d, component_groups=%d, fast_forward=%s, fast_backward=%s.\n",
+      "SUS2 v1.1 GPUMD tensor-block path: graph-specific tensor l%dk%d block DAG, ops=%d, fast_ops=%d, generic_ops=%d, component_groups=%d, candidate_matches=%d/%d, generic_rows=%d, cost_units=%d, fast_forward=%s, fast_backward=%s, op_histogram=%s.\n",
       tensor_l_,
       tensor_k_,
       l3k3_tensor_block_op_count_,
       l3k3_tensor_block_plan.fast_op_count,
+      l3k3_tensor_block_plan.generic_op_count,
       l3k3_tensor_block_plan.component_group_count,
+      l3k3_tensor_block_plan.matched_candidate_count,
+      l3k3_tensor_block_plan.candidate_count,
+      l3k3_tensor_block_plan.generic_row_count,
+      l3k3_tensor_block_plan.selected_cost_units,
       use_l3k3_tensor_block_fast_forward_ ? "yes" : "no",
-      use_l3k3_tensor_block_fast_backward_ ? "yes" : "no");
+      use_l3k3_tensor_block_fast_backward_ ? "yes" : "no",
+      format_l3k3_tensor_block_histogram(l3k3_tensor_block_plan).c_str());
   } else if (request_l3k3_tensor_block) {
     printf(
       "SUS2 v1.1 GPUMD tensor-block path: requested but unsupported for this model; using product graph fallback.\n");
