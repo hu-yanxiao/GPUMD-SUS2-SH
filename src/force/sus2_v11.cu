@@ -220,6 +220,11 @@ struct L3K3TensorBlockPlan {
   std::vector<int> ops;
 };
 
+struct TensorAutoDecision {
+  bool use_tensor_block = false;
+  std::string reason;
+};
+
 [[noreturn]] void sus2_input_error(const std::string& message)
 {
   std::cout << message << std::endl;
@@ -1721,6 +1726,42 @@ L3K3TensorBlockPlan build_l3k3_tensor_block_plan(const SUS2HostModel& model)
   return plan;
 }
 
+TensorAutoDecision choose_tensor_auto_plan(
+  const SUS2HostModel& model,
+  const L3K3TensorBlockPlan& block_plan)
+{
+  TensorAutoDecision decision;
+  const TensorBasicLayout layout = detect_tensor_alpha_basic_layout(model);
+  std::ostringstream reason;
+  if (!layout.enabled) {
+    decision.reason = "no tensor alpha_index_basic layout; product graph selected";
+    return decision;
+  }
+  if (!block_plan.enabled || block_plan.op_count <= 0) {
+    reason << "tensor-block planner unsupported for l" << layout.l << "k" << layout.k
+           << "; product graph selected";
+    decision.reason = reason.str();
+    return decision;
+  }
+
+  const double fast_fraction =
+    block_plan.op_count > 0 ? static_cast<double>(block_plan.fast_op_count) /
+                                static_cast<double>(block_plan.op_count)
+                            : 0.0;
+  reason << "l" << layout.l << "k" << layout.k
+         << ", scalars=" << model.alpha_scalar_moments
+         << ", moments=" << model.alpha_moments_count
+         << ", product_rules=" << model.alpha_times_count
+         << ", tensor_ops=" << block_plan.op_count
+         << ", fast_ops=" << block_plan.fast_op_count
+         << ", fast_fraction=" << std::fixed << std::setprecision(3) << fast_fraction
+         << ", component_groups=" << block_plan.component_group_count
+         << "; tensor-block selected";
+  decision.use_tensor_block = true;
+  decision.reason = reason.str();
+  return decision;
+}
+
 SUS2HostModel load_model(const std::string& path)
 {
   const std::string text = read_text_file(path);
@@ -2181,6 +2222,35 @@ bool parse_l3k3_tensor_block(
     }
   }
   return use_tensor_block;
+}
+
+bool parse_tensor_auto(
+  const SUS2HostModel& model,
+  int num_potential_options,
+  const char** potential_options)
+{
+  bool use_tensor_auto = false;
+  const char* env = std::getenv("SUS2_GPUMD_TENSOR_AUTO");
+  if (env != nullptr) {
+    use_tensor_auto = parse_bool_value(env, "SUS2_GPUMD_TENSOR_AUTO");
+  }
+  const char* generic_env = std::getenv("SUS2_GPUMD_TENSOR");
+  if (generic_env != nullptr) {
+    use_tensor_auto = parse_bool_value(generic_env, "SUS2_GPUMD_TENSOR");
+  }
+
+  const int option_begin = std::min(num_potential_options, model.species_count);
+  for (int i = option_begin; i < num_potential_options; ++i) {
+    const std::string option = potential_options[i] == nullptr ? "" : potential_options[i];
+    if (starts_with(option, "sus2_tensor_auto=") ||
+        starts_with(option, "tensor_auto=") ||
+        starts_with(option, "sus2_tensor=") ||
+        starts_with(option, "tensor=")) {
+      const size_t eq = option.find('=');
+      use_tensor_auto = parse_bool_value(option.substr(eq + 1), option.substr(0, eq));
+    }
+  }
+  return use_tensor_auto;
 }
 
 bool parse_l3k3_tensor_block_fast_forward(
@@ -6194,19 +6264,30 @@ SUS2_V11::SUS2_V11(
     parse_l3k3_tensor_scalar(host_model, num_potential_options, potential_options);
   const bool request_l3k3_tensor_block =
     parse_l3k3_tensor_block(host_model, num_potential_options, potential_options);
+  const bool request_tensor_auto =
+    parse_tensor_auto(host_model, num_potential_options, potential_options);
   use_l3k3_tensor_block_fast_forward_ =
     parse_l3k3_tensor_block_fast_forward(host_model, num_potential_options, potential_options);
   use_l3k3_tensor_block_fast_backward_ =
     parse_l3k3_tensor_block_fast_backward(host_model, num_potential_options, potential_options);
   L3K3TensorScalarPlan l3k3_tensor_scalar_plan;
   L3K3TensorBlockPlan l3k3_tensor_block_plan;
-  if (request_l3k3_tensor_scalar && request_l3k3_tensor_block) {
-    sus2_input_error("SUS2 v1.1 tensor_scalar and tensor_block paths are mutually exclusive.");
+  TensorAutoDecision tensor_auto_decision;
+  if ((request_l3k3_tensor_scalar && request_l3k3_tensor_block) ||
+      (request_tensor_auto && (request_l3k3_tensor_scalar || request_l3k3_tensor_block))) {
+    sus2_input_error(
+      "SUS2 v1.1 tensor_auto, tensor_scalar, and tensor_block path requests are mutually exclusive.");
   }
   if (request_l3k3_tensor_block) {
     l3k3_tensor_block_plan = build_l3k3_tensor_block_plan(host_model);
     use_l3k3_tensor_block_ = l3k3_tensor_block_plan.enabled;
     l3k3_tensor_block_op_count_ = l3k3_tensor_block_plan.op_count;
+  } else if (request_tensor_auto) {
+    l3k3_tensor_block_plan = build_l3k3_tensor_block_plan(host_model);
+    tensor_auto_decision = choose_tensor_auto_plan(host_model, l3k3_tensor_block_plan);
+    use_l3k3_tensor_block_ = tensor_auto_decision.use_tensor_block;
+    l3k3_tensor_block_op_count_ =
+      use_l3k3_tensor_block_ ? l3k3_tensor_block_plan.op_count : 0;
   } else if (request_l3k3_tensor_scalar) {
     l3k3_tensor_scalar_plan = build_l3k3_tensor_scalar_plan(host_model);
     use_l3k3_tensor_scalar_ = l3k3_tensor_scalar_plan.enabled;
@@ -6400,6 +6481,12 @@ SUS2_V11::SUS2_V11(
       "SUS2 v1.1 GPUMD basic/force fast path: tensor l%dk%d alpha_index_basic layout.\n",
       tensor_l_,
       tensor_k_);
+  }
+  if (request_tensor_auto) {
+    printf(
+      "SUS2 v1.1 GPUMD tensor planner: auto requested, selected=%s, %s.\n",
+      use_l3k3_tensor_block_ ? "tensor-block" : "product-graph",
+      tensor_auto_decision.reason.c_str());
   }
   if (use_const_alpha_times_ && !use_l3k3_tensor_scalar_ && !use_l3k3_tensor_block_) {
     printf("SUS2 v1.1 GPUMD product-rule table: constant-memory uint16 alpha_index_times.\n");
