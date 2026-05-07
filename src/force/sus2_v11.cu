@@ -32,6 +32,10 @@ constexpr int kSus2LocalGraphMaxMoments = 640;
 constexpr int kSus2MaxTensorRank = 4;
 constexpr int kSus2MaxTensorGroups = 4;
 constexpr int kSus2MaxTensorBasic = 140;
+constexpr int kSus2L3K3TensorScalarBasic = 60;
+constexpr int kSus2TensorScalarMaxDegree = 5;
+constexpr int kSus2TensorScalarPackedInts = kSus2TensorScalarMaxDegree + 1;
+constexpr int kSus2TensorScalarBlockSize = 128;
 constexpr double kLaguerreMinRho = 1.0e-8;
 constexpr double kLaguerrePositiveParamFloor = 1.0e-6;
 
@@ -145,6 +149,10 @@ struct SUS2DeviceModel {
   const int* alpha_times;
   const int* alpha_time_groups;
   const int* alpha_moment_mapping;
+  int l3k3_tensor_scalar_term_count;
+  const int* l3k3_tensor_scalar_terms;
+  const double* l3k3_tensor_scalar_coeffs;
+  const float* l3k3_tensor_scalar_coeffs_float;
   const float* lut_vals;
   const float* lut_ders;
   const float* radial_direct_coeffs;
@@ -158,6 +166,7 @@ struct SUS2DeviceModel {
   bool use_const_float_coeffs;
   bool use_float_model_params;
   bool use_radial_direct;
+  bool use_l3k3_tensor_scalar;
 };
 
 struct TensorBasicLayout {
@@ -165,6 +174,13 @@ struct TensorBasicLayout {
   int l = 0;
   int k = 0;
   int basic_per_group = 0;
+};
+
+struct L3K3TensorScalarPlan {
+  bool enabled = false;
+  int max_degree = 0;
+  std::vector<int> terms;
+  std::vector<double> coeffs;
 };
 
 [[noreturn]] void sus2_input_error(const std::string& message)
@@ -777,6 +793,122 @@ bool supports_product_assign(const SUS2HostModel& model)
   return true;
 }
 
+std::array<int, kSus2TensorScalarPackedInts> make_l3k3_tensor_scalar_key(
+  const std::array<int, kSus2TensorScalarMaxDegree>& ids,
+  int degree)
+{
+  std::array<int, kSus2TensorScalarPackedInts> key;
+  key.fill(-1);
+  key[0] = degree;
+  for (int i = 0; i < degree; ++i) {
+    key[i + 1] = ids[i];
+  }
+  return key;
+}
+
+L3K3TensorScalarPlan build_l3k3_tensor_scalar_plan(const SUS2HostModel& model)
+{
+  L3K3TensorScalarPlan plan;
+  const TensorBasicLayout layout = detect_tensor_alpha_basic_layout(model);
+  if (!layout.enabled || layout.l != 3 || layout.k != 3 ||
+      model.alpha_basic_count != kSus2L3K3TensorScalarBasic) {
+    return plan;
+  }
+
+  using MonoKey = std::array<int, kSus2TensorScalarPackedInts>;
+  using Polynomial = std::map<MonoKey, double>;
+  std::vector<Polynomial> polys(model.alpha_moments_count);
+  std::vector<unsigned char> built(model.alpha_moments_count, 0);
+
+  for (int basic = 0; basic < model.alpha_basic_count; ++basic) {
+    std::array<int, kSus2TensorScalarMaxDegree> ids;
+    ids.fill(-1);
+    ids[0] = basic;
+    polys[basic][make_l3k3_tensor_scalar_key(ids, 1)] = 1.0;
+    built[basic] = 1;
+  }
+
+  int max_degree = 1;
+  for (int t = 0; t < model.alpha_times_count; ++t) {
+    const int src0 = model.alpha_times[t * 4 + 0];
+    const int src1 = model.alpha_times[t * 4 + 1];
+    const int mult = model.alpha_times[t * 4 + 2];
+    const int dst = model.alpha_times[t * 4 + 3];
+    if (src0 < 0 || src0 >= model.alpha_moments_count || src1 < 0 ||
+        src1 >= model.alpha_moments_count || dst < 0 || dst >= model.alpha_moments_count ||
+        !built[src0] || !built[src1]) {
+      return L3K3TensorScalarPlan{};
+    }
+
+    Polynomial product;
+    for (const auto& lhs : polys[src0]) {
+      const int lhs_degree = lhs.first[0];
+      for (const auto& rhs : polys[src1]) {
+        const int rhs_degree = rhs.first[0];
+        const int degree = lhs_degree + rhs_degree;
+        if (degree > kSus2TensorScalarMaxDegree) {
+          return L3K3TensorScalarPlan{};
+        }
+        std::array<int, kSus2TensorScalarMaxDegree> ids;
+        ids.fill(-1);
+        int cursor = 0;
+        for (int k = 0; k < lhs_degree; ++k) {
+          ids[cursor++] = lhs.first[k + 1];
+        }
+        for (int k = 0; k < rhs_degree; ++k) {
+          ids[cursor++] = rhs.first[k + 1];
+        }
+        std::sort(ids.begin(), ids.begin() + degree);
+        const MonoKey key = make_l3k3_tensor_scalar_key(ids, degree);
+        product[key] += static_cast<double>(mult) * lhs.second * rhs.second;
+        max_degree = std::max(max_degree, degree);
+      }
+    }
+    for (const auto& term : product) {
+      polys[dst][term.first] += term.second;
+      if (polys[dst][term.first] == 0.0) {
+        polys[dst].erase(term.first);
+      }
+    }
+    built[dst] = 1;
+  }
+
+  Polynomial merged;
+  for (int idx = 0; idx < model.alpha_scalar_moments; ++idx) {
+    const int moment_id = model.alpha_moment_mapping[idx];
+    if (moment_id < 0 || moment_id >= model.alpha_moments_count || !built[moment_id]) {
+      return L3K3TensorScalarPlan{};
+    }
+    const double coeff = model.moment_coeffs[idx];
+    if (coeff == 0.0) {
+      continue;
+    }
+    for (const auto& term : polys[moment_id]) {
+      merged[term.first] += coeff * term.second;
+      if (merged[term.first] == 0.0) {
+        merged.erase(term.first);
+      }
+    }
+  }
+
+  plan.enabled = true;
+  plan.max_degree = max_degree;
+  plan.terms.reserve(merged.size() * kSus2TensorScalarPackedInts);
+  plan.coeffs.reserve(merged.size());
+  for (const auto& term : merged) {
+    const int degree = term.first[0];
+    if (degree <= 0 || degree > kSus2TensorScalarMaxDegree) {
+      return L3K3TensorScalarPlan{};
+    }
+    plan.terms.push_back(degree);
+    for (int k = 1; k < kSus2TensorScalarPackedInts; ++k) {
+      plan.terms.push_back(term.first[k]);
+    }
+    plan.coeffs.push_back(term.second);
+  }
+  return plan;
+}
+
 SUS2HostModel load_model(const std::string& path)
 {
   const std::string text = read_text_file(path);
@@ -1181,6 +1313,35 @@ bool parse_tensor_force_grad_cache(
   return use_cache;
 }
 
+bool parse_l3k3_tensor_scalar(
+  const SUS2HostModel& model,
+  int num_potential_options,
+  const char** potential_options)
+{
+  bool use_tensor_scalar = false;
+  const char* env = std::getenv("SUS2_GPUMD_L3K3_TENSOR_SCALAR");
+  if (env != nullptr) {
+    use_tensor_scalar = parse_bool_value(env, "SUS2_GPUMD_L3K3_TENSOR_SCALAR");
+  }
+  const char* generic_env = std::getenv("SUS2_GPUMD_TENSOR_SCALAR");
+  if (generic_env != nullptr) {
+    use_tensor_scalar = parse_bool_value(generic_env, "SUS2_GPUMD_TENSOR_SCALAR");
+  }
+
+  const int option_begin = std::min(num_potential_options, model.species_count);
+  for (int i = option_begin; i < num_potential_options; ++i) {
+    const std::string option = potential_options[i] == nullptr ? "" : potential_options[i];
+    if (starts_with(option, "sus2_l3k3_tensor_scalar=") ||
+        starts_with(option, "l3k3_tensor_scalar=") ||
+        starts_with(option, "sus2_tensor_scalar=") ||
+        starts_with(option, "tensor_scalar=")) {
+      const size_t eq = option.find('=');
+      use_tensor_scalar = parse_bool_value(option.substr(eq + 1), option.substr(0, eq));
+    }
+  }
+  return use_tensor_scalar;
+}
+
 bool parse_fused_graph(
   const SUS2HostModel& model,
   int num_potential_options,
@@ -1390,6 +1551,14 @@ __device__ __forceinline__ RealT sus2_moment_coeff(const SUS2DeviceModel& model,
   }
   return model.use_float_model_params ? static_cast<RealT>(model.moment_coeffs_float[idx])
                                       : static_cast<RealT>(model.moment_coeffs[idx]);
+}
+
+template <typename RealT>
+__device__ __forceinline__ RealT sus2_l3k3_tensor_scalar_coeff(const SUS2DeviceModel& model, int idx)
+{
+  return model.use_float_model_params && model.l3k3_tensor_scalar_coeffs_float != nullptr
+    ? static_cast<RealT>(model.l3k3_tensor_scalar_coeffs_float[idx])
+    : static_cast<RealT>(model.l3k3_tensor_scalar_coeffs[idx]);
 }
 
 __device__ __forceinline__ int sus2_scalar_moment_id(const SUS2DeviceModel& model, int idx)
@@ -3402,6 +3571,196 @@ static __global__ void gpu_local_graph_energy_backward_to_basic(
 }
 
 template <typename RealT, typename GradT>
+static __global__ void gpu_l3k3_tensor_scalar_energy_backward(
+  int N,
+  SUS2DeviceModel model,
+  const int* type,
+  const RealT* basic_moments,
+  GradT* basic_grads,
+  double* potential)
+{
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= N || model.alpha_basic_count != kSus2L3K3TensorScalarBasic ||
+      model.l3k3_tensor_scalar_term_count <= 0) {
+    return;
+  }
+
+  RealT vals[kSus2L3K3TensorScalarBasic];
+  RealT grads_local[kSus2L3K3TensorScalarBasic];
+#pragma unroll
+  for (int basic = 0; basic < kSus2L3K3TensorScalarBasic; ++basic) {
+    vals[basic] = basic_moments[static_cast<size_t>(basic) * N + i];
+    grads_local[basic] = static_cast<RealT>(0.0);
+  }
+
+  RealT scalar_sum = static_cast<RealT>(0.0);
+  for (int term = 0; term < model.l3k3_tensor_scalar_term_count; ++term) {
+    const int offset = term * kSus2TensorScalarPackedInts;
+    const int degree = model.l3k3_tensor_scalar_terms[offset + 0];
+    const int b0 = model.l3k3_tensor_scalar_terms[offset + 1];
+    const int b1 = model.l3k3_tensor_scalar_terms[offset + 2];
+    const int b2 = model.l3k3_tensor_scalar_terms[offset + 3];
+    const int b3 = model.l3k3_tensor_scalar_terms[offset + 4];
+    const int b4 = model.l3k3_tensor_scalar_terms[offset + 5];
+    const RealT coeff = sus2_l3k3_tensor_scalar_coeff<RealT>(model, term);
+
+    if (degree == 1) {
+      scalar_sum += coeff * vals[b0];
+      grads_local[b0] += coeff;
+    } else if (degree == 2) {
+      const RealT v0 = vals[b0];
+      const RealT v1 = vals[b1];
+      scalar_sum += coeff * v0 * v1;
+      grads_local[b0] += coeff * v1;
+      grads_local[b1] += coeff * v0;
+    } else if (degree == 3) {
+      const RealT v0 = vals[b0];
+      const RealT v1 = vals[b1];
+      const RealT v2 = vals[b2];
+      scalar_sum += coeff * v0 * v1 * v2;
+      grads_local[b0] += coeff * v1 * v2;
+      grads_local[b1] += coeff * v0 * v2;
+      grads_local[b2] += coeff * v0 * v1;
+    } else if (degree == 4) {
+      const RealT v0 = vals[b0];
+      const RealT v1 = vals[b1];
+      const RealT v2 = vals[b2];
+      const RealT v3 = vals[b3];
+      scalar_sum += coeff * v0 * v1 * v2 * v3;
+      grads_local[b0] += coeff * v1 * v2 * v3;
+      grads_local[b1] += coeff * v0 * v2 * v3;
+      grads_local[b2] += coeff * v0 * v1 * v3;
+      grads_local[b3] += coeff * v0 * v1 * v2;
+    } else if (degree == 5) {
+      const RealT v0 = vals[b0];
+      const RealT v1 = vals[b1];
+      const RealT v2 = vals[b2];
+      const RealT v3 = vals[b3];
+      const RealT v4 = vals[b4];
+      scalar_sum += coeff * v0 * v1 * v2 * v3 * v4;
+      grads_local[b0] += coeff * v1 * v2 * v3 * v4;
+      grads_local[b1] += coeff * v0 * v2 * v3 * v4;
+      grads_local[b2] += coeff * v0 * v1 * v3 * v4;
+      grads_local[b3] += coeff * v0 * v1 * v2 * v4;
+      grads_local[b4] += coeff * v0 * v1 * v2 * v3;
+    }
+  }
+
+  const int type_i = type[i];
+  const RealT species_coeff = sus2_species_coeff<RealT>(model, type_i);
+  const RealT site_energy =
+    sus2_shift_coeff<RealT>(model, type_i) + species_coeff + species_coeff * scalar_sum;
+  potential[i] += static_cast<double>(site_energy);
+
+#pragma unroll
+  for (int basic = 0; basic < kSus2L3K3TensorScalarBasic; ++basic) {
+    basic_grads[static_cast<size_t>(basic) * N + i] = static_cast<GradT>(grads_local[basic]);
+  }
+}
+
+static __global__ void gpu_l3k3_tensor_scalar_energy_backward_float_parallel(
+  int N,
+  SUS2DeviceModel model,
+  const int* type,
+  const float* basic_moments,
+  float* basic_grads,
+  double* potential)
+{
+  const int i = blockIdx.x;
+  const int tid = threadIdx.x;
+  if (i >= N || model.alpha_basic_count != kSus2L3K3TensorScalarBasic ||
+      model.l3k3_tensor_scalar_term_count <= 0) {
+    return;
+  }
+
+  __shared__ float vals[kSus2L3K3TensorScalarBasic];
+  __shared__ float grads_shared[kSus2L3K3TensorScalarBasic];
+  __shared__ float scalar_shared[kSus2TensorScalarBlockSize];
+
+  if (tid < kSus2L3K3TensorScalarBasic) {
+    vals[tid] = basic_moments[static_cast<size_t>(tid) * N + i];
+    grads_shared[tid] = 0.0f;
+  }
+  scalar_shared[tid] = 0.0f;
+  __syncthreads();
+
+  float scalar_local = 0.0f;
+  for (int term = tid; term < model.l3k3_tensor_scalar_term_count; term += blockDim.x) {
+    const int offset = term * kSus2TensorScalarPackedInts;
+    const int degree = model.l3k3_tensor_scalar_terms[offset + 0];
+    const int b0 = model.l3k3_tensor_scalar_terms[offset + 1];
+    const int b1 = model.l3k3_tensor_scalar_terms[offset + 2];
+    const int b2 = model.l3k3_tensor_scalar_terms[offset + 3];
+    const int b3 = model.l3k3_tensor_scalar_terms[offset + 4];
+    const int b4 = model.l3k3_tensor_scalar_terms[offset + 5];
+    const float coeff = sus2_l3k3_tensor_scalar_coeff<float>(model, term);
+
+    if (degree == 1) {
+      scalar_local += coeff * vals[b0];
+      atomicAdd(&grads_shared[b0], coeff);
+    } else if (degree == 2) {
+      const float v0 = vals[b0];
+      const float v1 = vals[b1];
+      scalar_local += coeff * v0 * v1;
+      atomicAdd(&grads_shared[b0], coeff * v1);
+      atomicAdd(&grads_shared[b1], coeff * v0);
+    } else if (degree == 3) {
+      const float v0 = vals[b0];
+      const float v1 = vals[b1];
+      const float v2 = vals[b2];
+      scalar_local += coeff * v0 * v1 * v2;
+      atomicAdd(&grads_shared[b0], coeff * v1 * v2);
+      atomicAdd(&grads_shared[b1], coeff * v0 * v2);
+      atomicAdd(&grads_shared[b2], coeff * v0 * v1);
+    } else if (degree == 4) {
+      const float v0 = vals[b0];
+      const float v1 = vals[b1];
+      const float v2 = vals[b2];
+      const float v3 = vals[b3];
+      scalar_local += coeff * v0 * v1 * v2 * v3;
+      atomicAdd(&grads_shared[b0], coeff * v1 * v2 * v3);
+      atomicAdd(&grads_shared[b1], coeff * v0 * v2 * v3);
+      atomicAdd(&grads_shared[b2], coeff * v0 * v1 * v3);
+      atomicAdd(&grads_shared[b3], coeff * v0 * v1 * v2);
+    } else if (degree == 5) {
+      const float v0 = vals[b0];
+      const float v1 = vals[b1];
+      const float v2 = vals[b2];
+      const float v3 = vals[b3];
+      const float v4 = vals[b4];
+      scalar_local += coeff * v0 * v1 * v2 * v3 * v4;
+      atomicAdd(&grads_shared[b0], coeff * v1 * v2 * v3 * v4);
+      atomicAdd(&grads_shared[b1], coeff * v0 * v2 * v3 * v4);
+      atomicAdd(&grads_shared[b2], coeff * v0 * v1 * v3 * v4);
+      atomicAdd(&grads_shared[b3], coeff * v0 * v1 * v2 * v4);
+      atomicAdd(&grads_shared[b4], coeff * v0 * v1 * v2 * v3);
+    }
+  }
+
+  scalar_shared[tid] = scalar_local;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      scalar_shared[tid] += scalar_shared[tid + stride];
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    const int type_i = type[i];
+    const float species_coeff = sus2_species_coeff<float>(model, type_i);
+    const float site_energy =
+      sus2_shift_coeff<float>(model, type_i) + species_coeff + species_coeff * scalar_shared[0];
+    potential[i] += static_cast<double>(site_energy);
+  }
+  __syncthreads();
+
+  if (tid < kSus2L3K3TensorScalarBasic) {
+    basic_grads[static_cast<size_t>(tid) * N + i] = grads_shared[tid];
+  }
+}
+
+template <typename RealT, typename GradT>
 static __global__ void gpu_site_energy_init_grad(
   int N,
   SUS2DeviceModel model,
@@ -4248,12 +4607,26 @@ SUS2_V11::SUS2_V11(
   use_tensor_force_grad_cache_ =
     parse_tensor_force_grad_cache(host_model, num_potential_options, potential_options);
   use_radial_direct_ = parse_radial_direct(host_model, num_potential_options, potential_options);
+  const bool request_l3k3_tensor_scalar =
+    parse_l3k3_tensor_scalar(host_model, num_potential_options, potential_options);
+  L3K3TensorScalarPlan l3k3_tensor_scalar_plan;
+  if (request_l3k3_tensor_scalar) {
+    l3k3_tensor_scalar_plan = build_l3k3_tensor_scalar_plan(host_model);
+    use_l3k3_tensor_scalar_ = l3k3_tensor_scalar_plan.enabled;
+    l3k3_tensor_scalar_term_count_ =
+      static_cast<int>(l3k3_tensor_scalar_plan.coeffs.size());
+  }
+  if (use_l3k3_tensor_scalar_) {
+    use_tensor_force_grad_cache_ = true;
+    use_pairwise_no_atomic_force_ = false;
+  }
   use_local_product_graph_ = use_local_product_graph_ && use_float_moments_ &&
-                             alpha_moments_count_ <= kSus2LocalGraphMaxMoments;
+                             alpha_moments_count_ <= kSus2LocalGraphMaxMoments &&
+                             !use_l3k3_tensor_scalar_;
   product_assign_supported_ = supports_product_assign(host_model);
   use_product_assign_ = use_product_assign_ && product_assign_supported_ &&
                         use_fused_graph_ && !use_local_product_graph_ &&
-                        use_tensor_basic_fastpath_;
+                        use_tensor_basic_fastpath_ && !use_l3k3_tensor_scalar_;
   use_const_float_coeffs_ = use_float_moments_ &&
                             host_model.species_count <= kSus2MaxConstSpecies &&
                             host_model.alpha_scalar_moments <= kSus2MaxConstScalarMoments;
@@ -4332,6 +4705,19 @@ SUS2_V11::SUS2_V11(
       c_sus2_alpha_moment_mapping_u16,
       packed_mapping.data(),
       packed_mapping.size() * sizeof(unsigned short)));
+  }
+  if (use_l3k3_tensor_scalar_) {
+    l3k3_tensor_scalar_terms_.resize(l3k3_tensor_scalar_plan.terms.size());
+    l3k3_tensor_scalar_terms_.copy_from_host(l3k3_tensor_scalar_plan.terms.data());
+    l3k3_tensor_scalar_coeffs_.resize(l3k3_tensor_scalar_plan.coeffs.size());
+    l3k3_tensor_scalar_coeffs_.copy_from_host(l3k3_tensor_scalar_plan.coeffs.data());
+    if (use_float_moments_) {
+      std::vector<float> host_l3k3_tensor_scalar_coeffs_float(
+        l3k3_tensor_scalar_plan.coeffs.begin(), l3k3_tensor_scalar_plan.coeffs.end());
+      l3k3_tensor_scalar_coeffs_float_.resize(host_l3k3_tensor_scalar_coeffs_float.size());
+      l3k3_tensor_scalar_coeffs_float_.copy_from_host(
+        host_l3k3_tensor_scalar_coeffs_float.data());
+    }
   }
 
   if (use_radial_direct_) {
@@ -4413,25 +4799,27 @@ SUS2_V11::SUS2_V11(
       tensor_l_,
       tensor_k_);
   }
-  if (use_const_alpha_times_) {
+  if (use_const_alpha_times_ && !use_l3k3_tensor_scalar_) {
     printf("SUS2 v1.1 GPUMD product-rule table: constant-memory uint16 alpha_index_times.\n");
   }
-  if (use_const_scalar_moments_) {
+  if (use_const_scalar_moments_ && !use_l3k3_tensor_scalar_) {
     printf("SUS2 v1.1 GPUMD scalar mapping: constant-memory uint16 alpha_moment_mapping.\n");
   }
   if (use_const_float_coeffs_) {
     printf("SUS2 v1.1 GPUMD float coefficients: constant-memory shift/species/moment coeffs.\n");
   }
-  if (use_fused_energy_backward_) {
+  if (use_fused_energy_backward_ && !use_l3k3_tensor_scalar_) {
     printf("SUS2 v1.1 GPUMD reverse path: fused site-energy gradient and product backward kernel.\n");
   }
-  if (use_fused_graph_ && !use_local_product_graph_) {
+  if (use_fused_graph_ && !use_local_product_graph_ && !use_l3k3_tensor_scalar_) {
     printf("SUS2 v1.1 GPUMD product graph path: fused forward/site-gradient/backward kernel.\n");
   }
   if (use_product_assign_) {
     printf(
       "SUS2 v1.1 GPUMD product graph micro-optimization: product moments use assign-forward and skip moment-value memset.\n");
-  } else if (parse_product_assign(host_model, num_potential_options, potential_options)) {
+  } else if (
+    parse_product_assign(host_model, num_potential_options, potential_options) &&
+    !use_l3k3_tensor_scalar_) {
     printf(
       "SUS2 v1.1 GPUMD product graph micro-optimization: product assign requested but unsupported for this path (supported=%s, fused=%s, local=%s, tensor_basic=%s).\n",
       product_assign_supported_ ? "yes" : "no",
@@ -4442,6 +4830,15 @@ SUS2_V11::SUS2_V11(
   if (use_local_product_graph_) {
     printf(
       "SUS2 v1.1 GPUMD product graph path: local per-atom graph workspace, write basic gradients only.\n");
+  }
+  if (use_l3k3_tensor_scalar_) {
+    printf(
+      "SUS2 v1.1 GPUMD tensor-scalar path: l3k3 compiled polynomial plan, terms=%d, max_degree=%d.\n",
+      l3k3_tensor_scalar_term_count_,
+      l3k3_tensor_scalar_plan.max_degree);
+  } else if (request_l3k3_tensor_scalar) {
+    printf(
+      "SUS2 v1.1 GPUMD tensor-scalar path: requested but unsupported for this model; using product graph fallback.\n");
   }
   if (use_tensor_basic_fastpath_ && use_tensor_force_grad_cache_) {
     printf("SUS2 v1.1 GPUMD force path: cached tensor center basic gradients.\n");
@@ -4674,7 +5071,10 @@ void SUS2_V11::compute(
   const bool use_local_product_graph = use_local_product_graph_;
 
   profile_t = profile_start();
-  if (use_local_product_graph) {
+  if (use_l3k3_tensor_scalar_) {
+    // The l3k3 tensor-scalar path overwrites the 60 basic moments and their
+    // gradients directly; product moments are not materialized.
+  } else if (use_local_product_graph) {
     if (!use_tensor_basic_fastpath_) {
       CHECK(gpuMemset(moment_vals_float_.data(), 0, basic_moment_size * sizeof(float)));
     }
@@ -4729,6 +5129,11 @@ void SUS2_V11::compute(
     alpha_times_.data(),
     alpha_time_group_count_ > 0 ? alpha_time_groups_.data() : nullptr,
     alpha_moment_mapping_.data(),
+    l3k3_tensor_scalar_term_count_,
+    use_l3k3_tensor_scalar_ ? l3k3_tensor_scalar_terms_.data() : nullptr,
+    use_l3k3_tensor_scalar_ ? l3k3_tensor_scalar_coeffs_.data() : nullptr,
+    (use_l3k3_tensor_scalar_ && use_float_moments_) ? l3k3_tensor_scalar_coeffs_float_.data()
+                                                     : nullptr,
     use_radial_direct_ ? nullptr : lut_vals_.data(),
     use_radial_direct_ ? nullptr : lut_ders_.data(),
     use_radial_direct_ ? radial_direct_coeffs_.data() : nullptr,
@@ -4741,7 +5146,8 @@ void SUS2_V11::compute(
     use_const_scalar_moments_,
     use_const_float_coeffs_,
     use_float_moments_,
-    use_radial_direct_};
+    use_radial_direct_,
+    use_l3k3_tensor_scalar_};
 
 #define SUS2_LAUNCH_TENSOR_BASIC_DYNAMIC(REAL_T, OUT_PTR) \
   do { \
@@ -4814,6 +5220,7 @@ void SUS2_V11::compute(
 
   profile_t = profile_start();
   const bool use_exact_l3k3_tensor = use_tensor_basic_fastpath_ && tensor_l_ == 3 && tensor_k_ == 3;
+  const bool use_l3k3_tensor_scalar = use_l3k3_tensor_scalar_ && use_exact_l3k3_tensor;
 
   if (use_exact_l3k3_tensor) {
     if (use_float_moments_) {
@@ -4897,7 +5304,36 @@ void SUS2_V11::compute(
   GPU_CHECK_KERNEL
   profile_stop(profile_basic, profile_t);
 
-  if (use_local_product_graph) {
+  if (use_l3k3_tensor_scalar) {
+    profile_t = profile_start();
+    if (use_float_moments_) {
+      gpu_l3k3_tensor_scalar_energy_backward_float_parallel<<<num_atoms, kSus2TensorScalarBlockSize>>>(
+        num_atoms,
+        model,
+        type.data(),
+        moment_vals_float_.data(),
+        moment_grads_float_.data(),
+        potential.data());
+    } else if (use_float_moment_grads_) {
+      gpu_l3k3_tensor_scalar_energy_backward<double, float><<<grid_size, kBlockSize>>>(
+        num_atoms,
+        model,
+        type.data(),
+        moment_vals_.data(),
+        moment_grads_float_.data(),
+        potential.data());
+    } else {
+      gpu_l3k3_tensor_scalar_energy_backward<double, double><<<grid_size, kBlockSize>>>(
+        num_atoms,
+        model,
+        type.data(),
+        moment_vals_.data(),
+        moment_grads_.data(),
+        potential.data());
+    }
+    GPU_CHECK_KERNEL
+    profile_stop(profile_forward, profile_t);
+  } else if (use_local_product_graph) {
     profile_t = profile_start();
     gpu_local_graph_energy_backward_to_basic<float, float, kSus2LocalGraphMaxMoments><<<grid_size, kBlockSize>>>(
       num_atoms,
