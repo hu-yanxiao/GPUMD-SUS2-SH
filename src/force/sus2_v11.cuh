@@ -81,6 +81,7 @@ private:
   GPU_Vector<float> l3k3_tensor_scalar_coeffs_float_;
   GPU_Vector<int> l3k3_tensor_block_ops_;
   GPU_Vector<int> l3k3_tensor_block_op_rows_;
+  GPU_Vector<int> l3k3_tensor_block_metas_;
   GPU_Vector<unsigned int> l3k3_tensor_block_rows_;
   GPU_Vector<float> lut_vals_;
   GPU_Vector<float> lut_ders_;
