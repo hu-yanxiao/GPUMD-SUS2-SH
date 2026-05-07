@@ -108,6 +108,8 @@ private:
   bool use_tensor_force_grad_cache_ = true;
   bool use_l3k3_tensor_scalar_ = false;
   bool use_l3k3_tensor_block_ = false;
+  bool use_l3k3_tensor_block_fast_forward_ = true;
+  bool use_l3k3_tensor_block_fast_backward_ = true;
   bool use_float_moment_grads_ = false;
   bool use_float_moments_ = false;
   bool use_radial_direct_ = false;
