@@ -75,6 +75,7 @@ private:
   GPU_Vector<int> alpha_basic_;
   GPU_Vector<int> alpha_times_;
   GPU_Vector<int> alpha_time_groups_;
+  GPU_Vector<unsigned int> alpha_time_group_pairs_;
   GPU_Vector<int> alpha_moment_mapping_;
   GPU_Vector<int> l3k3_tensor_scalar_terms_;
   GPU_Vector<double> l3k3_tensor_scalar_coeffs_;
@@ -107,6 +108,7 @@ private:
   bool use_fused_graph_ = true;
   bool use_local_product_graph_ = false;
   bool use_product_assign_ = true;
+  bool use_graph_specific_product_ = false;
   bool product_assign_supported_ = false;
   bool use_tensor_force_grad_cache_ = true;
   bool use_l3k3_tensor_scalar_ = false;

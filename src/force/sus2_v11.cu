@@ -28,6 +28,7 @@ constexpr int kSus2MaxDirectRbSize = 16;
 constexpr int kSus2MaxConstAlphaTimes = 6000;
 constexpr int kSus2MaxConstScalarMoments = 2048;
 constexpr int kSus2MaxConstSpecies = 128;
+constexpr int kSus2ProductGroupPairWords = 2;
 constexpr int kSus2LocalGraphMaxMoments = 640;
 constexpr int kSus2MaxTensorRank = 4;
 constexpr int kSus2MaxTensorGroups = 4;
@@ -190,6 +191,7 @@ struct SUS2DeviceModel {
   const int* alpha_basic;
   const int* alpha_times;
   const int* alpha_time_groups;
+  const unsigned int* alpha_time_group_pairs;
   const int* alpha_moment_mapping;
   int l3k3_tensor_scalar_term_count;
   const int* l3k3_tensor_scalar_terms;
@@ -837,6 +839,33 @@ bool can_pack_scalar_moments_u16(const SUS2HostModel& model)
     }
   }
   return true;
+}
+
+bool can_pack_alpha_time_groups_u16(const std::vector<int>& groups)
+{
+  if (groups.size() % 3 != 0) {
+    return false;
+  }
+  for (int value : groups) {
+    if (value < 0 || value > 65535) {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::vector<unsigned int> pack_alpha_time_group_pairs(const std::vector<int>& groups)
+{
+  std::vector<unsigned int> pairs;
+  pairs.reserve((groups.size() / 3) * kSus2ProductGroupPairWords);
+  for (size_t group = 0; group < groups.size() / 3; ++group) {
+    const unsigned int begin = static_cast<unsigned int>(groups[group * 3 + 0]);
+    const unsigned int len = static_cast<unsigned int>(groups[group * 3 + 1]);
+    const unsigned int dst = static_cast<unsigned int>(groups[group * 3 + 2]);
+    pairs.push_back(begin | (len << 16));
+    pairs.push_back(dst);
+  }
+  return pairs;
 }
 
 bool supports_product_assign(const SUS2HostModel& model)
@@ -2722,6 +2751,30 @@ bool parse_product_assign(
     }
   }
   return use_assign;
+}
+
+bool parse_graph_specific_product(
+  const SUS2HostModel& model,
+  int num_potential_options,
+  const char** potential_options)
+{
+  bool use_specific = false;
+  const char* env = std::getenv("SUS2_GPUMD_GRAPH_SPECIFIC_PRODUCT");
+  if (env != nullptr) {
+    use_specific = parse_bool_value(env, "SUS2_GPUMD_GRAPH_SPECIFIC_PRODUCT");
+  }
+
+  const int option_begin = std::min(num_potential_options, model.species_count);
+  for (int i = option_begin; i < num_potential_options; ++i) {
+    const std::string option = potential_options[i] == nullptr ? "" : potential_options[i];
+    if (starts_with(option, "sus2_graph_specific=") ||
+        starts_with(option, "sus2_product_graph_specific=") ||
+        starts_with(option, "product_graph_specific=")) {
+      const size_t eq = option.find('=');
+      use_specific = parse_bool_value(option.substr(eq + 1), option.substr(0, eq));
+    }
+  }
+  return use_specific;
 }
 
 bool parse_local_product_graph(
@@ -5367,6 +5420,75 @@ static __global__ void gpu_forward_energy_backward_const_u16_assign_group_table(
   }
 }
 
+__device__ __forceinline__ void sus2_product_group_pair(
+  const SUS2DeviceModel& model,
+  int group,
+  int& begin,
+  int& len,
+  int& dst)
+{
+  const int offset = group * kSus2ProductGroupPairWords;
+  const unsigned int word0 = __ldg(model.alpha_time_group_pairs + offset + 0);
+  const unsigned int word1 = __ldg(model.alpha_time_group_pairs + offset + 1);
+  begin = static_cast<int>(word0 & 0xffffu);
+  len = static_cast<int>(word0 >> 16);
+  dst = static_cast<int>(word1 & 0xffffu);
+}
+
+template <typename RealT, typename GradT>
+static __global__ void gpu_forward_energy_backward_const_u16_group_pair_table(
+  int N,
+  SUS2DeviceModel model,
+  const int* type,
+  RealT* moments,
+  GradT* grads,
+  double* potential)
+{
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= N || model.alpha_time_group_pairs == nullptr) {
+    return;
+  }
+
+  for (int g = 0; g < model.alpha_time_group_count; ++g) {
+    int begin;
+    int len;
+    int dst;
+    sus2_product_group_pair(model, g, begin, len, dst);
+    RealT dst_value = static_cast<RealT>(0.0);
+    for (int k = 0; k < len; ++k) {
+      const int offset = (begin + k) * 4;
+      const int src0 = static_cast<int>(c_sus2_alpha_times_u16[offset + 0]);
+      const int src1 = static_cast<int>(c_sus2_alpha_times_u16[offset + 1]);
+      const int mult = static_cast<int>(c_sus2_alpha_times_u16[offset + 2]);
+      dst_value += static_cast<RealT>(mult) * moments[static_cast<size_t>(src0) * N + i] *
+                   moments[static_cast<size_t>(src1) * N + i];
+    }
+    moments[static_cast<size_t>(dst) * N + i] = dst_value;
+  }
+
+  sus2_init_site_energy_and_scalar_grads(N, model, i, type, moments, grads, potential);
+
+  for (int g = model.alpha_time_group_count - 1; g >= 0; --g) {
+    int begin;
+    int len;
+    int dst;
+    sus2_product_group_pair(model, g, begin, len, dst);
+    const RealT dst_grad =
+      static_cast<RealT>(load_sus2_grad(grads, N, dst, i));
+    for (int k = len - 1; k >= 0; --k) {
+      const int offset = (begin + k) * 4;
+      const int src0 = static_cast<int>(c_sus2_alpha_times_u16[offset + 0]);
+      const int src1 = static_cast<int>(c_sus2_alpha_times_u16[offset + 1]);
+      const int mult = static_cast<int>(c_sus2_alpha_times_u16[offset + 2]);
+      const RealT gdst = dst_grad * static_cast<RealT>(mult);
+      add_sus2_grad(
+        grads, static_cast<size_t>(src1) * N + i, gdst * moments[static_cast<size_t>(src0) * N + i]);
+      add_sus2_grad(
+        grads, static_cast<size_t>(src0) * N + i, gdst * moments[static_cast<size_t>(src1) * N + i]);
+    }
+  }
+}
+
 __device__ __forceinline__ int l3k3_sym2_offset(int a, int b)
 {
   if (a > b) {
@@ -6973,6 +7095,8 @@ SUS2_V11::SUS2_V11(
   use_fused_graph_ = parse_fused_graph(host_model, num_potential_options, potential_options);
   use_product_assign_ =
     parse_product_assign(host_model, num_potential_options, potential_options);
+  const bool request_graph_specific_product =
+    parse_graph_specific_product(host_model, num_potential_options, potential_options);
   use_local_product_graph_ =
     parse_local_product_graph(host_model, num_potential_options, potential_options);
   use_tensor_force_grad_cache_ =
@@ -7024,6 +7148,8 @@ SUS2_V11::SUS2_V11(
                         use_fused_graph_ && !use_local_product_graph_ &&
                         use_tensor_basic_fastpath_ && !use_l3k3_tensor_scalar_ &&
                         !use_l3k3_tensor_block_;
+  use_graph_specific_product_ =
+    request_graph_specific_product && use_product_assign_ && use_const_alpha_times_;
   use_const_float_coeffs_ = use_float_moments_ &&
                             host_model.species_count <= kSus2MaxConstSpecies &&
                             host_model.alpha_scalar_moments <= kSus2MaxConstScalarMoments;
@@ -7091,6 +7217,16 @@ SUS2_V11::SUS2_V11(
   alpha_time_group_count_ = static_cast<int>(packed_alpha_time_groups.size() / 3);
   alpha_time_groups_.resize(packed_alpha_time_groups.size());
   alpha_time_groups_.copy_from_host(packed_alpha_time_groups.data());
+  if (use_graph_specific_product_) {
+    if (can_pack_alpha_time_groups_u16(packed_alpha_time_groups)) {
+      std::vector<unsigned int> group_pairs =
+        pack_alpha_time_group_pairs(packed_alpha_time_groups);
+      alpha_time_group_pairs_.resize(group_pairs.size());
+      alpha_time_group_pairs_.copy_from_host(group_pairs.data());
+    } else {
+      use_graph_specific_product_ = false;
+    }
+  }
   alpha_moment_mapping_.resize(host_model.alpha_moment_mapping.size());
   alpha_moment_mapping_.copy_from_host(host_model.alpha_moment_mapping.data());
   if (use_const_scalar_moments_) {
@@ -7232,6 +7368,12 @@ SUS2_V11::SUS2_V11(
   if (use_product_assign_) {
     printf(
       "SUS2 v1.1 GPUMD product graph micro-optimization: product moments use assign-forward and skip moment-value memset.\n");
+    if (use_graph_specific_product_) {
+      printf(
+        "SUS2 v1.1 GPUMD graph-specific product path: packed product-group plan, groups=%d, product_rules=%d.\n",
+        alpha_time_group_count_,
+        alpha_times_count_);
+    }
   } else if (
     parse_product_assign(host_model, num_potential_options, potential_options) &&
     !use_l3k3_tensor_scalar_ && !use_l3k3_tensor_block_) {
@@ -7241,6 +7383,13 @@ SUS2_V11::SUS2_V11(
       use_fused_graph_ ? "yes" : "no",
       use_local_product_graph_ ? "yes" : "no",
       use_tensor_basic_fastpath_ ? "yes" : "no");
+  }
+  if (request_graph_specific_product && !use_graph_specific_product_ &&
+      !use_l3k3_tensor_scalar_ && !use_l3k3_tensor_block_) {
+    printf(
+      "SUS2 v1.1 GPUMD graph-specific product path: requested but unsupported; using mature product graph (product_assign=%s, const_u16_rules=%s).\n",
+      use_product_assign_ ? "yes" : "no",
+      use_const_alpha_times_ ? "yes" : "no");
   }
   if (use_local_product_graph_) {
     printf(
@@ -7570,6 +7719,7 @@ void SUS2_V11::compute(
     alpha_basic_.data(),
     alpha_times_.data(),
     alpha_time_group_count_ > 0 ? alpha_time_groups_.data() : nullptr,
+    use_graph_specific_product_ ? alpha_time_group_pairs_.data() : nullptr,
     alpha_moment_mapping_.data(),
     l3k3_tensor_scalar_term_count_,
     use_l3k3_tensor_scalar_ ? l3k3_tensor_scalar_terms_.data() : nullptr,
@@ -7830,8 +7980,13 @@ void SUS2_V11::compute(
     if (use_float_moments_) {
       if (use_const_alpha_times_) {
         if (use_product_assign_) {
-          gpu_forward_energy_backward_const_u16_assign_group_table<float, float><<<grid_size, kBlockSize>>>(
-            num_atoms, model, type.data(), moment_vals_float_.data(), moment_grads_float_.data(), potential.data());
+          if (use_graph_specific_product_) {
+            gpu_forward_energy_backward_const_u16_group_pair_table<float, float><<<grid_size, kBlockSize>>>(
+              num_atoms, model, type.data(), moment_vals_float_.data(), moment_grads_float_.data(), potential.data());
+          } else {
+            gpu_forward_energy_backward_const_u16_assign_group_table<float, float><<<grid_size, kBlockSize>>>(
+              num_atoms, model, type.data(), moment_vals_float_.data(), moment_grads_float_.data(), potential.data());
+          }
         } else {
           gpu_forward_energy_backward_const_u16<float, float><<<grid_size, kBlockSize>>>(
             num_atoms, model, type.data(), moment_vals_float_.data(), moment_grads_float_.data(), potential.data());
@@ -7848,8 +8003,13 @@ void SUS2_V11::compute(
     } else if (use_float_moment_grads_) {
       if (use_const_alpha_times_) {
         if (use_product_assign_) {
-          gpu_forward_energy_backward_const_u16_assign_group_table<double, float><<<grid_size, kBlockSize>>>(
-            num_atoms, model, type.data(), moment_vals_.data(), moment_grads_float_.data(), potential.data());
+          if (use_graph_specific_product_) {
+            gpu_forward_energy_backward_const_u16_group_pair_table<double, float><<<grid_size, kBlockSize>>>(
+              num_atoms, model, type.data(), moment_vals_.data(), moment_grads_float_.data(), potential.data());
+          } else {
+            gpu_forward_energy_backward_const_u16_assign_group_table<double, float><<<grid_size, kBlockSize>>>(
+              num_atoms, model, type.data(), moment_vals_.data(), moment_grads_float_.data(), potential.data());
+          }
         } else {
           gpu_forward_energy_backward_const_u16<double, float><<<grid_size, kBlockSize>>>(
             num_atoms, model, type.data(), moment_vals_.data(), moment_grads_float_.data(), potential.data());
@@ -7866,8 +8026,13 @@ void SUS2_V11::compute(
     } else {
       if (use_const_alpha_times_) {
         if (use_product_assign_) {
-          gpu_forward_energy_backward_const_u16_assign_group_table<double, double><<<grid_size, kBlockSize>>>(
-            num_atoms, model, type.data(), moment_vals_.data(), moment_grads_.data(), potential.data());
+          if (use_graph_specific_product_) {
+            gpu_forward_energy_backward_const_u16_group_pair_table<double, double><<<grid_size, kBlockSize>>>(
+              num_atoms, model, type.data(), moment_vals_.data(), moment_grads_.data(), potential.data());
+          } else {
+            gpu_forward_energy_backward_const_u16_assign_group_table<double, double><<<grid_size, kBlockSize>>>(
+              num_atoms, model, type.data(), moment_vals_.data(), moment_grads_.data(), potential.data());
+          }
         } else {
           gpu_forward_energy_backward_const_u16<double, double><<<grid_size, kBlockSize>>>(
             num_atoms, model, type.data(), moment_vals_.data(), moment_grads_.data(), potential.data());
