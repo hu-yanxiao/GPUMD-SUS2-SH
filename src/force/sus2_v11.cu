@@ -7751,7 +7751,6 @@ void SUS2_V11::compute(
   }
   if (!use_pairwise_no_atomic_force) {
     CHECK(gpuMemset(force_tmp_.data(), 0, static_cast<size_t>(num_atoms) * 3 * sizeof(float)));
-    CHECK(gpuMemset(virial_tmp_.data(), 0, static_cast<size_t>(num_atoms) * 9 * sizeof(float)));
   }
   profile_stop(profile_zero, profile_t);
 
