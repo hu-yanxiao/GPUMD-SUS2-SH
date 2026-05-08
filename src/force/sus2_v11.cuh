@@ -110,6 +110,7 @@ private:
   bool use_product_assign_ = true;
   bool use_graph_specific_product_ = false;
   bool product_assign_supported_ = false;
+  bool use_force_self_buffer_ = false;
   bool use_tensor_force_grad_cache_ = true;
   bool use_l3k3_tensor_scalar_ = false;
   bool use_l3k3_tensor_block_ = false;
@@ -127,6 +128,7 @@ private:
   GPU_Vector<double> moment_grads_;
   GPU_Vector<float> moment_grads_float_;
   GPU_Vector<float> force_tmp_;
+  GPU_Vector<float> force_self_tmp_;
   GPU_Vector<float> virial_tmp_;
 
   bool profile_enabled_ = false;

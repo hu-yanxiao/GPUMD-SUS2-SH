@@ -2777,6 +2777,30 @@ bool parse_graph_specific_product(
   return use_specific;
 }
 
+bool parse_force_self_buffer(
+  const SUS2HostModel& model,
+  int num_potential_options,
+  const char** potential_options)
+{
+  bool use_buffer = false;
+  const char* env = std::getenv("SUS2_GPUMD_FORCE_SELF_BUFFER");
+  if (env != nullptr) {
+    use_buffer = parse_bool_value(env, "SUS2_GPUMD_FORCE_SELF_BUFFER");
+  }
+
+  const int option_begin = std::min(num_potential_options, model.species_count);
+  for (int i = option_begin; i < num_potential_options; ++i) {
+    const std::string option = potential_options[i] == nullptr ? "" : potential_options[i];
+    if (starts_with(option, "sus2_force_self_buffer=") ||
+        starts_with(option, "sus2_force_self=") ||
+        starts_with(option, "force_self_buffer=")) {
+      const size_t eq = option.find('=');
+      use_buffer = parse_bool_value(option.substr(eq + 1), option.substr(0, eq));
+    }
+  }
+  return use_buffer;
+}
+
 bool parse_local_product_graph(
   const SUS2HostModel& model,
   int num_potential_options,
@@ -3686,6 +3710,27 @@ template <typename GradT>
 __device__ __forceinline__ void add_sus2_grad(GradT* grads, size_t index, double value)
 {
   grads[index] = static_cast<GradT>(static_cast<double>(grads[index]) + value);
+}
+
+template <typename RealT>
+__device__ __forceinline__ void store_sus2_self_force(
+  int N,
+  int atom,
+  RealT fx,
+  RealT fy,
+  RealT fz,
+  float* force_tmp,
+  float* force_self_tmp)
+{
+  if (force_self_tmp != nullptr) {
+    force_self_tmp[atom] = static_cast<float>(fx);
+    force_self_tmp[atom + N] = static_cast<float>(fy);
+    force_self_tmp[atom + 2 * N] = static_cast<float>(fz);
+  } else {
+    atomicAdd(force_tmp + atom, static_cast<float>(fx));
+    atomicAdd(force_tmp + atom + N, static_cast<float>(fy));
+    atomicAdd(force_tmp + atom + 2 * N, static_cast<float>(fz));
+  }
 }
 
 template <typename GradT, typename RealT>
@@ -6542,6 +6587,7 @@ static __global__ void gpu_compute_forces(
   const double* z,
   const GradT* grads,
   float* force_tmp,
+  float* force_self_tmp,
   float* virial_tmp)
 {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -6605,19 +6651,17 @@ static __global__ void gpu_compute_forces(
     s_zy -= dz * dEy;
   }
 
-  atomicAdd(force_tmp + i, static_cast<float>(fx_self));
-  atomicAdd(force_tmp + i + N, static_cast<float>(fy_self));
-  atomicAdd(force_tmp + i + 2 * N, static_cast<float>(fz_self));
+  store_sus2_self_force(N, i, fx_self, fy_self, fz_self, force_tmp, force_self_tmp);
 
-  virial_tmp[i + 0 * N] += static_cast<float>(s_xx);
-  virial_tmp[i + 1 * N] += static_cast<float>(s_yy);
-  virial_tmp[i + 2 * N] += static_cast<float>(s_zz);
-  virial_tmp[i + 3 * N] += static_cast<float>(s_xy);
-  virial_tmp[i + 4 * N] += static_cast<float>(s_xz);
-  virial_tmp[i + 5 * N] += static_cast<float>(s_yz);
-  virial_tmp[i + 6 * N] += static_cast<float>(s_yx);
-  virial_tmp[i + 7 * N] += static_cast<float>(s_zx);
-  virial_tmp[i + 8 * N] += static_cast<float>(s_zy);
+  virial_tmp[i + 0 * N] = static_cast<float>(s_xx);
+  virial_tmp[i + 1 * N] = static_cast<float>(s_yy);
+  virial_tmp[i + 2 * N] = static_cast<float>(s_zz);
+  virial_tmp[i + 3 * N] = static_cast<float>(s_xy);
+  virial_tmp[i + 4 * N] = static_cast<float>(s_xz);
+  virial_tmp[i + 5 * N] = static_cast<float>(s_yz);
+  virial_tmp[i + 6 * N] = static_cast<float>(s_yx);
+  virial_tmp[i + 7 * N] = static_cast<float>(s_zx);
+  virial_tmp[i + 8 * N] = static_cast<float>(s_zy);
 }
 
 template <typename GradT, typename RealT>
@@ -6638,6 +6682,7 @@ static __global__ void gpu_compute_forces_l3k3_cached_grads(
   const double* z,
   const GradT* grads,
   float* force_tmp,
+  float* force_self_tmp,
   float* virial_tmp)
 {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -6709,19 +6754,17 @@ static __global__ void gpu_compute_forces_l3k3_cached_grads(
     s_zy -= dz * dEy;
   }
 
-  atomicAdd(force_tmp + i, static_cast<float>(fx_self));
-  atomicAdd(force_tmp + i + N, static_cast<float>(fy_self));
-  atomicAdd(force_tmp + i + 2 * N, static_cast<float>(fz_self));
+  store_sus2_self_force(N, i, fx_self, fy_self, fz_self, force_tmp, force_self_tmp);
 
-  virial_tmp[i + 0 * N] += static_cast<float>(s_xx);
-  virial_tmp[i + 1 * N] += static_cast<float>(s_yy);
-  virial_tmp[i + 2 * N] += static_cast<float>(s_zz);
-  virial_tmp[i + 3 * N] += static_cast<float>(s_xy);
-  virial_tmp[i + 4 * N] += static_cast<float>(s_xz);
-  virial_tmp[i + 5 * N] += static_cast<float>(s_yz);
-  virial_tmp[i + 6 * N] += static_cast<float>(s_yx);
-  virial_tmp[i + 7 * N] += static_cast<float>(s_zx);
-  virial_tmp[i + 8 * N] += static_cast<float>(s_zy);
+  virial_tmp[i + 0 * N] = static_cast<float>(s_xx);
+  virial_tmp[i + 1 * N] = static_cast<float>(s_yy);
+  virial_tmp[i + 2 * N] = static_cast<float>(s_zz);
+  virial_tmp[i + 3 * N] = static_cast<float>(s_xy);
+  virial_tmp[i + 4 * N] = static_cast<float>(s_xz);
+  virial_tmp[i + 5 * N] = static_cast<float>(s_yz);
+  virial_tmp[i + 6 * N] = static_cast<float>(s_yx);
+  virial_tmp[i + 7 * N] = static_cast<float>(s_zx);
+  virial_tmp[i + 8 * N] = static_cast<float>(s_zy);
 }
 
 template <typename GradT, typename RealT, int MaxBasic>
@@ -6742,6 +6785,7 @@ static __global__ void gpu_compute_forces_tensor_cached_grads(
   const double* z,
   const GradT* grads,
   float* force_tmp,
+  float* force_self_tmp,
   float* virial_tmp)
 {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -6812,19 +6856,17 @@ static __global__ void gpu_compute_forces_tensor_cached_grads(
     s_zy -= dz * dEy;
   }
 
-  atomicAdd(force_tmp + i, static_cast<float>(fx_self));
-  atomicAdd(force_tmp + i + N, static_cast<float>(fy_self));
-  atomicAdd(force_tmp + i + 2 * N, static_cast<float>(fz_self));
+  store_sus2_self_force(N, i, fx_self, fy_self, fz_self, force_tmp, force_self_tmp);
 
-  virial_tmp[i + 0 * N] += static_cast<float>(s_xx);
-  virial_tmp[i + 1 * N] += static_cast<float>(s_yy);
-  virial_tmp[i + 2 * N] += static_cast<float>(s_zz);
-  virial_tmp[i + 3 * N] += static_cast<float>(s_xy);
-  virial_tmp[i + 4 * N] += static_cast<float>(s_xz);
-  virial_tmp[i + 5 * N] += static_cast<float>(s_yz);
-  virial_tmp[i + 6 * N] += static_cast<float>(s_yx);
-  virial_tmp[i + 7 * N] += static_cast<float>(s_zx);
-  virial_tmp[i + 8 * N] += static_cast<float>(s_zy);
+  virial_tmp[i + 0 * N] = static_cast<float>(s_xx);
+  virial_tmp[i + 1 * N] = static_cast<float>(s_yy);
+  virial_tmp[i + 2 * N] = static_cast<float>(s_zz);
+  virial_tmp[i + 3 * N] = static_cast<float>(s_xy);
+  virial_tmp[i + 4 * N] = static_cast<float>(s_xz);
+  virial_tmp[i + 5 * N] = static_cast<float>(s_yz);
+  virial_tmp[i + 6 * N] = static_cast<float>(s_yx);
+  virial_tmp[i + 7 * N] = static_cast<float>(s_zx);
+  virial_tmp[i + 8 * N] = static_cast<float>(s_zy);
 }
 
 template <typename GradT, typename RealT, int L, int K>
@@ -6845,6 +6887,7 @@ static __global__ void gpu_compute_forces_tensor_cached_grads_static(
   const double* z,
   const GradT* grads,
   float* force_tmp,
+  float* force_self_tmp,
   float* virial_tmp)
 {
   constexpr int BasicPerGroup = Sus2TensorStaticLayout<L>::basic_per_group;
@@ -6918,19 +6961,17 @@ static __global__ void gpu_compute_forces_tensor_cached_grads_static(
     s_zy -= dz * dEy;
   }
 
-  atomicAdd(force_tmp + i, static_cast<float>(fx_self));
-  atomicAdd(force_tmp + i + N, static_cast<float>(fy_self));
-  atomicAdd(force_tmp + i + 2 * N, static_cast<float>(fz_self));
+  store_sus2_self_force(N, i, fx_self, fy_self, fz_self, force_tmp, force_self_tmp);
 
-  virial_tmp[i + 0 * N] += static_cast<float>(s_xx);
-  virial_tmp[i + 1 * N] += static_cast<float>(s_yy);
-  virial_tmp[i + 2 * N] += static_cast<float>(s_zz);
-  virial_tmp[i + 3 * N] += static_cast<float>(s_xy);
-  virial_tmp[i + 4 * N] += static_cast<float>(s_xz);
-  virial_tmp[i + 5 * N] += static_cast<float>(s_yz);
-  virial_tmp[i + 6 * N] += static_cast<float>(s_yx);
-  virial_tmp[i + 7 * N] += static_cast<float>(s_zx);
-  virial_tmp[i + 8 * N] += static_cast<float>(s_zy);
+  virial_tmp[i + 0 * N] = static_cast<float>(s_xx);
+  virial_tmp[i + 1 * N] = static_cast<float>(s_yy);
+  virial_tmp[i + 2 * N] = static_cast<float>(s_zz);
+  virial_tmp[i + 3 * N] = static_cast<float>(s_xy);
+  virial_tmp[i + 4 * N] = static_cast<float>(s_xz);
+  virial_tmp[i + 5 * N] = static_cast<float>(s_yz);
+  virial_tmp[i + 6 * N] = static_cast<float>(s_yx);
+  virial_tmp[i + 7 * N] = static_cast<float>(s_zx);
+  virial_tmp[i + 8 * N] = static_cast<float>(s_zy);
 }
 
 template <typename GradT, typename RealT>
@@ -7030,6 +7071,7 @@ static __global__ void gpu_compute_forces_pairwise_no_atomic(
 static __global__ void gpu_accumulate_float_to_double(
   int N,
   const float* force_tmp,
+  const float* force_self_tmp,
   const float* virial_tmp,
   double* force,
   double* virial)
@@ -7038,9 +7080,17 @@ static __global__ void gpu_accumulate_float_to_double(
   if (i >= N) {
     return;
   }
-  force[i] += static_cast<double>(force_tmp[i]);
-  force[i + N] += static_cast<double>(force_tmp[i + N]);
-  force[i + 2 * N] += static_cast<double>(force_tmp[i + 2 * N]);
+  double fx = static_cast<double>(force_tmp[i]);
+  double fy = static_cast<double>(force_tmp[i + N]);
+  double fz = static_cast<double>(force_tmp[i + 2 * N]);
+  if (force_self_tmp != nullptr) {
+    fx += static_cast<double>(force_self_tmp[i]);
+    fy += static_cast<double>(force_self_tmp[i + N]);
+    fz += static_cast<double>(force_self_tmp[i + 2 * N]);
+  }
+  force[i] += fx;
+  force[i + N] += fy;
+  force[i + 2 * N] += fz;
   for (int k = 0; k < 9; ++k) {
     virial[i + k * N] += static_cast<double>(virial_tmp[i + k * N]);
   }
@@ -7087,6 +7137,8 @@ SUS2_V11::SUS2_V11(
   const char* no_atomic_force_env = std::getenv("SUS2_GPUMD_PAIRWISE_NO_ATOMIC_FORCE");
   use_pairwise_no_atomic_force_ =
     no_atomic_force_env != nullptr && std::atoi(no_atomic_force_env) != 0;
+  use_force_self_buffer_ =
+    parse_force_self_buffer(host_model, num_potential_options, potential_options);
   use_float_moments_ = parse_float_moments(host_model, num_potential_options, potential_options);
   use_float_moment_grads_ =
     use_float_moments_ || parse_float_moment_grads(host_model, num_potential_options, potential_options);
@@ -7337,6 +7389,9 @@ SUS2_V11::SUS2_V11(
   if (use_pairwise_no_atomic_force_) {
     printf("SUS2 v1.1 GPUMD force mode: pairwise no-atomic for large-box neighbor lists.\n");
   }
+  if (use_force_self_buffer_ && !use_pairwise_no_atomic_force_) {
+    printf("SUS2 v1.1 GPUMD force mode: self-force buffer avoids per-atom self atomic adds.\n");
+  }
   if (use_tensor_basic_fastpath_) {
     printf(
       "SUS2 v1.1 GPUMD basic/force fast path: tensor l%dk%d alpha_index_basic layout.\n",
@@ -7494,6 +7549,9 @@ void SUS2_V11::resize_work_buffers(int num_atoms)
   const size_t virial_size = static_cast<size_t>(num_atoms) * 9;
   if (force_tmp_.size() != force_size) {
     force_tmp_.resize(force_size);
+  }
+  if (use_force_self_buffer_ && force_self_tmp_.size() != force_size) {
+    force_self_tmp_.resize(force_size);
   }
   if (virial_tmp_.size() != virial_size) {
     virial_tmp_.resize(virial_size);
@@ -7653,6 +7711,8 @@ void SUS2_V11::compute(
   const size_t basic_moment_size = static_cast<size_t>(alpha_basic_count_) * num_atoms;
   const bool use_pairwise_no_atomic_force =
     !use_cached_neighbor_displacements_ && use_pairwise_no_atomic_force_;
+  float* force_self_tmp_ptr =
+    (use_force_self_buffer_ && !use_pairwise_no_atomic_force) ? force_self_tmp_.data() : nullptr;
   const bool use_local_product_graph = use_local_product_graph_;
 
   profile_t = profile_start();
@@ -8151,19 +8211,19 @@ void SUS2_V11::compute(
         num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(), \
         neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(), \
         neighbor_dz_.data(), position.data(), position.data() + num_atoms, \
-        position.data() + 2 * num_atoms, GRADS_PTR, force_tmp_.data(), virial_tmp_.data()); \
+        position.data() + 2 * num_atoms, GRADS_PTR, force_tmp_.data(), force_self_tmp_ptr, virial_tmp_.data()); \
     } else if (alpha_basic_count_ <= 80) { \
       gpu_compute_forces_tensor_cached_grads<GRAD_T, REAL_T, 80><<<grid_size, kBlockSize>>>( \
         num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(), \
         neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(), \
         neighbor_dz_.data(), position.data(), position.data() + num_atoms, \
-        position.data() + 2 * num_atoms, GRADS_PTR, force_tmp_.data(), virial_tmp_.data()); \
+        position.data() + 2 * num_atoms, GRADS_PTR, force_tmp_.data(), force_self_tmp_ptr, virial_tmp_.data()); \
     } else { \
       gpu_compute_forces_tensor_cached_grads<GRAD_T, REAL_T, kSus2MaxTensorBasic><<<grid_size, kBlockSize>>>( \
         num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(), \
         neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(), \
         neighbor_dz_.data(), position.data(), position.data() + num_atoms, \
-        position.data() + 2 * num_atoms, GRADS_PTR, force_tmp_.data(), virial_tmp_.data()); \
+        position.data() + 2 * num_atoms, GRADS_PTR, force_tmp_.data(), force_self_tmp_ptr, virial_tmp_.data()); \
     } \
   } while (0)
 
@@ -8172,7 +8232,7 @@ void SUS2_V11::compute(
     num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(), \
     neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(), \
     neighbor_dz_.data(), position.data(), position.data() + num_atoms, \
-    position.data() + 2 * num_atoms, GRADS_PTR, force_tmp_.data(), virial_tmp_.data())
+    position.data() + 2 * num_atoms, GRADS_PTR, force_tmp_.data(), force_self_tmp_ptr, virial_tmp_.data())
 
 #define SUS2_LAUNCH_TENSOR_CACHED_FORCE(GRAD_T, REAL_T, GRADS_PTR) \
   do { \
@@ -8181,7 +8241,7 @@ void SUS2_V11::compute(
         num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(), \
         neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(), \
         neighbor_dz_.data(), position.data(), position.data() + num_atoms, \
-        position.data() + 2 * num_atoms, GRADS_PTR, force_tmp_.data(), virial_tmp_.data()); \
+        position.data() + 2 * num_atoms, GRADS_PTR, force_tmp_.data(), force_self_tmp_ptr, virial_tmp_.data()); \
     } else if (tensor_l_ == 1 && tensor_k_ == 1) { \
       SUS2_LAUNCH_TENSOR_CACHED_FORCE_STATIC(GRAD_T, REAL_T, 1, 1, GRADS_PTR); \
     } else if (tensor_l_ == 1 && tensor_k_ == 2) { \
@@ -8240,9 +8300,10 @@ void SUS2_V11::compute(
           position.data(),
           position.data() + num_atoms,
           position.data() + 2 * num_atoms,
-        moment_grads_float_.data(),
-        force_tmp_.data(),
-        virial_tmp_.data());
+          moment_grads_float_.data(),
+          force_tmp_.data(),
+          force_self_tmp_ptr,
+          virial_tmp_.data());
       }
     } else if (use_float_moment_grads_) {
       if (use_tensor_basic_fastpath_ && use_tensor_force_grad_cache_) {
@@ -8265,7 +8326,8 @@ void SUS2_V11::compute(
           position.data() + 2 * num_atoms,
           moment_grads_float_.data(),
           force_tmp_.data(),
-        virial_tmp_.data());
+          force_self_tmp_ptr,
+          virial_tmp_.data());
       }
     } else {
       if (use_tensor_basic_fastpath_ && use_tensor_force_grad_cache_) {
@@ -8288,6 +8350,7 @@ void SUS2_V11::compute(
           position.data() + 2 * num_atoms,
           moment_grads_.data(),
           force_tmp_.data(),
+          force_self_tmp_ptr,
           virial_tmp_.data());
       }
     }
@@ -8351,7 +8414,7 @@ void SUS2_V11::compute(
 
   profile_t = profile_start();
   gpu_accumulate_float_to_double<<<grid_size, kBlockSize>>>(
-    num_atoms, force_tmp_.data(), virial_tmp_.data(), force.data(), virial.data());
+    num_atoms, force_tmp_.data(), force_self_tmp_ptr, virial_tmp_.data(), force.data(), virial.data());
   GPU_CHECK_KERNEL
   profile_stop(profile_accumulate, profile_t);
 
