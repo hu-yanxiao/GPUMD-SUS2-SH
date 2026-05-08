@@ -74,6 +74,7 @@ private:
   GPU_Vector<float> moment_coeffs_float_;
   GPU_Vector<int> alpha_basic_;
   GPU_Vector<int> alpha_times_;
+  GPU_Vector<unsigned short> alpha_times_u16_;
   GPU_Vector<int> alpha_time_groups_;
   GPU_Vector<unsigned int> alpha_time_group_pairs_;
   GPU_Vector<int> alpha_moment_mapping_;

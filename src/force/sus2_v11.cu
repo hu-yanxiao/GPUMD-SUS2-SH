@@ -190,6 +190,7 @@ struct SUS2DeviceModel {
   const float* moment_coeffs_float;
   const int* alpha_basic;
   const int* alpha_times;
+  const unsigned short* alpha_times_u16;
   const int* alpha_time_groups;
   const unsigned int* alpha_time_group_pairs;
   const int* alpha_moment_mapping;
@@ -817,6 +818,19 @@ TensorBasicLayout detect_tensor_alpha_basic_layout(const SUS2HostModel& model)
 bool can_pack_alpha_times_u16(const SUS2HostModel& model)
 {
   if (model.alpha_times_count > kSus2MaxConstAlphaTimes || model.alpha_moments_count > 65535) {
+    return false;
+  }
+  for (int value : model.alpha_times) {
+    if (value < 0 || value > 65535) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool can_pack_alpha_times_global_u16(const SUS2HostModel& model)
+{
+  if (model.alpha_moments_count > 65535) {
     return false;
   }
   for (int value : model.alpha_times) {
@@ -5480,6 +5494,19 @@ __device__ __forceinline__ void sus2_product_group_pair(
   dst = static_cast<int>(word1 & 0xffffu);
 }
 
+__device__ __forceinline__ void sus2_product_rule_global_u16(
+  const SUS2DeviceModel& model,
+  int rule,
+  int& src0,
+  int& src1,
+  int& mult)
+{
+  const int offset = rule * 4;
+  src0 = static_cast<int>(__ldg(model.alpha_times_u16 + offset + 0));
+  src1 = static_cast<int>(__ldg(model.alpha_times_u16 + offset + 1));
+  mult = static_cast<int>(__ldg(model.alpha_times_u16 + offset + 2));
+}
+
 template <typename RealT, typename GradT>
 static __global__ void gpu_forward_energy_backward_const_u16_group_pair_table(
   int N,
@@ -5525,6 +5552,60 @@ static __global__ void gpu_forward_energy_backward_const_u16_group_pair_table(
       const int src0 = static_cast<int>(c_sus2_alpha_times_u16[offset + 0]);
       const int src1 = static_cast<int>(c_sus2_alpha_times_u16[offset + 1]);
       const int mult = static_cast<int>(c_sus2_alpha_times_u16[offset + 2]);
+      const RealT gdst = dst_grad * static_cast<RealT>(mult);
+      add_sus2_grad(
+        grads, static_cast<size_t>(src1) * N + i, gdst * moments[static_cast<size_t>(src0) * N + i]);
+      add_sus2_grad(
+        grads, static_cast<size_t>(src0) * N + i, gdst * moments[static_cast<size_t>(src1) * N + i]);
+    }
+  }
+}
+
+template <typename RealT, typename GradT>
+static __global__ void gpu_forward_energy_backward_global_u16_group_pair_table(
+  int N,
+  SUS2DeviceModel model,
+  const int* type,
+  RealT* moments,
+  GradT* grads,
+  double* potential)
+{
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= N || model.alpha_time_group_pairs == nullptr || model.alpha_times_u16 == nullptr) {
+    return;
+  }
+
+  for (int g = 0; g < model.alpha_time_group_count; ++g) {
+    int begin;
+    int len;
+    int dst;
+    sus2_product_group_pair(model, g, begin, len, dst);
+    RealT dst_value = static_cast<RealT>(0.0);
+    for (int k = 0; k < len; ++k) {
+      int src0;
+      int src1;
+      int mult;
+      sus2_product_rule_global_u16(model, begin + k, src0, src1, mult);
+      dst_value += static_cast<RealT>(mult) * moments[static_cast<size_t>(src0) * N + i] *
+                   moments[static_cast<size_t>(src1) * N + i];
+    }
+    moments[static_cast<size_t>(dst) * N + i] = dst_value;
+  }
+
+  sus2_init_site_energy_and_scalar_grads(N, model, i, type, moments, grads, potential);
+
+  for (int g = model.alpha_time_group_count - 1; g >= 0; --g) {
+    int begin;
+    int len;
+    int dst;
+    sus2_product_group_pair(model, g, begin, len, dst);
+    const RealT dst_grad =
+      static_cast<RealT>(load_sus2_grad(grads, N, dst, i));
+    for (int k = len - 1; k >= 0; --k) {
+      int src0;
+      int src1;
+      int mult;
+      sus2_product_rule_global_u16(model, begin + k, src0, src1, mult);
       const RealT gdst = dst_grad * static_cast<RealT>(mult);
       add_sus2_grad(
         grads, static_cast<size_t>(src1) * N + i, gdst * moments[static_cast<size_t>(src0) * N + i]);
@@ -7122,6 +7203,8 @@ SUS2_V11::SUS2_V11(
   tensor_k_ = tensor_layout.k;
   tensor_basic_per_group_ = tensor_layout.basic_per_group;
   use_const_alpha_times_ = can_pack_alpha_times_u16(host_model);
+  const bool alpha_times_global_u16_supported =
+    can_pack_alpha_times_global_u16(host_model);
   use_const_scalar_moments_ = can_pack_scalar_moments_u16(host_model);
 
   if (radial_funcs_count_ > 32 || max_rank_ > 7) {
@@ -7201,7 +7284,8 @@ SUS2_V11::SUS2_V11(
                         use_tensor_basic_fastpath_ && !use_l3k3_tensor_scalar_ &&
                         !use_l3k3_tensor_block_;
   use_graph_specific_product_ =
-    request_graph_specific_product && use_product_assign_ && use_const_alpha_times_;
+    request_graph_specific_product && use_product_assign_ &&
+    (use_const_alpha_times_ || alpha_times_global_u16_supported);
   use_const_float_coeffs_ = use_float_moments_ &&
                             host_model.species_count <= kSus2MaxConstSpecies &&
                             host_model.alpha_scalar_moments <= kSus2MaxConstScalarMoments;
@@ -7241,6 +7325,14 @@ SUS2_V11::SUS2_V11(
   alpha_basic_.copy_from_host(host_model.alpha_basic.data());
   alpha_times_.resize(host_model.alpha_times.size());
   alpha_times_.copy_from_host(host_model.alpha_times.data());
+  if (use_graph_specific_product_ && !use_const_alpha_times_) {
+    std::vector<unsigned short> packed_alpha_times(host_model.alpha_times.size());
+    for (size_t i = 0; i < host_model.alpha_times.size(); ++i) {
+      packed_alpha_times[i] = static_cast<unsigned short>(host_model.alpha_times[i]);
+    }
+    alpha_times_u16_.resize(packed_alpha_times.size());
+    alpha_times_u16_.copy_from_host(packed_alpha_times.data());
+  }
   if (use_const_alpha_times_) {
     std::vector<unsigned short> packed_alpha_times(host_model.alpha_times.size());
     for (size_t i = 0; i < host_model.alpha_times.size(); ++i) {
@@ -7442,9 +7534,10 @@ SUS2_V11::SUS2_V11(
   if (request_graph_specific_product && !use_graph_specific_product_ &&
       !use_l3k3_tensor_scalar_ && !use_l3k3_tensor_block_) {
     printf(
-      "SUS2 v1.1 GPUMD graph-specific product path: requested but unsupported; using mature product graph (product_assign=%s, const_u16_rules=%s).\n",
+      "SUS2 v1.1 GPUMD graph-specific product path: requested but unsupported; using mature product graph (product_assign=%s, const_u16_rules=%s, global_u16_rules=%s).\n",
       use_product_assign_ ? "yes" : "no",
-      use_const_alpha_times_ ? "yes" : "no");
+      use_const_alpha_times_ ? "yes" : "no",
+      alpha_times_global_u16_supported ? "yes" : "no");
   }
   if (use_local_product_graph_) {
     printf(
@@ -7777,6 +7870,7 @@ void SUS2_V11::compute(
     use_float_moments_ ? moment_coeffs_float_.data() : nullptr,
     alpha_basic_.data(),
     alpha_times_.data(),
+    (use_graph_specific_product_ && !use_const_alpha_times_) ? alpha_times_u16_.data() : nullptr,
     alpha_time_group_count_ > 0 ? alpha_time_groups_.data() : nullptr,
     use_graph_specific_product_ ? alpha_time_group_pairs_.data() : nullptr,
     alpha_moment_mapping_.data(),
@@ -8052,8 +8146,13 @@ void SUS2_V11::compute(
         }
       } else {
         if (use_product_assign_) {
-          gpu_forward_energy_backward_assign_group_table<float, float><<<grid_size, kBlockSize>>>(
-            num_atoms, model, type.data(), moment_vals_float_.data(), moment_grads_float_.data(), potential.data());
+          if (use_graph_specific_product_) {
+            gpu_forward_energy_backward_global_u16_group_pair_table<float, float><<<grid_size, kBlockSize>>>(
+              num_atoms, model, type.data(), moment_vals_float_.data(), moment_grads_float_.data(), potential.data());
+          } else {
+            gpu_forward_energy_backward_assign_group_table<float, float><<<grid_size, kBlockSize>>>(
+              num_atoms, model, type.data(), moment_vals_float_.data(), moment_grads_float_.data(), potential.data());
+          }
         } else {
           gpu_forward_energy_backward<float, float><<<grid_size, kBlockSize>>>(
             num_atoms, model, type.data(), moment_vals_float_.data(), moment_grads_float_.data(), potential.data());
@@ -8075,8 +8174,13 @@ void SUS2_V11::compute(
         }
       } else {
         if (use_product_assign_) {
-          gpu_forward_energy_backward_assign_group_table<double, float><<<grid_size, kBlockSize>>>(
-            num_atoms, model, type.data(), moment_vals_.data(), moment_grads_float_.data(), potential.data());
+          if (use_graph_specific_product_) {
+            gpu_forward_energy_backward_global_u16_group_pair_table<double, float><<<grid_size, kBlockSize>>>(
+              num_atoms, model, type.data(), moment_vals_.data(), moment_grads_float_.data(), potential.data());
+          } else {
+            gpu_forward_energy_backward_assign_group_table<double, float><<<grid_size, kBlockSize>>>(
+              num_atoms, model, type.data(), moment_vals_.data(), moment_grads_float_.data(), potential.data());
+          }
         } else {
           gpu_forward_energy_backward<double, float><<<grid_size, kBlockSize>>>(
             num_atoms, model, type.data(), moment_vals_.data(), moment_grads_float_.data(), potential.data());
@@ -8098,8 +8202,13 @@ void SUS2_V11::compute(
         }
       } else {
         if (use_product_assign_) {
-          gpu_forward_energy_backward_assign_group_table<double, double><<<grid_size, kBlockSize>>>(
-            num_atoms, model, type.data(), moment_vals_.data(), moment_grads_.data(), potential.data());
+          if (use_graph_specific_product_) {
+            gpu_forward_energy_backward_global_u16_group_pair_table<double, double><<<grid_size, kBlockSize>>>(
+              num_atoms, model, type.data(), moment_vals_.data(), moment_grads_.data(), potential.data());
+          } else {
+            gpu_forward_energy_backward_assign_group_table<double, double><<<grid_size, kBlockSize>>>(
+              num_atoms, model, type.data(), moment_vals_.data(), moment_grads_.data(), potential.data());
+          }
         } else {
           gpu_forward_energy_backward<double, double><<<grid_size, kBlockSize>>>(
             num_atoms, model, type.data(), moment_vals_.data(), moment_grads_.data(), potential.data());
