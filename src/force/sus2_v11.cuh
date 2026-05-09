@@ -77,6 +77,8 @@ private:
   GPU_Vector<unsigned short> alpha_times_u16_;
   GPU_Vector<int> alpha_time_groups_;
   GPU_Vector<unsigned int> alpha_time_group_pairs_;
+  GPU_Vector<int> alpha_time_group_infos_;
+  GPU_Vector<int> alpha_grad_init_pairs_;
   GPU_Vector<int> alpha_moment_mapping_;
   GPU_Vector<int> l3k3_tensor_scalar_terms_;
   GPU_Vector<double> l3k3_tensor_scalar_coeffs_;
@@ -123,6 +125,7 @@ private:
   int l3k3_tensor_scalar_term_count_ = 0;
   int l3k3_tensor_block_op_count_ = 0;
   int l3k3_tensor_block_row_count_ = 0;
+  int alpha_grad_init_count_ = 0;
 
   GPU_Vector<double> moment_vals_;
   GPU_Vector<float> moment_vals_float_;

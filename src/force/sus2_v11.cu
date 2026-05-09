@@ -29,6 +29,7 @@ constexpr int kSus2MaxConstAlphaTimes = 6000;
 constexpr int kSus2MaxConstScalarMoments = 2048;
 constexpr int kSus2MaxConstSpecies = 128;
 constexpr int kSus2ProductGroupPairWords = 2;
+constexpr int kSus2GradInitPairInts = 2;
 constexpr int kSus2LocalGraphMaxMoments = 640;
 constexpr int kSus2MaxTensorRank = 4;
 constexpr int kSus2MaxTensorGroups = 4;
@@ -193,6 +194,9 @@ struct SUS2DeviceModel {
   const unsigned short* alpha_times_u16;
   const int* alpha_time_groups;
   const unsigned int* alpha_time_group_pairs;
+  const int* alpha_time_group_infos;
+  int alpha_grad_init_count;
+  const int* alpha_grad_init_pairs;
   const int* alpha_moment_mapping;
   int l3k3_tensor_scalar_term_count;
   const int* l3k3_tensor_scalar_terms;
@@ -880,6 +884,58 @@ std::vector<unsigned int> pack_alpha_time_group_pairs(const std::vector<int>& gr
     pairs.push_back(dst);
   }
   return pairs;
+}
+
+void build_graph_specific_grad_init_plan(
+  const SUS2HostModel& model,
+  const std::vector<int>& groups,
+  std::vector<int>& group_infos,
+  std::vector<int>& grad_init_pairs)
+{
+  std::vector<int> scalar_index(model.alpha_moments_count, -1);
+  for (int idx = 0; idx < static_cast<int>(model.alpha_moment_mapping.size()); ++idx) {
+    const int moment = model.alpha_moment_mapping[idx];
+    if (moment >= 0 && moment < model.alpha_moments_count) {
+      scalar_index[moment] = idx;
+    }
+  }
+
+  std::vector<unsigned char> is_source(model.alpha_moments_count, 0);
+  for (int t = 0; t < model.alpha_times_count; ++t) {
+    const int src0 = model.alpha_times[t * 4 + 0];
+    const int src1 = model.alpha_times[t * 4 + 1];
+    if (src0 >= 0 && src0 < model.alpha_moments_count) {
+      is_source[src0] = 1;
+    }
+    if (src1 >= 0 && src1 < model.alpha_moments_count) {
+      is_source[src1] = 1;
+    }
+  }
+
+  group_infos.clear();
+  group_infos.reserve(groups.size() / 3);
+  for (size_t group = 0; group < groups.size() / 3; ++group) {
+    const int dst = groups[group * 3 + 2];
+    const int source_active =
+      (dst >= 0 && dst < model.alpha_moments_count && is_source[dst]) ? 1 : 0;
+    const int scalar_plus_one =
+      (dst >= 0 && dst < model.alpha_moments_count) ? scalar_index[dst] + 1 : 0;
+    group_infos.push_back(source_active | (scalar_plus_one << 1));
+  }
+
+  grad_init_pairs.clear();
+  grad_init_pairs.reserve(static_cast<size_t>(model.alpha_basic_count + model.alpha_moments_count) *
+                          kSus2GradInitPairInts);
+  for (int moment = 0; moment < model.alpha_basic_count; ++moment) {
+    grad_init_pairs.push_back(moment);
+    grad_init_pairs.push_back(scalar_index[moment]);
+  }
+  for (int moment = model.alpha_basic_count; moment < model.alpha_moments_count; ++moment) {
+    if (is_source[moment]) {
+      grad_init_pairs.push_back(moment);
+      grad_init_pairs.push_back(scalar_index[moment]);
+    }
+  }
 }
 
 bool supports_product_assign(const SUS2HostModel& model)
@@ -2978,6 +3034,12 @@ __device__ __forceinline__ RealT sus2_moment_coeff(const SUS2DeviceModel& model,
   }
   return model.use_float_model_params ? static_cast<RealT>(model.moment_coeffs_float[idx])
                                       : static_cast<RealT>(model.moment_coeffs[idx]);
+}
+
+template <typename RealT, typename GradT>
+__device__ __forceinline__ RealT sus2_moment_grad_seed(const SUS2DeviceModel& model, int idx)
+{
+  return static_cast<RealT>(static_cast<GradT>(sus2_moment_coeff<RealT>(model, idx)));
 }
 
 template <typename RealT>
@@ -5615,6 +5677,87 @@ static __global__ void gpu_forward_energy_backward_global_u16_group_pair_table(
   }
 }
 
+template <typename RealT, typename GradT>
+static __global__ void gpu_forward_energy_backward_global_u16_group_pair_selective_init(
+  int N,
+  SUS2DeviceModel model,
+  const int* type,
+  RealT* moments,
+  GradT* grads,
+  double* potential)
+{
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= N || model.alpha_time_group_pairs == nullptr || model.alpha_times_u16 == nullptr ||
+      model.alpha_time_group_infos == nullptr || model.alpha_grad_init_pairs == nullptr) {
+    return;
+  }
+
+  for (int g = 0; g < model.alpha_time_group_count; ++g) {
+    int begin;
+    int len;
+    int dst;
+    sus2_product_group_pair(model, g, begin, len, dst);
+    RealT dst_value = static_cast<RealT>(0.0);
+    for (int k = 0; k < len; ++k) {
+      int src0;
+      int src1;
+      int mult;
+      sus2_product_rule_global_u16(model, begin + k, src0, src1, mult);
+      dst_value += static_cast<RealT>(mult) * moments[static_cast<size_t>(src0) * N + i] *
+                   moments[static_cast<size_t>(src1) * N + i];
+    }
+    moments[static_cast<size_t>(dst) * N + i] = dst_value;
+  }
+
+  for (int idx = 0; idx < model.alpha_grad_init_count; ++idx) {
+    const int offset = idx * kSus2GradInitPairInts;
+    const int moment = model.alpha_grad_init_pairs[offset + 0];
+    const int scalar_idx = model.alpha_grad_init_pairs[offset + 1];
+    const GradT seed = scalar_idx >= 0
+      ? static_cast<GradT>(sus2_moment_coeff<RealT>(model, scalar_idx))
+      : static_cast<GradT>(0.0);
+    grads[static_cast<size_t>(moment) * N + i] = seed;
+  }
+
+  const int type_i = type[i];
+  const RealT species_coeff = sus2_species_coeff<RealT>(model, type_i);
+  RealT site_energy = sus2_shift_coeff<RealT>(model, type_i) + species_coeff;
+  for (int idx = 0; idx < model.alpha_scalar_moments; ++idx) {
+    const int moment_id = sus2_scalar_moment_id(model, idx);
+    const RealT coeff = sus2_moment_coeff<RealT>(model, idx);
+    site_energy += coeff * moments[static_cast<size_t>(moment_id) * N + i] *
+                   species_coeff;
+  }
+  potential[i] += static_cast<double>(site_energy);
+
+  for (int g = model.alpha_time_group_count - 1; g >= 0; --g) {
+    int begin;
+    int len;
+    int dst;
+    sus2_product_group_pair(model, g, begin, len, dst);
+    const int info = model.alpha_time_group_infos[g];
+    const bool source_active = (info & 1) != 0;
+    const int scalar_idx = (info >> 1) - 1;
+    RealT dst_grad = source_active
+      ? static_cast<RealT>(load_sus2_grad(grads, N, dst, i))
+      : static_cast<RealT>(0.0);
+    if (!source_active && scalar_idx >= 0) {
+      dst_grad = sus2_moment_grad_seed<RealT, GradT>(model, scalar_idx);
+    }
+    for (int k = len - 1; k >= 0; --k) {
+      int src0;
+      int src1;
+      int mult;
+      sus2_product_rule_global_u16(model, begin + k, src0, src1, mult);
+      const RealT gdst = dst_grad * static_cast<RealT>(mult);
+      add_sus2_grad(
+        grads, static_cast<size_t>(src1) * N + i, gdst * moments[static_cast<size_t>(src0) * N + i]);
+      add_sus2_grad(
+        grads, static_cast<size_t>(src0) * N + i, gdst * moments[static_cast<size_t>(src1) * N + i]);
+    }
+  }
+}
+
 __device__ __forceinline__ int l3k3_sym2_offset(int a, int b)
 {
   if (a > b) {
@@ -7371,6 +7514,17 @@ SUS2_V11::SUS2_V11(
       use_graph_specific_product_ = false;
     }
   }
+  if (use_graph_specific_product_ && !use_const_alpha_times_) {
+    std::vector<int> group_infos;
+    std::vector<int> grad_init_pairs;
+    build_graph_specific_grad_init_plan(
+      host_model, packed_alpha_time_groups, group_infos, grad_init_pairs);
+    alpha_time_group_infos_.resize(group_infos.size());
+    alpha_time_group_infos_.copy_from_host(group_infos.data());
+    alpha_grad_init_pairs_.resize(grad_init_pairs.size());
+    alpha_grad_init_pairs_.copy_from_host(grad_init_pairs.data());
+    alpha_grad_init_count_ = static_cast<int>(grad_init_pairs.size() / kSus2GradInitPairInts);
+  }
   alpha_moment_mapping_.resize(host_model.alpha_moment_mapping.size());
   alpha_moment_mapping_.copy_from_host(host_model.alpha_moment_mapping.data());
   if (use_const_scalar_moments_) {
@@ -7517,9 +7671,10 @@ SUS2_V11::SUS2_V11(
       "SUS2 v1.1 GPUMD product graph micro-optimization: product moments use assign-forward and skip moment-value memset.\n");
     if (use_graph_specific_product_) {
       printf(
-        "SUS2 v1.1 GPUMD graph-specific product path: packed product-group plan, groups=%d, product_rules=%d.\n",
+        "SUS2 v1.1 GPUMD graph-specific product path: packed product-group plan, groups=%d, product_rules=%d, grad_init=%d.\n",
         alpha_time_group_count_,
-        alpha_times_count_);
+        alpha_times_count_,
+        alpha_grad_init_count_);
     }
   } else if (
     parse_product_assign(host_model, num_potential_options, potential_options) &&
@@ -7807,6 +7962,8 @@ void SUS2_V11::compute(
   float* force_self_tmp_ptr =
     (use_force_self_buffer_ && !use_pairwise_no_atomic_force) ? force_self_tmp_.data() : nullptr;
   const bool use_local_product_graph = use_local_product_graph_;
+  const bool use_graph_specific_selective_grad_init =
+    use_graph_specific_product_ && !use_const_alpha_times_;
 
   profile_t = profile_start();
   if (use_l3k3_tensor_scalar_) {
@@ -7836,10 +7993,12 @@ void SUS2_V11::compute(
         CHECK(gpuMemset(moment_vals_.data(), 0, basic_moment_size * sizeof(double)));
       }
     }
-    if (use_float_moment_grads_) {
-      CHECK(gpuMemset(moment_grads_float_.data(), 0, moment_size * sizeof(float)));
-    } else {
-      CHECK(gpuMemset(moment_grads_.data(), 0, moment_size * sizeof(double)));
+    if (!use_graph_specific_selective_grad_init) {
+      if (use_float_moment_grads_) {
+        CHECK(gpuMemset(moment_grads_float_.data(), 0, moment_size * sizeof(float)));
+      } else {
+        CHECK(gpuMemset(moment_grads_.data(), 0, moment_size * sizeof(double)));
+      }
     }
   }
   if (!use_pairwise_no_atomic_force) {
@@ -7873,6 +8032,9 @@ void SUS2_V11::compute(
     (use_graph_specific_product_ && !use_const_alpha_times_) ? alpha_times_u16_.data() : nullptr,
     alpha_time_group_count_ > 0 ? alpha_time_groups_.data() : nullptr,
     use_graph_specific_product_ ? alpha_time_group_pairs_.data() : nullptr,
+    use_graph_specific_selective_grad_init ? alpha_time_group_infos_.data() : nullptr,
+    alpha_grad_init_count_,
+    use_graph_specific_selective_grad_init ? alpha_grad_init_pairs_.data() : nullptr,
     alpha_moment_mapping_.data(),
     l3k3_tensor_scalar_term_count_,
     use_l3k3_tensor_scalar_ ? l3k3_tensor_scalar_terms_.data() : nullptr,
@@ -8147,7 +8309,7 @@ void SUS2_V11::compute(
       } else {
         if (use_product_assign_) {
           if (use_graph_specific_product_) {
-            gpu_forward_energy_backward_global_u16_group_pair_table<float, float><<<grid_size, kBlockSize>>>(
+            gpu_forward_energy_backward_global_u16_group_pair_selective_init<float, float><<<grid_size, kBlockSize>>>(
               num_atoms, model, type.data(), moment_vals_float_.data(), moment_grads_float_.data(), potential.data());
           } else {
             gpu_forward_energy_backward_assign_group_table<float, float><<<grid_size, kBlockSize>>>(
@@ -8175,7 +8337,7 @@ void SUS2_V11::compute(
       } else {
         if (use_product_assign_) {
           if (use_graph_specific_product_) {
-            gpu_forward_energy_backward_global_u16_group_pair_table<double, float><<<grid_size, kBlockSize>>>(
+            gpu_forward_energy_backward_global_u16_group_pair_selective_init<double, float><<<grid_size, kBlockSize>>>(
               num_atoms, model, type.data(), moment_vals_.data(), moment_grads_float_.data(), potential.data());
           } else {
             gpu_forward_energy_backward_assign_group_table<double, float><<<grid_size, kBlockSize>>>(
@@ -8203,7 +8365,7 @@ void SUS2_V11::compute(
       } else {
         if (use_product_assign_) {
           if (use_graph_specific_product_) {
-            gpu_forward_energy_backward_global_u16_group_pair_table<double, double><<<grid_size, kBlockSize>>>(
+            gpu_forward_energy_backward_global_u16_group_pair_selective_init<double, double><<<grid_size, kBlockSize>>>(
               num_atoms, model, type.data(), moment_vals_.data(), moment_grads_.data(), potential.data());
           } else {
             gpu_forward_energy_backward_assign_group_table<double, double><<<grid_size, kBlockSize>>>(
