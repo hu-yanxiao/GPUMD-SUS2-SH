@@ -2828,7 +2828,7 @@ bool parse_graph_specific_product(
   int num_potential_options,
   const char** potential_options)
 {
-  bool use_specific = false;
+  bool use_specific = true;
   const char* env = std::getenv("SUS2_GPUMD_GRAPH_SPECIFIC_PRODUCT");
   if (env != nullptr) {
     use_specific = parse_bool_value(env, "SUS2_GPUMD_GRAPH_SPECIFIC_PRODUCT");
