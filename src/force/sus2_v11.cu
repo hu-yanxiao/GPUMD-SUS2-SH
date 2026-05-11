@@ -2865,6 +2865,69 @@ bool parse_graph_specific_product(
   return use_specific;
 }
 
+int parse_stage_block_size(
+  const SUS2HostModel& model,
+  int num_potential_options,
+  const char** potential_options,
+  const char* env_name,
+  const char* option_name,
+  const char* option_alias,
+  const char* label,
+  int default_block_size)
+{
+  int block_size = default_block_size;
+  const char* env = std::getenv(env_name);
+  if (env != nullptr) {
+    block_size = std::atoi(env);
+  }
+
+  const int option_begin = std::min(num_potential_options, model.species_count);
+  for (int i = option_begin; i < num_potential_options; ++i) {
+    const std::string option = potential_options[i] == nullptr ? "" : potential_options[i];
+    if (starts_with(option, option_name) || starts_with(option, option_alias)) {
+      const size_t eq = option.find('=');
+      block_size = std::atoi(option.substr(eq + 1).c_str());
+    }
+  }
+
+  if (block_size != 64 && block_size != 128 && block_size != 256) {
+    sus2_input_error(std::string("SUS2 ") + label + " must be one of 64, 128, or 256.");
+  }
+  return block_size;
+}
+
+int parse_product_block_size(
+  const SUS2HostModel& model,
+  int num_potential_options,
+  const char** potential_options)
+{
+  return parse_stage_block_size(
+    model,
+    num_potential_options,
+    potential_options,
+    "SUS2_GPUMD_PRODUCT_BLOCK_SIZE",
+    "sus2_product_block_size=",
+    "product_block_size=",
+    "product_block_size",
+    256);
+}
+
+int parse_force_block_size(
+  const SUS2HostModel& model,
+  int num_potential_options,
+  const char** potential_options)
+{
+  return parse_stage_block_size(
+    model,
+    num_potential_options,
+    potential_options,
+    "SUS2_GPUMD_FORCE_BLOCK_SIZE",
+    "sus2_force_block_size=",
+    "force_block_size=",
+    "force_block_size",
+    kBlockSize);
+}
+
 bool has_graph_specific_product_override(
   const SUS2HostModel& model,
   int num_potential_options,
@@ -7493,6 +7556,10 @@ SUS2_V11::SUS2_V11(
   use_fused_graph_ = parse_fused_graph(host_model, num_potential_options, potential_options);
   use_product_assign_ =
     parse_product_assign(host_model, num_potential_options, potential_options);
+  product_block_size_ =
+    parse_product_block_size(host_model, num_potential_options, potential_options);
+  force_block_size_ =
+    parse_force_block_size(host_model, num_potential_options, potential_options);
   const bool request_graph_specific_product =
     parse_graph_specific_product(host_model, num_potential_options, potential_options);
   const bool explicit_graph_specific_product =
@@ -7789,6 +7856,12 @@ SUS2_V11::SUS2_V11(
       !use_l3k3_tensor_block_) {
     printf("SUS2 v1.1 GPUMD product graph path: fused forward/site-gradient/backward kernel.\n");
   }
+  printf(
+    "SUS2 v1.1 GPUMD product-stage launch block size: %d.\n",
+    product_block_size_);
+  printf(
+    "SUS2 v1.1 GPUMD force-stage launch block size: %d.\n",
+    force_block_size_);
   if (use_product_assign_) {
     printf(
       "SUS2 v1.1 GPUMD product graph micro-optimization: product moments use assign-forward and skip moment-value memset.\n");
@@ -8079,6 +8152,8 @@ void SUS2_V11::compute(
   profile_stop(profile_neighbor, profile_t);
 
   const int grid_size = (num_atoms - 1) / kBlockSize + 1;
+  const int product_grid_size = (num_atoms - 1) / product_block_size_ + 1;
+  const int force_grid_size = (num_atoms - 1) / force_block_size_ + 1;
   const size_t moment_size = static_cast<size_t>(alpha_moments_count_) * num_atoms;
   const size_t basic_moment_size = static_cast<size_t>(alpha_basic_count_) * num_atoms;
   const bool use_pairwise_no_atomic_force =
@@ -8355,7 +8430,7 @@ void SUS2_V11::compute(
         moment_grads_float_.data(),
         potential.data());
     } else if (use_float_moment_grads_) {
-      gpu_l3k3_tensor_scalar_energy_backward<double, float><<<grid_size, kBlockSize>>>(
+      gpu_l3k3_tensor_scalar_energy_backward<double, float><<<product_grid_size, product_block_size_>>>(
         num_atoms,
         model,
         type.data(),
@@ -8363,7 +8438,7 @@ void SUS2_V11::compute(
         moment_grads_float_.data(),
         potential.data());
     } else {
-      gpu_l3k3_tensor_scalar_energy_backward<double, double><<<grid_size, kBlockSize>>>(
+      gpu_l3k3_tensor_scalar_energy_backward<double, double><<<product_grid_size, product_block_size_>>>(
         num_atoms,
         model,
         type.data(),
@@ -8376,7 +8451,7 @@ void SUS2_V11::compute(
   } else if (use_l3k3_tensor_block) {
     profile_t = profile_start();
     if (use_float_moments_) {
-      gpu_l3k3_tensor_block_energy_backward<float, float><<<grid_size, kBlockSize>>>(
+      gpu_l3k3_tensor_block_energy_backward<float, float><<<product_grid_size, product_block_size_>>>(
         num_atoms,
         model,
         type.data(),
@@ -8384,7 +8459,7 @@ void SUS2_V11::compute(
         moment_grads_float_.data(),
         potential.data());
     } else if (use_float_moment_grads_) {
-      gpu_l3k3_tensor_block_energy_backward<double, float><<<grid_size, kBlockSize>>>(
+      gpu_l3k3_tensor_block_energy_backward<double, float><<<product_grid_size, product_block_size_>>>(
         num_atoms,
         model,
         type.data(),
@@ -8392,7 +8467,7 @@ void SUS2_V11::compute(
         moment_grads_float_.data(),
         potential.data());
     } else {
-      gpu_l3k3_tensor_block_energy_backward<double, double><<<grid_size, kBlockSize>>>(
+      gpu_l3k3_tensor_block_energy_backward<double, double><<<product_grid_size, product_block_size_>>>(
         num_atoms,
         model,
         type.data(),
@@ -8404,7 +8479,7 @@ void SUS2_V11::compute(
     profile_stop(profile_forward, profile_t);
   } else if (use_local_product_graph) {
     profile_t = profile_start();
-    gpu_local_graph_energy_backward_to_basic<float, float, kSus2LocalGraphMaxMoments><<<grid_size, kBlockSize>>>(
+    gpu_local_graph_energy_backward_to_basic<float, float, kSus2LocalGraphMaxMoments><<<product_grid_size, product_block_size_>>>(
       num_atoms,
       model,
       type.data(),
@@ -8419,27 +8494,27 @@ void SUS2_V11::compute(
       if (use_const_alpha_times_) {
         if (use_product_assign_) {
           if (use_graph_specific_product_) {
-            gpu_forward_energy_backward_const_u16_group_pair_selective_init<float, float><<<grid_size, kBlockSize>>>(
+            gpu_forward_energy_backward_const_u16_group_pair_selective_init<float, float><<<product_grid_size, product_block_size_>>>(
               num_atoms, model, type.data(), moment_vals_float_.data(), moment_grads_float_.data(), potential.data());
           } else {
-            gpu_forward_energy_backward_const_u16_assign_group_table<float, float><<<grid_size, kBlockSize>>>(
+            gpu_forward_energy_backward_const_u16_assign_group_table<float, float><<<product_grid_size, product_block_size_>>>(
               num_atoms, model, type.data(), moment_vals_float_.data(), moment_grads_float_.data(), potential.data());
           }
         } else {
-          gpu_forward_energy_backward_const_u16<float, float><<<grid_size, kBlockSize>>>(
+          gpu_forward_energy_backward_const_u16<float, float><<<product_grid_size, product_block_size_>>>(
             num_atoms, model, type.data(), moment_vals_float_.data(), moment_grads_float_.data(), potential.data());
         }
       } else {
         if (use_product_assign_) {
           if (use_graph_specific_product_) {
-            gpu_forward_energy_backward_global_u16_group_pair_selective_init<float, float><<<grid_size, kBlockSize>>>(
+            gpu_forward_energy_backward_global_u16_group_pair_selective_init<float, float><<<product_grid_size, product_block_size_>>>(
               num_atoms, model, type.data(), moment_vals_float_.data(), moment_grads_float_.data(), potential.data());
           } else {
-            gpu_forward_energy_backward_assign_group_table<float, float><<<grid_size, kBlockSize>>>(
+            gpu_forward_energy_backward_assign_group_table<float, float><<<product_grid_size, product_block_size_>>>(
               num_atoms, model, type.data(), moment_vals_float_.data(), moment_grads_float_.data(), potential.data());
           }
         } else {
-          gpu_forward_energy_backward<float, float><<<grid_size, kBlockSize>>>(
+          gpu_forward_energy_backward<float, float><<<product_grid_size, product_block_size_>>>(
             num_atoms, model, type.data(), moment_vals_float_.data(), moment_grads_float_.data(), potential.data());
         }
       }
@@ -8447,27 +8522,27 @@ void SUS2_V11::compute(
       if (use_const_alpha_times_) {
         if (use_product_assign_) {
           if (use_graph_specific_product_) {
-            gpu_forward_energy_backward_const_u16_group_pair_selective_init<double, float><<<grid_size, kBlockSize>>>(
+            gpu_forward_energy_backward_const_u16_group_pair_selective_init<double, float><<<product_grid_size, product_block_size_>>>(
               num_atoms, model, type.data(), moment_vals_.data(), moment_grads_float_.data(), potential.data());
           } else {
-            gpu_forward_energy_backward_const_u16_assign_group_table<double, float><<<grid_size, kBlockSize>>>(
+            gpu_forward_energy_backward_const_u16_assign_group_table<double, float><<<product_grid_size, product_block_size_>>>(
               num_atoms, model, type.data(), moment_vals_.data(), moment_grads_float_.data(), potential.data());
           }
         } else {
-          gpu_forward_energy_backward_const_u16<double, float><<<grid_size, kBlockSize>>>(
+          gpu_forward_energy_backward_const_u16<double, float><<<product_grid_size, product_block_size_>>>(
             num_atoms, model, type.data(), moment_vals_.data(), moment_grads_float_.data(), potential.data());
         }
       } else {
         if (use_product_assign_) {
           if (use_graph_specific_product_) {
-            gpu_forward_energy_backward_global_u16_group_pair_selective_init<double, float><<<grid_size, kBlockSize>>>(
+            gpu_forward_energy_backward_global_u16_group_pair_selective_init<double, float><<<product_grid_size, product_block_size_>>>(
               num_atoms, model, type.data(), moment_vals_.data(), moment_grads_float_.data(), potential.data());
           } else {
-            gpu_forward_energy_backward_assign_group_table<double, float><<<grid_size, kBlockSize>>>(
+            gpu_forward_energy_backward_assign_group_table<double, float><<<product_grid_size, product_block_size_>>>(
               num_atoms, model, type.data(), moment_vals_.data(), moment_grads_float_.data(), potential.data());
           }
         } else {
-          gpu_forward_energy_backward<double, float><<<grid_size, kBlockSize>>>(
+          gpu_forward_energy_backward<double, float><<<product_grid_size, product_block_size_>>>(
             num_atoms, model, type.data(), moment_vals_.data(), moment_grads_float_.data(), potential.data());
         }
       }
@@ -8475,27 +8550,27 @@ void SUS2_V11::compute(
       if (use_const_alpha_times_) {
         if (use_product_assign_) {
           if (use_graph_specific_product_) {
-            gpu_forward_energy_backward_const_u16_group_pair_selective_init<double, double><<<grid_size, kBlockSize>>>(
+            gpu_forward_energy_backward_const_u16_group_pair_selective_init<double, double><<<product_grid_size, product_block_size_>>>(
               num_atoms, model, type.data(), moment_vals_.data(), moment_grads_.data(), potential.data());
           } else {
-            gpu_forward_energy_backward_const_u16_assign_group_table<double, double><<<grid_size, kBlockSize>>>(
+            gpu_forward_energy_backward_const_u16_assign_group_table<double, double><<<product_grid_size, product_block_size_>>>(
               num_atoms, model, type.data(), moment_vals_.data(), moment_grads_.data(), potential.data());
           }
         } else {
-          gpu_forward_energy_backward_const_u16<double, double><<<grid_size, kBlockSize>>>(
+          gpu_forward_energy_backward_const_u16<double, double><<<product_grid_size, product_block_size_>>>(
             num_atoms, model, type.data(), moment_vals_.data(), moment_grads_.data(), potential.data());
         }
       } else {
         if (use_product_assign_) {
           if (use_graph_specific_product_) {
-            gpu_forward_energy_backward_global_u16_group_pair_selective_init<double, double><<<grid_size, kBlockSize>>>(
+            gpu_forward_energy_backward_global_u16_group_pair_selective_init<double, double><<<product_grid_size, product_block_size_>>>(
               num_atoms, model, type.data(), moment_vals_.data(), moment_grads_.data(), potential.data());
           } else {
-            gpu_forward_energy_backward_assign_group_table<double, double><<<grid_size, kBlockSize>>>(
+            gpu_forward_energy_backward_assign_group_table<double, double><<<product_grid_size, product_block_size_>>>(
               num_atoms, model, type.data(), moment_vals_.data(), moment_grads_.data(), potential.data());
           }
         } else {
-          gpu_forward_energy_backward<double, double><<<grid_size, kBlockSize>>>(
+          gpu_forward_energy_backward<double, double><<<product_grid_size, product_block_size_>>>(
             num_atoms, model, type.data(), moment_vals_.data(), moment_grads_.data(), potential.data());
         }
       }
@@ -8506,17 +8581,17 @@ void SUS2_V11::compute(
     profile_t = profile_start();
     if (use_const_alpha_times_) {
       if (use_float_moments_) {
-        gpu_forward_times_const_u16<float><<<grid_size, kBlockSize>>>(
+        gpu_forward_times_const_u16<float><<<product_grid_size, product_block_size_>>>(
           num_atoms, model, moment_vals_float_.data());
       } else {
-        gpu_forward_times_const_u16<double><<<grid_size, kBlockSize>>>(
+        gpu_forward_times_const_u16<double><<<product_grid_size, product_block_size_>>>(
           num_atoms, model, moment_vals_.data());
       }
     } else {
       if (use_float_moments_) {
-        gpu_forward_times<float><<<grid_size, kBlockSize>>>(num_atoms, model, moment_vals_float_.data());
+        gpu_forward_times<float><<<product_grid_size, product_block_size_>>>(num_atoms, model, moment_vals_float_.data());
       } else {
-        gpu_forward_times<double><<<grid_size, kBlockSize>>>(num_atoms, model, moment_vals_.data());
+        gpu_forward_times<double><<<product_grid_size, product_block_size_>>>(num_atoms, model, moment_vals_.data());
       }
     }
     GPU_CHECK_KERNEL
@@ -8526,26 +8601,26 @@ void SUS2_V11::compute(
       profile_t = profile_start();
       if (use_float_moments_) {
         if (use_const_alpha_times_) {
-          gpu_site_energy_init_grad_backward_const_u16<float, float><<<grid_size, kBlockSize>>>(
+          gpu_site_energy_init_grad_backward_const_u16<float, float><<<product_grid_size, product_block_size_>>>(
             num_atoms, model, type.data(), moment_vals_float_.data(), moment_grads_float_.data(), potential.data());
         } else {
-          gpu_site_energy_init_grad_backward<float, float><<<grid_size, kBlockSize>>>(
+          gpu_site_energy_init_grad_backward<float, float><<<product_grid_size, product_block_size_>>>(
             num_atoms, model, type.data(), moment_vals_float_.data(), moment_grads_float_.data(), potential.data());
         }
       } else if (use_float_moment_grads_) {
         if (use_const_alpha_times_) {
-          gpu_site_energy_init_grad_backward_const_u16<double, float><<<grid_size, kBlockSize>>>(
+          gpu_site_energy_init_grad_backward_const_u16<double, float><<<product_grid_size, product_block_size_>>>(
             num_atoms, model, type.data(), moment_vals_.data(), moment_grads_float_.data(), potential.data());
         } else {
-          gpu_site_energy_init_grad_backward<double, float><<<grid_size, kBlockSize>>>(
+          gpu_site_energy_init_grad_backward<double, float><<<product_grid_size, product_block_size_>>>(
             num_atoms, model, type.data(), moment_vals_.data(), moment_grads_float_.data(), potential.data());
         }
       } else {
         if (use_const_alpha_times_) {
-          gpu_site_energy_init_grad_backward_const_u16<double, double><<<grid_size, kBlockSize>>>(
+          gpu_site_energy_init_grad_backward_const_u16<double, double><<<product_grid_size, product_block_size_>>>(
             num_atoms, model, type.data(), moment_vals_.data(), moment_grads_.data(), potential.data());
         } else {
-          gpu_site_energy_init_grad_backward<double, double><<<grid_size, kBlockSize>>>(
+          gpu_site_energy_init_grad_backward<double, double><<<product_grid_size, product_block_size_>>>(
             num_atoms, model, type.data(), moment_vals_.data(), moment_grads_.data(), potential.data());
         }
       }
@@ -8554,13 +8629,13 @@ void SUS2_V11::compute(
     } else {
       profile_t = profile_start();
       if (use_float_moments_) {
-        gpu_site_energy_init_grad<float, float><<<grid_size, kBlockSize>>>(
+        gpu_site_energy_init_grad<float, float><<<product_grid_size, product_block_size_>>>(
           num_atoms, model, type.data(), moment_vals_float_.data(), moment_grads_float_.data(), potential.data());
       } else if (use_float_moment_grads_) {
-        gpu_site_energy_init_grad<double, float><<<grid_size, kBlockSize>>>(
+        gpu_site_energy_init_grad<double, float><<<product_grid_size, product_block_size_>>>(
           num_atoms, model, type.data(), moment_vals_.data(), moment_grads_float_.data(), potential.data());
       } else {
-        gpu_site_energy_init_grad<double, double><<<grid_size, kBlockSize>>>(
+        gpu_site_energy_init_grad<double, double><<<product_grid_size, product_block_size_>>>(
           num_atoms, model, type.data(), moment_vals_.data(), moment_grads_.data(), potential.data());
       }
       GPU_CHECK_KERNEL
@@ -8569,26 +8644,26 @@ void SUS2_V11::compute(
       profile_t = profile_start();
       if (use_float_moments_) {
         if (use_const_alpha_times_) {
-          gpu_backward_times_const_u16<float, float><<<grid_size, kBlockSize>>>(
+          gpu_backward_times_const_u16<float, float><<<product_grid_size, product_block_size_>>>(
             num_atoms, model, moment_vals_float_.data(), moment_grads_float_.data());
         } else {
-          gpu_backward_times<float, float><<<grid_size, kBlockSize>>>(
+          gpu_backward_times<float, float><<<product_grid_size, product_block_size_>>>(
             num_atoms, model, moment_vals_float_.data(), moment_grads_float_.data());
         }
       } else if (use_float_moment_grads_) {
         if (use_const_alpha_times_) {
-          gpu_backward_times_const_u16<double, float><<<grid_size, kBlockSize>>>(
+          gpu_backward_times_const_u16<double, float><<<product_grid_size, product_block_size_>>>(
             num_atoms, model, moment_vals_.data(), moment_grads_float_.data());
         } else {
-          gpu_backward_times<double, float><<<grid_size, kBlockSize>>>(
+          gpu_backward_times<double, float><<<product_grid_size, product_block_size_>>>(
             num_atoms, model, moment_vals_.data(), moment_grads_float_.data());
         }
       } else {
         if (use_const_alpha_times_) {
-          gpu_backward_times_const_u16<double, double><<<grid_size, kBlockSize>>>(
+          gpu_backward_times_const_u16<double, double><<<product_grid_size, product_block_size_>>>(
             num_atoms, model, moment_vals_.data(), moment_grads_.data());
         } else {
-          gpu_backward_times<double, double><<<grid_size, kBlockSize>>>(
+          gpu_backward_times<double, double><<<product_grid_size, product_block_size_>>>(
             num_atoms, model, moment_vals_.data(), moment_grads_.data());
         }
       }
@@ -8600,19 +8675,19 @@ void SUS2_V11::compute(
 #define SUS2_LAUNCH_TENSOR_CACHED_FORCE_DYNAMIC(GRAD_T, REAL_T, GRADS_PTR) \
   do { \
     if (alpha_basic_count_ <= 40) { \
-      gpu_compute_forces_tensor_cached_grads<GRAD_T, REAL_T, 40><<<grid_size, kBlockSize>>>( \
+      gpu_compute_forces_tensor_cached_grads<GRAD_T, REAL_T, 40><<<force_grid_size, force_block_size_>>>( \
         num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(), \
         neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(), \
         neighbor_dz_.data(), position.data(), position.data() + num_atoms, \
         position.data() + 2 * num_atoms, GRADS_PTR, force_tmp_.data(), force_self_tmp_ptr, virial_tmp_.data()); \
     } else if (alpha_basic_count_ <= 80) { \
-      gpu_compute_forces_tensor_cached_grads<GRAD_T, REAL_T, 80><<<grid_size, kBlockSize>>>( \
+      gpu_compute_forces_tensor_cached_grads<GRAD_T, REAL_T, 80><<<force_grid_size, force_block_size_>>>( \
         num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(), \
         neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(), \
         neighbor_dz_.data(), position.data(), position.data() + num_atoms, \
         position.data() + 2 * num_atoms, GRADS_PTR, force_tmp_.data(), force_self_tmp_ptr, virial_tmp_.data()); \
     } else { \
-      gpu_compute_forces_tensor_cached_grads<GRAD_T, REAL_T, kSus2MaxTensorBasic><<<grid_size, kBlockSize>>>( \
+      gpu_compute_forces_tensor_cached_grads<GRAD_T, REAL_T, kSus2MaxTensorBasic><<<force_grid_size, force_block_size_>>>( \
         num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(), \
         neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(), \
         neighbor_dz_.data(), position.data(), position.data() + num_atoms, \
@@ -8621,7 +8696,7 @@ void SUS2_V11::compute(
   } while (0)
 
 #define SUS2_LAUNCH_TENSOR_CACHED_FORCE_STATIC(GRAD_T, REAL_T, LVAL, KVAL, GRADS_PTR) \
-  gpu_compute_forces_tensor_cached_grads_static<GRAD_T, REAL_T, LVAL, KVAL><<<grid_size, kBlockSize>>>( \
+  gpu_compute_forces_tensor_cached_grads_static<GRAD_T, REAL_T, LVAL, KVAL><<<force_grid_size, force_block_size_>>>( \
     num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(), \
     neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(), \
     neighbor_dz_.data(), position.data(), position.data() + num_atoms, \
@@ -8630,7 +8705,7 @@ void SUS2_V11::compute(
 #define SUS2_LAUNCH_TENSOR_CACHED_FORCE(GRAD_T, REAL_T, GRADS_PTR) \
   do { \
     if (use_exact_l3k3_tensor) { \
-      gpu_compute_forces_l3k3_cached_grads<GRAD_T, REAL_T><<<grid_size, kBlockSize>>>( \
+      gpu_compute_forces_l3k3_cached_grads<GRAD_T, REAL_T><<<force_grid_size, force_block_size_>>>( \
         num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(), \
         neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(), \
         neighbor_dz_.data(), position.data(), position.data() + num_atoms, \
@@ -8678,7 +8753,7 @@ void SUS2_V11::compute(
       if (use_tensor_basic_fastpath_ && use_tensor_force_grad_cache_) {
         SUS2_LAUNCH_TENSOR_CACHED_FORCE(float, float, moment_grads_float_.data());
       } else {
-        gpu_compute_forces<float, float><<<grid_size, kBlockSize>>>(
+        gpu_compute_forces<float, float><<<force_grid_size, force_block_size_>>>(
           num_atoms,
           box,
           rc * rc,
@@ -8702,7 +8777,7 @@ void SUS2_V11::compute(
       if (use_tensor_basic_fastpath_ && use_tensor_force_grad_cache_) {
         SUS2_LAUNCH_TENSOR_CACHED_FORCE(float, double, moment_grads_float_.data());
       } else {
-        gpu_compute_forces<float, double><<<grid_size, kBlockSize>>>(
+        gpu_compute_forces<float, double><<<force_grid_size, force_block_size_>>>(
           num_atoms,
           box,
           rc * rc,
@@ -8726,7 +8801,7 @@ void SUS2_V11::compute(
       if (use_tensor_basic_fastpath_ && use_tensor_force_grad_cache_) {
         SUS2_LAUNCH_TENSOR_CACHED_FORCE(double, double, moment_grads_.data());
       } else {
-        gpu_compute_forces<double, double><<<grid_size, kBlockSize>>>(
+        gpu_compute_forces<double, double><<<force_grid_size, force_block_size_>>>(
           num_atoms,
           box,
           rc * rc,
@@ -8750,7 +8825,7 @@ void SUS2_V11::compute(
     GPU_CHECK_KERNEL
   } else {
     if (use_float_moments_) {
-      gpu_compute_forces_pairwise_no_atomic<float, float><<<grid_size, kBlockSize>>>(
+      gpu_compute_forces_pairwise_no_atomic<float, float><<<force_grid_size, force_block_size_>>>(
         num_atoms,
         box,
         rc * rc,
@@ -8765,7 +8840,7 @@ void SUS2_V11::compute(
         force_tmp_.data(),
         virial_tmp_.data());
     } else if (use_float_moment_grads_) {
-      gpu_compute_forces_pairwise_no_atomic<float, double><<<grid_size, kBlockSize>>>(
+      gpu_compute_forces_pairwise_no_atomic<float, double><<<force_grid_size, force_block_size_>>>(
         num_atoms,
         box,
         rc * rc,
@@ -8780,7 +8855,7 @@ void SUS2_V11::compute(
         force_tmp_.data(),
         virial_tmp_.data());
     } else {
-      gpu_compute_forces_pairwise_no_atomic<double, double><<<grid_size, kBlockSize>>>(
+      gpu_compute_forces_pairwise_no_atomic<double, double><<<force_grid_size, force_block_size_>>>(
         num_atoms,
         box,
         rc * rc,
@@ -8806,7 +8881,7 @@ void SUS2_V11::compute(
   profile_stop(profile_force, profile_t);
 
   profile_t = profile_start();
-  gpu_accumulate_float_to_double<<<grid_size, kBlockSize>>>(
+  gpu_accumulate_float_to_double<<<force_grid_size, force_block_size_>>>(
     num_atoms, force_tmp_.data(), force_self_tmp_ptr, virial_tmp_.data(), force.data(), virial.data());
   GPU_CHECK_KERNEL
   profile_stop(profile_accumulate, profile_t);

@@ -59,6 +59,8 @@ private:
   int alpha_moments_count_ = 0;
   int alpha_scalar_moments_ = 0;
   int max_rank_ = 0;
+  int product_block_size_ = 256;
+  int force_block_size_ = 128;
   int tensor_l_ = 0;
   int tensor_k_ = 0;
   int tensor_basic_per_group_ = 0;
