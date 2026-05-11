@@ -1456,6 +1456,12 @@ direct kernels were justified and checked.
   scalar moment mapping, and `uint16`-packable product rules. It can be disabled
   independently with `sus2_graph_specific=0` or
   `SUS2_GPUMD_GRAPH_SPECIFIC_PRODUCT=0`.
+- The production default fast path is `sus2_float=1`, `sus2_radial_direct=1`,
+  `sus2_graph_specific=1`, and `sus2_force_self_buffer=1`. Each can still be
+  disabled explicitly with the corresponding `=0` option or environment
+  variable for parity and debugging. Default direct-radial mode falls back to
+  LUT for unsupported radial-basis sizes, while an explicit direct request still
+  raises an input error if unsupported.
 - Jacobi direct recurrence now uses constant-memory recurrence coefficient
   tables for the supported indexed Jacobi blocks instead of recomputing the
   coefficient formula inside every edge/order evaluation.

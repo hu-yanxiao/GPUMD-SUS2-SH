@@ -8,11 +8,11 @@ This repository is an overlay on top of upstream GPUMD, not a full GPUMD fork. I
 
 - SUS2 model format: `version = 1.1.0`
 - GPUMD potential token: model files beginning with `MTP`
-- Default radial evaluation: GPU lookup table for all supported radial basis types
-- Default LUT spacing: `dr = 1.0e-4 A`, matching the LAMMPS table convention
+- Default radial evaluation: direct basis recurrence for supported radial basis types
+- LUT fallback spacing: `dr = 1.0e-4 A`, matching the LAMMPS table convention
 - Runtime LUT controls: `sus2_lut_dr=...`, `sus2_lut_span=...`, `SUS2_GPUMD_LUT_DR`, `SUS2_GPUMD_LUT_SPAN`
-- Experimental direct radial switch for `RBChebyshev_sss[_lmp]`: `sus2_radial_direct=1` or `SUS2_GPUMD_RADIAL_DIRECT=1`
-- Optional memory-saving reverse-gradient workspace: `sus2_grad_float=1` or `SUS2_GPUMD_GRAD_FLOAT=1`
+- Default precision path: NEP-like float moments/gradients/local arithmetic; use `sus2_float=0` or `SUS2_GPUMD_FLOAT=0` for double moments
+- Default force path: self-force buffer enabled; use `sus2_force_self_buffer=0` or `SUS2_GPUMD_FORCE_SELF_BUFFER=0` to disable it
 - Optimized tensor path: automatic for standard `lLkK` `alpha_index_basic` layouts up to `l4k4`, using programmatic rank-block tensor contractions
 - Product-graph controls: graph-specific grouped product path is automatic for safe supported models; use `sus2_graph_specific=0` or `SUS2_GPUMD_GRAPH_SPECIFIC_PRODUCT=0` to force the mature product graph
 - Supported radial basis types:
@@ -68,49 +68,53 @@ or:
 export SUS2_GPUMD_LUT_DR=0.0001
 ```
 
-To test direct Chebyshev radial recurrence instead of lookup tables:
+To force radial lookup tables instead of direct basis recurrence:
 
 ```text
-potential p.mtp Cu Zr sus2_radial_direct=1
+potential p.mtp Cu Zr sus2_radial_direct=0
 ```
 
 or:
 
 ```bash
-export SUS2_GPUMD_RADIAL_DIRECT=1
+export SUS2_GPUMD_RADIAL_DIRECT=0
 ```
 
-The default remains LUT. The direct path currently accepts only
-`RBChebyshev_sss` and `RBChebyshev_sss_lmp`; other radial families continue to
-use the table path.
+The default is direct recurrence for supported radial families with
+`radial_basis_size <= 16`; larger radial bases fall back to LUT mode unless
+direct mode is requested explicitly. LUT mode remains available for debugging
+and parity checks.
 
-To test the optional float moment-gradient workspace:
+To force double moment values and gradients instead of the default NEP-like
+float path:
 
 ```text
-potential p.mtp H C N I Pb sus2_grad_float=1
+potential p.mtp H C N I Pb sus2_float=0
 ```
 
 or:
 
 ```bash
+export SUS2_GPUMD_FLOAT=0
+```
+
+To keep double forward moments but store only the reverse-gradient workspace in
+float:
+
+```text
+potential p.mtp H C N I Pb sus2_float=0 sus2_grad_float=1
+```
+
+or:
+
+```bash
+export SUS2_GPUMD_FLOAT=0
 export SUS2_GPUMD_GRAD_FLOAT=1
 ```
 
-This keeps the SUS2 forward moment values in double precision but stores the reverse-mode moment-gradient workspace in float. The default remains double.
-
-To test the more aggressive NEP-like float path:
-
-```text
-potential p.mtp H C N I Pb sus2_float=1
-```
-
-or:
-
-```bash
-export SUS2_GPUMD_FLOAT=1
-```
-
-This stores SUS2 moments and reverse gradients in float, evaluates local moment arithmetic in float, and still writes GPUMD energy/force/virial outputs to the existing double arrays.
+The default `sus2_float=1` stores SUS2 moments and reverse gradients in float,
+evaluates local moment arithmetic in float, and still writes GPUMD
+energy/force/virial outputs to the existing double arrays.
 
 To disable or probe the current safe fast paths:
 
@@ -119,6 +123,7 @@ potential p.mtp Cu Zr sus2_float=1 sus2_l3k3_force_grad_cache=0
 potential p.mtp Cu Zr sus2_float=1 sus2_tensor_force_grad_cache=0
 potential p.mtp Cu Zr sus2_float=1 sus2_fused_graph=0
 potential p.mtp Cu Zr sus2_float=1 sus2_graph_specific=0
+potential p.mtp Cu Zr sus2_float=1 sus2_force_self_buffer=0
 potential p.mtp Cu Zr sus2_float=1 sus2_local_product_graph=1
 ```
 

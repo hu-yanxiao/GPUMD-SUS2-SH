@@ -2555,10 +2555,12 @@ bool parse_radial_direct(
   int num_potential_options,
   const char** potential_options)
 {
-  bool use_direct = false;
+  bool use_direct = true;
+  bool explicit_direct = false;
   const char* env = std::getenv("SUS2_GPUMD_RADIAL_DIRECT");
   if (env != nullptr) {
     use_direct = parse_bool_value(env, "SUS2_GPUMD_RADIAL_DIRECT");
+    explicit_direct = true;
   }
 
   const int option_begin = std::min(num_potential_options, model.species_count);
@@ -2568,10 +2570,14 @@ bool parse_radial_direct(
         starts_with(option, "sus2_no_lut=")) {
       const size_t eq = option.find('=');
       use_direct = parse_bool_value(option.substr(eq + 1), option.substr(0, eq));
+      explicit_direct = true;
     }
   }
 
   if (use_direct && model.rb_size > 16) {
+    if (!explicit_direct) {
+      return false;
+    }
     sus2_input_error("SUS2 GPUMD radial_direct currently supports radial_basis_size <= 16.");
   }
   return use_direct;
@@ -2582,7 +2588,7 @@ bool parse_float_moments(
   int num_potential_options,
   const char** potential_options)
 {
-  bool use_float = false;
+  bool use_float = true;
   const char* env = std::getenv("SUS2_GPUMD_FLOAT");
   if (env != nullptr) {
     use_float = parse_bool_value(env, "SUS2_GPUMD_FLOAT");
@@ -2885,7 +2891,7 @@ bool parse_force_self_buffer(
   int num_potential_options,
   const char** potential_options)
 {
-  bool use_buffer = false;
+  bool use_buffer = true;
   const char* env = std::getenv("SUS2_GPUMD_FORCE_SELF_BUFFER");
   if (env != nullptr) {
     use_buffer = parse_bool_value(env, "SUS2_GPUMD_FORCE_SELF_BUFFER");

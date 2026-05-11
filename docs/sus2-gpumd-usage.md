@@ -101,19 +101,29 @@ The pressure value `0.0001` is in GPUMD pressure units and corresponds to the
 
 ## SUS2 Modes
 
-Default double mode:
+Default fast mode:
 
 ```text
 potential p.mtp B As
 ```
 
+This defaults to NEP-like float moments/gradients/local arithmetic, direct
+radial recurrence, graph-specific product planning when the model is safe for
+it, and the self-force buffer.
+
+Force double moment values and gradients:
+
+```text
+potential p.mtp B As sus2_float=0
+```
+
 Float reverse-gradient workspace:
 
 ```text
-potential p.mtp B As sus2_grad_float=1
+potential p.mtp B As sus2_float=0 sus2_grad_float=1
 ```
 
-NEP-like SUS2 float path:
+Explicit NEP-like SUS2 float path:
 
 ```text
 potential p.mtp B As sus2_float=1
@@ -126,16 +136,18 @@ export SUS2_GPUMD_GRAD_FLOAT=1
 export SUS2_GPUMD_FLOAT=1
 ```
 
-`sus2_grad_float=1` keeps forward moment values in double precision but stores
-the reverse-gradient workspace in float. `sus2_float=1` stores SUS2 moments and
-reverse gradients in float and writes the final GPUMD energy, force, and virial
-outputs to the existing double arrays. For precision-sensitive checks, compare
-the first frame before relying on long MD trajectories because later frames can
-diverge through normal chaotic MD dynamics.
+`sus2_float=0 sus2_grad_float=1` keeps forward moment values in double precision
+but stores the reverse-gradient workspace in float. `sus2_float=1` stores SUS2
+moments and reverse gradients in float and writes the final GPUMD energy, force,
+and virial outputs to the existing double arrays. For precision-sensitive
+checks, compare the first frame before relying on long MD trajectories because
+later frames can diverge through normal chaotic MD dynamics.
 
-## Radial Lookup Tables
+## Radial Evaluation
 
-The GPUMD-SUS2 backend uses radial lookup tables by default.
+The GPUMD-SUS2 backend uses direct radial basis recurrence by default for the
+supported radial families when `radial_basis_size <= 16`. Larger radial bases
+fall back to the LUT path unless direct mode is requested explicitly.
 
 Default spacing:
 
@@ -158,24 +170,22 @@ export SUS2_GPUMD_LUT_DR=0.0001
 export SUS2_GPUMD_LUT_SPAN=...
 ```
 
-Experimental direct Chebyshev recurrence:
+Force lookup tables:
 
 ```text
-potential p.mtp Cu Zr sus2_radial_direct=1
+potential p.mtp Cu Zr sus2_radial_direct=0
 ```
 
 or:
 
 ```bash
-export SUS2_GPUMD_RADIAL_DIRECT=1
+export SUS2_GPUMD_RADIAL_DIRECT=0
 ```
 
-This bypasses the radial lookup table and evaluates the
-radial values and derivatives by the same recurrence used to build the LUT.
-Current direct mode supports `RBChebyshev_sss[_lmp]`,
+Direct mode evaluates radial values and derivatives by the same recurrence used
+to build the LUT. Current direct mode supports `RBChebyshev_sss[_lmp]`,
 `RBJacobi_sss[_lmp]`, `RBJacobi_sss_noweight[_lmp]`, and the
-`RBLaguerre_log1p` family when `radial_basis_size <= 16`. LUT mode remains the
-default unless `sus2_radial_direct=1` or `SUS2_GPUMD_RADIAL_DIRECT=1` is set.
+`RBLaguerre_log1p` family when `radial_basis_size <= 16`.
 
 Product-graph assign-forward is enabled by default for supported tensor
 fast-path models. It assigns each product moment once from grouped
@@ -208,6 +218,19 @@ or:
 
 ```bash
 export SUS2_GPUMD_GRAPH_SPECIFIC_PRODUCT=0
+```
+
+The self-force buffer is enabled by default to avoid per-atom self atomic adds.
+To disable it:
+
+```text
+potential p.mtp Cu Zr sus2_force_self_buffer=0
+```
+
+or:
+
+```bash
+export SUS2_GPUMD_FORCE_SELF_BUFFER=0
 ```
 
 ## LSF Job Template
