@@ -886,6 +886,18 @@ std::vector<unsigned int> pack_alpha_time_group_pairs(const std::vector<int>& gr
   return pairs;
 }
 
+bool has_unique_scalar_moment_mapping(const SUS2HostModel& model)
+{
+  std::vector<unsigned char> seen(model.alpha_moments_count, 0);
+  for (int moment : model.alpha_moment_mapping) {
+    if (moment < 0 || moment >= model.alpha_moments_count || seen[moment]) {
+      return false;
+    }
+    seen[moment] = 1;
+  }
+  return true;
+}
+
 void build_graph_specific_grad_init_plan(
   const SUS2HostModel& model,
   const std::vector<int>& groups,
@@ -2845,6 +2857,27 @@ bool parse_graph_specific_product(
     }
   }
   return use_specific;
+}
+
+bool has_graph_specific_product_override(
+  const SUS2HostModel& model,
+  int num_potential_options,
+  const char** potential_options)
+{
+  if (std::getenv("SUS2_GPUMD_GRAPH_SPECIFIC_PRODUCT") != nullptr) {
+    return true;
+  }
+
+  const int option_begin = std::min(num_potential_options, model.species_count);
+  for (int i = option_begin; i < num_potential_options; ++i) {
+    const std::string option = potential_options[i] == nullptr ? "" : potential_options[i];
+    if (starts_with(option, "sus2_graph_specific=") ||
+        starts_with(option, "sus2_product_graph_specific=") ||
+        starts_with(option, "product_graph_specific=")) {
+      return true;
+    }
+  }
+  return false;
 }
 
 bool parse_force_self_buffer(
@@ -7456,6 +7489,8 @@ SUS2_V11::SUS2_V11(
     parse_product_assign(host_model, num_potential_options, potential_options);
   const bool request_graph_specific_product =
     parse_graph_specific_product(host_model, num_potential_options, potential_options);
+  const bool explicit_graph_specific_product =
+    has_graph_specific_product_override(host_model, num_potential_options, potential_options);
   use_local_product_graph_ =
     parse_local_product_graph(host_model, num_potential_options, potential_options);
   use_tensor_force_grad_cache_ =
@@ -7503,13 +7538,14 @@ SUS2_V11::SUS2_V11(
                              alpha_moments_count_ <= kSus2LocalGraphMaxMoments &&
                              !use_l3k3_tensor_scalar_ && !use_l3k3_tensor_block_;
   product_assign_supported_ = supports_product_assign(host_model);
+  const bool scalar_moment_mapping_unique = has_unique_scalar_moment_mapping(host_model);
   use_product_assign_ = use_product_assign_ && product_assign_supported_ &&
                         use_fused_graph_ && !use_local_product_graph_ &&
                         use_tensor_basic_fastpath_ && !use_l3k3_tensor_scalar_ &&
                         !use_l3k3_tensor_block_;
   use_graph_specific_product_ =
     request_graph_specific_product && use_product_assign_ &&
-    (use_const_alpha_times_ || alpha_times_global_u16_supported);
+    scalar_moment_mapping_unique && (use_const_alpha_times_ || alpha_times_global_u16_supported);
   use_const_float_coeffs_ = use_float_moments_ &&
                             host_model.species_count <= kSus2MaxConstSpecies &&
                             host_model.alpha_scalar_moments <= kSus2MaxConstScalarMoments;
@@ -7767,11 +7803,12 @@ SUS2_V11::SUS2_V11(
       use_local_product_graph_ ? "yes" : "no",
       use_tensor_basic_fastpath_ ? "yes" : "no");
   }
-  if (request_graph_specific_product && !use_graph_specific_product_ &&
+  if (explicit_graph_specific_product && request_graph_specific_product && !use_graph_specific_product_ &&
       !use_l3k3_tensor_scalar_ && !use_l3k3_tensor_block_) {
     printf(
-      "SUS2 v1.1 GPUMD graph-specific product path: requested but unsupported; using mature product graph (product_assign=%s, const_u16_rules=%s, global_u16_rules=%s).\n",
+      "SUS2 v1.1 GPUMD graph-specific product path: requested but unsupported; using mature product graph (product_assign=%s, scalar_mapping_unique=%s, const_u16_rules=%s, global_u16_rules=%s).\n",
       use_product_assign_ ? "yes" : "no",
+      scalar_moment_mapping_unique ? "yes" : "no",
       use_const_alpha_times_ ? "yes" : "no",
       alpha_times_global_u16_supported ? "yes" : "no");
   }

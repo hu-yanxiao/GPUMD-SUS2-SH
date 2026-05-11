@@ -192,6 +192,24 @@ or:
 export SUS2_GPUMD_PRODUCT_ASSIGN=0
 ```
 
+Graph-specific grouped product planning is also enabled by default when the
+model satisfies the safe automatic conditions: supported tensor-basic layout,
+assignable product DAG, unique scalar moment mapping, and `uint16`-packable
+product rules. This keeps the same product graph and reverse-mode chain rule but
+uses a model-specific grouped product schedule plus selective gradient
+initialization. To force the mature grouped product graph while keeping
+product-assign enabled:
+
+```text
+potential p.mtp Cu Zr sus2_graph_specific=0
+```
+
+or:
+
+```bash
+export SUS2_GPUMD_GRAPH_SPECIFIC_PRODUCT=0
+```
+
 ## LSF Job Template
 
 Submit from the intended run directory so GPUMD sees the local `run.in`,

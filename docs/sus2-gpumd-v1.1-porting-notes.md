@@ -1451,6 +1451,11 @@ direct kernels were justified and checked.
 - `product_assign` is now the default for supported tensor fast-path, fused
   product-graph models. It can still be disabled with
   `sus2_product_assign=0` or `SUS2_GPUMD_PRODUCT_ASSIGN=0`.
+- Graph-specific grouped product planning is now the default subpath when the
+  model has a supported tensor-basic layout, assignable product DAG, unique
+  scalar moment mapping, and `uint16`-packable product rules. It can be disabled
+  independently with `sus2_graph_specific=0` or
+  `SUS2_GPUMD_GRAPH_SPECIFIC_PRODUCT=0`.
 - Jacobi direct recurrence now uses constant-memory recurrence coefficient
   tables for the supported indexed Jacobi blocks instead of recomputing the
   coefficient formula inside every edge/order evaluation.

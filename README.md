@@ -14,7 +14,7 @@ This repository is an overlay on top of upstream GPUMD, not a full GPUMD fork. I
 - Experimental direct radial switch for `RBChebyshev_sss[_lmp]`: `sus2_radial_direct=1` or `SUS2_GPUMD_RADIAL_DIRECT=1`
 - Optional memory-saving reverse-gradient workspace: `sus2_grad_float=1` or `SUS2_GPUMD_GRAD_FLOAT=1`
 - Optimized tensor path: automatic for standard `lLkK` `alpha_index_basic` layouts up to `l4k4`, using programmatic rank-block tensor contractions
-- Experimental product-graph controls: `sus2_fused_graph=...`, `sus2_local_product_graph=...`
+- Product-graph controls: graph-specific grouped product path is automatic for safe supported models; use `sus2_graph_specific=0` or `SUS2_GPUMD_GRAPH_SPECIFIC_PRODUCT=0` to force the mature product graph
 - Supported radial basis types:
   - `RBJacobi_sss`, `RBJacobi_sss_lmp`
   - `RBJacobi_sss_noweight`, `RBJacobi_sss_noweight_lmp`
@@ -118,10 +118,11 @@ To disable or probe the current safe fast paths:
 potential p.mtp Cu Zr sus2_float=1 sus2_l3k3_force_grad_cache=0
 potential p.mtp Cu Zr sus2_float=1 sus2_tensor_force_grad_cache=0
 potential p.mtp Cu Zr sus2_float=1 sus2_fused_graph=0
+potential p.mtp Cu Zr sus2_float=1 sus2_graph_specific=0
 potential p.mtp Cu Zr sus2_float=1 sus2_local_product_graph=1
 ```
 
-`sus2_local_product_graph=1` is kept as an experimental model-topology path. It preserves the same product DAG and reverse-mode chain rule, but on the tested Cu-Zr l3k3 model it was slower because the local per-thread graph workspace increased register/local-memory pressure.
+`sus2_graph_specific=0` keeps product-assign but forces the mature grouped product graph. The default graph-specific path is enabled only when the model has a supported tensor-basic layout, assignable product DAG, unique scalar moment mapping, and `uint16`-packable product rules. `sus2_local_product_graph=1` is kept as an experimental model-topology path. It preserves the same product DAG and reverse-mode chain rule, but on the tested Cu-Zr l3k3 model it was slower because the local per-thread graph workspace increased register/local-memory pressure.
 
 ## Codegen Cache
 
