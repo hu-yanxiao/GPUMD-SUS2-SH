@@ -14,6 +14,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <map>
 #include <sstream>
 #include <stdexcept>
@@ -948,6 +949,216 @@ void build_graph_specific_grad_init_plan(
       grad_init_pairs.push_back(scalar_index[moment]);
     }
   }
+}
+
+struct ProductGraphAnalysis {
+  int group_count = 0;
+  int rule_count = 0;
+  int max_group_len = 0;
+  int groups_len_le4 = 0;
+  int groups_len_le8 = 0;
+  int max_write_set = 0;
+  int max_level = 0;
+  int max_level_width = 0;
+  int max_backward_colors = 0;
+  int backward_color_rounds = 0;
+  int forward_critical_rules = 0;
+  int backward_critical_rules = 0;
+  double avg_group_len = 0.0;
+  double avg_write_set = 0.0;
+  double forward_rule_parallel_upper = 1.0;
+  double backward_rule_parallel_upper = 1.0;
+  std::vector<int> group_len_hist;
+  std::vector<int> level_width_hist;
+  std::string summary;
+};
+
+std::string format_histogram_compact(const std::vector<int>& hist, const char* overflow_label)
+{
+  std::ostringstream out;
+  bool first = true;
+  for (int i = 0; i < static_cast<int>(hist.size()); ++i) {
+    if (hist[i] == 0) {
+      continue;
+    }
+    if (!first) {
+      out << ",";
+    }
+    if (i + 1 == static_cast<int>(hist.size()) && overflow_label != nullptr) {
+      out << overflow_label;
+    } else {
+      out << i;
+    }
+    out << ":" << hist[i];
+    first = false;
+  }
+  return first ? "none" : out.str();
+}
+
+bool sorted_vectors_intersect(const std::vector<int>& a, const std::vector<int>& b)
+{
+  size_t ia = 0;
+  size_t ib = 0;
+  while (ia < a.size() && ib < b.size()) {
+    if (a[ia] == b[ib]) {
+      return true;
+    }
+    if (a[ia] < b[ib]) {
+      ++ia;
+    } else {
+      ++ib;
+    }
+  }
+  return false;
+}
+
+void merge_sorted_unique(std::vector<int>& dst, const std::vector<int>& src)
+{
+  std::vector<int> merged;
+  merged.reserve(dst.size() + src.size());
+  std::set_union(dst.begin(), dst.end(), src.begin(), src.end(), std::back_inserter(merged));
+  dst.swap(merged);
+}
+
+ProductGraphAnalysis analyze_product_graph(
+  const SUS2HostModel& model,
+  const std::vector<int>& groups)
+{
+  ProductGraphAnalysis analysis;
+  analysis.group_count = static_cast<int>(groups.size() / 3);
+  analysis.rule_count = model.alpha_times_count;
+  analysis.group_len_hist.assign(17, 0);
+  if (analysis.group_count <= 0 || analysis.rule_count <= 0) {
+    analysis.summary = "empty product graph";
+    return analysis;
+  }
+
+  std::vector<int> moment_level(model.alpha_moments_count, 0);
+  std::vector<int> group_level(analysis.group_count, 0);
+  std::vector<int> group_len(analysis.group_count, 0);
+  std::vector<std::vector<int>> group_sources(analysis.group_count);
+  long long total_write_set = 0;
+
+  for (int g = 0; g < analysis.group_count; ++g) {
+    const int begin = groups[g * 3 + 0];
+    const int len = groups[g * 3 + 1];
+    const int dst = groups[g * 3 + 2];
+    group_len[g] = len;
+    analysis.max_group_len = std::max(analysis.max_group_len, len);
+    if (len <= 4) {
+      ++analysis.groups_len_le4;
+    }
+    if (len <= 8) {
+      ++analysis.groups_len_le8;
+    }
+    ++analysis.group_len_hist[std::min(len, 16)];
+
+    int level = 1;
+    std::vector<int> sources;
+    sources.reserve(static_cast<size_t>(len) * 2);
+    for (int k = 0; k < len; ++k) {
+      const int offset = (begin + k) * 4;
+      const int src0 = model.alpha_times[offset + 0];
+      const int src1 = model.alpha_times[offset + 1];
+      if (src0 >= 0 && src0 < model.alpha_moments_count) {
+        level = std::max(level, moment_level[src0] + 1);
+        sources.push_back(src0);
+      }
+      if (src1 >= 0 && src1 < model.alpha_moments_count) {
+        level = std::max(level, moment_level[src1] + 1);
+        sources.push_back(src1);
+      }
+    }
+    std::sort(sources.begin(), sources.end());
+    sources.erase(std::unique(sources.begin(), sources.end()), sources.end());
+    group_sources[g].swap(sources);
+    analysis.max_write_set =
+      std::max(analysis.max_write_set, static_cast<int>(group_sources[g].size()));
+    total_write_set += static_cast<long long>(group_sources[g].size());
+    group_level[g] = level;
+    analysis.max_level = std::max(analysis.max_level, level);
+    if (dst >= 0 && dst < model.alpha_moments_count) {
+      moment_level[dst] = level;
+    }
+  }
+
+  analysis.level_width_hist.assign(analysis.max_level + 1, 0);
+  std::vector<int> level_max_group_len(analysis.max_level + 1, 0);
+  std::vector<std::vector<int>> groups_by_level(analysis.max_level + 1);
+  for (int g = 0; g < analysis.group_count; ++g) {
+    const int level = group_level[g];
+    ++analysis.level_width_hist[level];
+    analysis.max_level_width = std::max(analysis.max_level_width, analysis.level_width_hist[level]);
+    level_max_group_len[level] = std::max(level_max_group_len[level], group_len[g]);
+    groups_by_level[level].push_back(g);
+  }
+  for (int level = 1; level <= analysis.max_level; ++level) {
+    analysis.forward_critical_rules += level_max_group_len[level];
+  }
+
+  for (int level = 1; level <= analysis.max_level; ++level) {
+    std::vector<std::vector<int>> color_sources;
+    std::vector<int> color_max_len;
+    for (int g : groups_by_level[level]) {
+      int chosen = -1;
+      for (int color = 0; color < static_cast<int>(color_sources.size()); ++color) {
+        if (!sorted_vectors_intersect(color_sources[color], group_sources[g])) {
+          chosen = color;
+          break;
+        }
+      }
+      if (chosen < 0) {
+        chosen = static_cast<int>(color_sources.size());
+        color_sources.emplace_back();
+        color_max_len.push_back(0);
+      }
+      merge_sorted_unique(color_sources[chosen], group_sources[g]);
+      color_max_len[chosen] = std::max(color_max_len[chosen], group_len[g]);
+    }
+    analysis.max_backward_colors =
+      std::max(analysis.max_backward_colors, static_cast<int>(color_sources.size()));
+    analysis.backward_color_rounds += static_cast<int>(color_sources.size());
+    for (int len : color_max_len) {
+      analysis.backward_critical_rules += len;
+    }
+  }
+
+  analysis.avg_group_len =
+    static_cast<double>(analysis.rule_count) / static_cast<double>(analysis.group_count);
+  analysis.avg_write_set =
+    static_cast<double>(total_write_set) / static_cast<double>(analysis.group_count);
+  if (analysis.forward_critical_rules > 0) {
+    analysis.forward_rule_parallel_upper =
+      static_cast<double>(analysis.rule_count) /
+      static_cast<double>(analysis.forward_critical_rules);
+  }
+  if (analysis.backward_critical_rules > 0) {
+    analysis.backward_rule_parallel_upper =
+      static_cast<double>(analysis.rule_count) /
+      static_cast<double>(analysis.backward_critical_rules);
+  }
+
+  std::ostringstream summary;
+  summary << "groups=" << analysis.group_count
+          << ", product_rules=" << analysis.rule_count
+          << ", avg_group_len=" << std::fixed << std::setprecision(2)
+          << analysis.avg_group_len
+          << ", max_group_len=" << analysis.max_group_len
+          << ", len_hist=" << format_histogram_compact(analysis.group_len_hist, "16+")
+          << ", len_le4=" << analysis.groups_len_le4
+          << ", len_le8=" << analysis.groups_len_le8
+          << ", levels=" << analysis.max_level
+          << ", max_level_width=" << analysis.max_level_width
+          << ", avg_write_set=" << std::setprecision(2) << analysis.avg_write_set
+          << ", max_write_set=" << analysis.max_write_set
+          << ", backward_colors_max=" << analysis.max_backward_colors
+          << ", backward_color_rounds=" << analysis.backward_color_rounds
+          << ", forward_rule_parallel_upper=" << std::setprecision(2)
+          << analysis.forward_rule_parallel_upper
+          << ", backward_rule_parallel_upper=" << std::setprecision(2)
+          << analysis.backward_rule_parallel_upper;
+  analysis.summary = summary.str();
+  return analysis;
 }
 
 bool supports_product_assign(const SUS2HostModel& model)
@@ -7692,6 +7903,8 @@ SUS2_V11::SUS2_V11(
     packed_alpha_time_groups.push_back(dst);
   }
   alpha_time_group_count_ = static_cast<int>(packed_alpha_time_groups.size() / 3);
+  const ProductGraphAnalysis product_graph_analysis =
+    analyze_product_graph(host_model, packed_alpha_time_groups);
   alpha_time_groups_.resize(packed_alpha_time_groups.size());
   alpha_time_groups_.copy_from_host(packed_alpha_time_groups.data());
   if (use_graph_specific_product_) {
@@ -7865,6 +8078,9 @@ SUS2_V11::SUS2_V11(
   if (use_product_assign_) {
     printf(
       "SUS2 v1.1 GPUMD product graph micro-optimization: product moments use assign-forward and skip moment-value memset.\n");
+    printf(
+      "SUS2 v1.1 GPUMD product graph analyzer: %s.\n",
+      product_graph_analysis.summary.c_str());
     if (use_graph_specific_product_) {
       printf(
         "SUS2 v1.1 GPUMD graph-specific product path: packed product-group plan, groups=%d, product_rules=%d, grad_init=%d.\n",
