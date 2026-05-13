@@ -700,3 +700,96 @@ again within the float-order scale. Product remains the dominant gap versus the
 old moment backend, so the next serious direction is still a more compact
 standard layer program for the layer-1 pair tensor contractions and terminal
 scalar contractions, not more force work.
+
+Accepted product changes after the two-model optimization pass:
+
+- Active scalar seeding now stores only scalar moments that still need a
+  separate seed after terminal scalar fusion. This removes the loop over the
+  full scalar list in the compact, flat, cg-block, and tensor-parallel product
+  paths.
+- The back-row metadata can be packed into `uint32` row and term words. This is
+  enabled only when the model also uses the parallel back-row path; on smaller
+  graphs such as l3322 the old in-kernel back-row loop is faster.
+- The compact terminal-scalar path now uses an explicit terminal-row predicate,
+  which keeps the same chain rule but makes later row-scalar experiments
+  possible.
+- `sus2_sh_row_scalar_fusion=1` is available as an experimental option, but is
+  not the default because same-binary off/on timing showed no reliable extra
+  speed beyond the terminal-row restructuring.
+
+Same-GPU A/B on `c04u01g`, 1,024,000 atom Cu-Zr, 200 NPT steps:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_rowscalar_ab_20260513
+
+l3333, default row scalar off:
+  terminal_scalars = 545
+  active_scalar_seeds = 27
+  product ~= 58.33-58.36 ms/step
+  speed   = 1.09579e7 atom*step/s
+
+l3333, row scalar on:
+  active_scalar_seeds = 3
+  product ~= 58.33 ms/step
+  speed   = 1.09553e7 atom*step/s
+
+l3322, default row scalar off:
+  terminal_scalars = 240
+  active_scalar_seeds = 21
+  product ~= 14.98-14.99 ms/step
+  speed   = 2.12200e7 atom*step/s
+
+l3322, row scalar on:
+  active_scalar_seeds = 3
+  product ~= 14.98-14.99 ms/step
+  speed   = 2.12581e7 atom*step/s
+```
+
+The row-scalar off/on `run 1` A/B showed only float-order differences:
+total-energy changes were about `1.1e-1` eV for l3333 and `4.4e-2` eV for
+l3322 over the million-atom box, i.e. about `1e-7` eV/atom or less. Because the
+timing gain was not distinct from noise, the row-scalar option stays off by
+default.
+
+Follow-up math check, same code, l3333 model, first 4096 atoms, `time_step 0`,
+`dump_force 1`, `run 1`:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_rowscalar_mathcheck_20260513
+
+float, row scalar off/on:
+  total energy diff = 7.7e-5 eV over 4096 atoms
+  force max abs diff = 7.674e-6
+  force rms diff     = 7.886e-7
+
+double, row scalar off/on:
+  total energy diff = 0 at printed precision
+  force max abs diff = 1.192e-7
+  force rms diff     = 9.331e-9
+
+float off versus double off:
+  force max abs diff = 4.295e-5
+  force rms diff     = 1.874e-6
+```
+
+This separates trajectory divergence from the algebra. Row-scalar fusion changes
+where scalar site-energy contributions and gradient seeds are accumulated, but
+does not change the tensor-product expression in exact arithmetic. The double
+off/on result is essentially identical at output precision, and the float off/on
+force difference is smaller than the normal float-versus-double force difference.
+The larger differences seen after hundreds of NPT steps are therefore consistent
+with finite-precision summation order and chaotic trajectory divergence, not a
+missing CG contraction or chain-rule term. The option remains experimental and
+off by default because it also has no clear speed benefit.
+
+The next product strategy should exploit the fact that SH coupling topology is
+independent of `k`: CG term patterns depend on `(l1,l2,L,m)` while `k` only
+selects radial channels and tensor instances. A useful implementation must
+batch multiple `k` instances of the same `(l1,l2,L)` topology so coefficient
+loads and selected left/right component values can be reused. Merely storing a
+single copy of the CG coefficient table is unlikely to be enough, because the
+current constant-memory row table is already cheap; the target is reduced
+global moment traffic and fewer repeated per-row loops. The safest first
+experiment is a limited terminal-scalar or layer-1 pair-tensor microkernel for
+the hottest `(l1,l2,L)` groups, with the compact row program retained as the
+correctness fallback.

@@ -556,6 +556,25 @@ bool parse_sh_parallel_back_rows(const SHHostModel& model, int nopts, const char
   return use_parallel;
 }
 
+bool parse_sh_packed_back_rows(const SHHostModel& model, int nopts, const char** opts)
+{
+  bool use_packed = true;
+  const char* env = std::getenv("SUS2_SH_GPUMD_PACKED_BACK_ROWS");
+  if (env != nullptr) {
+    use_packed = parse_bool_value(env, "SUS2_SH_GPUMD_PACKED_BACK_ROWS");
+  }
+  const int begin = std::min(nopts, model.species_count);
+  for (int i = begin; i < nopts; ++i) {
+    const std::string option = opts[i] == nullptr ? "" : opts[i];
+    if (starts_with(option, "sus2_sh_packed_back_rows=") ||
+        starts_with(option, "sus2_packed_back_rows=")) {
+      const size_t eq = option.find('=');
+      use_packed = parse_bool_value(option.substr(eq + 1), option.substr(0, eq));
+    }
+  }
+  return use_packed;
+}
+
 bool parse_sh_static_basic(const SHHostModel& model, int nopts, const char** opts)
 {
   bool use_static = true;
@@ -606,6 +625,25 @@ bool parse_sh_terminal_scalar_fusion(const SHHostModel& model, int nopts, const 
     const std::string option = opts[i] == nullptr ? "" : opts[i];
     if (starts_with(option, "sus2_sh_terminal_scalar_fusion=") ||
         starts_with(option, "sus2_terminal_scalar_fusion=")) {
+      const size_t eq = option.find('=');
+      use_fusion = parse_bool_value(option.substr(eq + 1), option.substr(0, eq));
+    }
+  }
+  return use_fusion;
+}
+
+bool parse_sh_row_scalar_fusion(const SHHostModel& model, int nopts, const char** opts)
+{
+  bool use_fusion = false;
+  const char* env = std::getenv("SUS2_SH_GPUMD_ROW_SCALAR_FUSION");
+  if (env != nullptr) {
+    use_fusion = parse_bool_value(env, "SUS2_SH_GPUMD_ROW_SCALAR_FUSION");
+  }
+  const int begin = std::min(nopts, model.species_count);
+  for (int i = begin; i < nopts; ++i) {
+    const std::string option = opts[i] == nullptr ? "" : opts[i];
+    if (starts_with(option, "sus2_sh_row_scalar_fusion=") ||
+        starts_with(option, "sus2_row_scalar_fusion=")) {
       const size_t eq = option.find('=');
       use_fusion = parse_bool_value(option.substr(eq + 1), option.substr(0, eq));
     }
@@ -1692,6 +1730,7 @@ struct SHDeviceModel {
   int sh_cg_layer_count;
   int alpha_moments_count;
   int alpha_scalar_moments;
+  int active_scalar_moments;
   double max_dist;
   const double* shift_coeffs;
   const double* species_coeffs;
@@ -1719,6 +1758,10 @@ struct SHDeviceModel {
   const double* sh_cg_back_terms_coeff;
   const float* sh_cg_back_terms_coeff_float;
   const int* sh_cg_back_layer_offsets;
+  const unsigned int* sh_cg_back_packed_u32;
+  const int* active_scalar_moment;
+  const double* active_scalar_coeff;
+  const float* active_scalar_coeff_float;
   const int* sh_cg_layer_offsets;
   const int* alpha_moment_mapping;
   const float* radial_direct_coeffs;
@@ -1726,6 +1769,7 @@ struct SHDeviceModel {
   bool use_float_model_params;
   bool use_const_forward_rows;
   bool use_terminal_scalar_fusion;
+  bool use_packed_back_rows;
 };
 
 template <typename RealT>
@@ -1747,6 +1791,13 @@ __device__ __forceinline__ RealT sh_moment_coeff(const SHDeviceModel& model, int
 {
   return model.use_float_model_params ? static_cast<RealT>(model.moment_coeffs_float[idx])
                                       : static_cast<RealT>(model.moment_coeffs[idx]);
+}
+
+template <typename RealT>
+__device__ __forceinline__ RealT sh_active_scalar_coeff(const SHDeviceModel& model, int idx)
+{
+  return model.use_float_model_params ? static_cast<RealT>(model.active_scalar_coeff_float[idx])
+                                      : static_cast<RealT>(model.active_scalar_coeff[idx]);
 }
 
 template <typename RealT>
@@ -2452,9 +2503,9 @@ static __global__ void gpu_sh_forward_energy_backward(
   const int type_i = type[i];
   const RealT center_coeff = sh_species_coeff<RealT>(model, type_i);
   RealT site_energy = sh_shift_coeff<RealT>(model, type_i) + center_coeff;
-  for (int s = 0; s < model.alpha_scalar_moments; ++s) {
-    const int moment_id = model.alpha_moment_mapping[s];
-    const RealT coeff = sh_moment_coeff<RealT>(model, s);
+  for (int s = 0; s < model.active_scalar_moments; ++s) {
+    const int moment_id = model.active_scalar_moment[s];
+    const RealT coeff = sh_active_scalar_coeff<RealT>(model, s);
     site_energy += center_coeff * coeff * moments[static_cast<size_t>(moment_id) * N + i];
     grads[static_cast<size_t>(moment_id) * N + i] += static_cast<GradT>(center_coeff * coeff);
   }
@@ -2515,9 +2566,9 @@ static __global__ void gpu_sh_forward_energy_backward_cg_blocks(
   const int type_i = type[i];
   const RealT center_coeff = sh_species_coeff<RealT>(model, type_i);
   RealT site_energy = sh_shift_coeff<RealT>(model, type_i) + center_coeff;
-  for (int s = 0; s < model.alpha_scalar_moments; ++s) {
-    const int moment_id = model.alpha_moment_mapping[s];
-    const RealT coeff = sh_moment_coeff<RealT>(model, s);
+  for (int s = 0; s < model.active_scalar_moments; ++s) {
+    const int moment_id = model.active_scalar_moment[s];
+    const RealT coeff = sh_active_scalar_coeff<RealT>(model, s);
     site_energy += center_coeff * coeff * moments[static_cast<size_t>(moment_id) * N + i];
     grads[static_cast<size_t>(moment_id) * N + i] += static_cast<GradT>(center_coeff * coeff);
   }
@@ -2600,9 +2651,9 @@ static __global__ void gpu_sh_energy_init_from_scalars(
   const int type_i = type[i];
   const RealT center_coeff = sh_species_coeff<RealT>(model, type_i);
   RealT site_energy = sh_shift_coeff<RealT>(model, type_i) + center_coeff;
-  for (int s = 0; s < model.alpha_scalar_moments; ++s) {
-    const int moment_id = model.alpha_moment_mapping[s];
-    const RealT coeff = sh_moment_coeff<RealT>(model, s);
+  for (int s = 0; s < model.active_scalar_moments; ++s) {
+    const int moment_id = model.active_scalar_moment[s];
+    const RealT coeff = sh_active_scalar_coeff<RealT>(model, s);
     site_energy += center_coeff * coeff * moments[static_cast<size_t>(moment_id) * N + i];
     grads[static_cast<size_t>(moment_id) * N + i] += static_cast<GradT>(center_coeff * coeff);
   }
@@ -2671,17 +2722,41 @@ static __global__ void gpu_sh_tensor_product_back_rows(
        task += stride) {
     const int atom = static_cast<int>(task % static_cast<size_t>(N));
     const int row = row_begin + static_cast<int>(task / static_cast<size_t>(N));
-    const int row_base = row * 3;
-    const int source = model.sh_cg_back_rows_int[row_base + 0];
-    const int term_begin = model.sh_cg_back_rows_int[row_base + 1];
-    const int term_count = model.sh_cg_back_rows_int[row_base + 2];
+    int source;
+    int term_begin;
+    int term_count;
+    if (model.use_packed_back_rows) {
+      const unsigned int row0 = model.sh_cg_back_packed_u32[static_cast<size_t>(row) * 2 + 0];
+      source = static_cast<int>(row0 & 0xffffu);
+      term_count = static_cast<int>(row0 >> 16);
+      term_begin =
+        static_cast<int>(model.sh_cg_back_packed_u32[static_cast<size_t>(row) * 2 + 1]);
+    } else {
+      const int row_base = row * 3;
+      source = model.sh_cg_back_rows_int[row_base + 0];
+      term_begin = model.sh_cg_back_rows_int[row_base + 1];
+      term_count = model.sh_cg_back_rows_int[row_base + 2];
+    }
     RealT sum = static_cast<RealT>(0.0);
     for (int t = 0; t < term_count; ++t) {
       const int term = term_begin + t;
-      const int term_base = term * 2;
-      const int target = model.sh_cg_back_terms_int[term_base + 0];
-      const int other = model.sh_cg_back_terms_int[term_base + 1];
-      const RealT coeff = sh_cg_back_term_coeff<RealT>(model, term);
+      int target;
+      int other;
+      RealT coeff;
+      if (model.use_packed_back_rows) {
+        const size_t packed_base =
+          static_cast<size_t>(model.sh_cg_back_row_count) * 2 +
+          static_cast<size_t>(term) * 2;
+        const unsigned int meta = model.sh_cg_back_packed_u32[packed_base + 0];
+        target = static_cast<int>(meta & 0xffffu);
+        other = static_cast<int>(meta >> 16);
+        coeff = sh_const_forward_coeff<RealT>(model.sh_cg_back_packed_u32[packed_base + 1]);
+      } else {
+        const int term_base = term * 2;
+        target = model.sh_cg_back_terms_int[term_base + 0];
+        other = model.sh_cg_back_terms_int[term_base + 1];
+        coeff = sh_cg_back_term_coeff<RealT>(model, term);
+      }
       sum += coeff * static_cast<RealT>(grads[static_cast<size_t>(target) * N + atom]) *
              moments[static_cast<size_t>(other) * N + atom];
     }
@@ -2738,7 +2813,10 @@ static __global__ void gpu_sh_forward_energy_backward_compact_rows(
       const int scalar_index = model.use_terminal_scalar_fusion
         ? model.sh_cg_row_scalar_index[row]
         : -1;
-      const RealT terminal_gtarget = scalar_index >= 0
+      const bool scalar_row = scalar_index >= 0;
+      const bool terminal_scalar_row =
+        scalar_row && model.sh_terminal_moment_flags[target] != 0;
+      const RealT scalar_gtarget = scalar_row
         ? center_coeff * sh_moment_coeff<RealT>(model, scalar_index)
         : static_cast<RealT>(0.0);
       for (int t = 0; t < term_count; ++t) {
@@ -2763,28 +2841,30 @@ static __global__ void gpu_sh_forward_energy_backward_compact_rows(
         const RealT left_value = moments[static_cast<size_t>(left) * N + atom];
         const RealT right_value = moments[static_cast<size_t>(right) * N + atom];
         sum += coeff * left_value * right_value;
-        if (scalar_index >= 0) {
-          const RealT weighted = coeff * terminal_gtarget;
+        if (terminal_scalar_row) {
+          const RealT weighted = coeff * scalar_gtarget;
           grads[static_cast<size_t>(left) * N + atom] +=
             static_cast<GradT>(weighted * right_value);
           grads[static_cast<size_t>(right) * N + atom] +=
             static_cast<GradT>(weighted * left_value);
         }
       }
-      if (scalar_index >= 0) {
-        site_energy += terminal_gtarget * sum;
-      } else {
-        moments[static_cast<size_t>(target) * N + atom] = sum;
+      if (scalar_row) {
+        site_energy += scalar_gtarget * sum;
+      }
+      if (terminal_scalar_row) {
+        continue;
+      }
+      moments[static_cast<size_t>(target) * N + atom] = sum;
+      if (scalar_row) {
+        grads[static_cast<size_t>(target) * N + atom] += static_cast<GradT>(scalar_gtarget);
       }
     }
   }
 
-  for (int s = 0; s < model.alpha_scalar_moments; ++s) {
-    const int moment_id = model.alpha_moment_mapping[s];
-    if (model.use_terminal_scalar_fusion && model.sh_terminal_moment_flags[moment_id]) {
-      continue;
-    }
-    const RealT coeff = sh_moment_coeff<RealT>(model, s);
+  for (int s = 0; s < model.active_scalar_moments; ++s) {
+    const int moment_id = model.active_scalar_moment[s];
+    const RealT coeff = sh_active_scalar_coeff<RealT>(model, s);
     site_energy += center_coeff * coeff * moments[static_cast<size_t>(moment_id) * N + atom];
     grads[static_cast<size_t>(moment_id) * N + atom] +=
       static_cast<GradT>(center_coeff * coeff);
@@ -2799,17 +2879,41 @@ static __global__ void gpu_sh_forward_energy_backward_compact_rows(
     const int row_begin = model.sh_cg_back_layer_offsets[layer];
     const int row_end = model.sh_cg_back_layer_offsets[layer + 1];
     for (int row = row_begin; row < row_end; ++row) {
-      const int row_base = row * 3;
-      const int source = model.sh_cg_back_rows_int[row_base + 0];
-      const int term_begin = model.sh_cg_back_rows_int[row_base + 1];
-      const int term_count = model.sh_cg_back_rows_int[row_base + 2];
+      int source;
+      int term_begin;
+      int term_count;
+      if (model.use_packed_back_rows) {
+        const unsigned int row0 = model.sh_cg_back_packed_u32[static_cast<size_t>(row) * 2 + 0];
+        source = static_cast<int>(row0 & 0xffffu);
+        term_count = static_cast<int>(row0 >> 16);
+        term_begin =
+          static_cast<int>(model.sh_cg_back_packed_u32[static_cast<size_t>(row) * 2 + 1]);
+      } else {
+        const int row_base = row * 3;
+        source = model.sh_cg_back_rows_int[row_base + 0];
+        term_begin = model.sh_cg_back_rows_int[row_base + 1];
+        term_count = model.sh_cg_back_rows_int[row_base + 2];
+      }
       RealT sum = static_cast<RealT>(0.0);
       for (int t = 0; t < term_count; ++t) {
         const int term = term_begin + t;
-        const int term_base = term * 2;
-        const int target = model.sh_cg_back_terms_int[term_base + 0];
-        const int other = model.sh_cg_back_terms_int[term_base + 1];
-        const RealT coeff = sh_cg_back_term_coeff<RealT>(model, term);
+        int target;
+        int other;
+        RealT coeff;
+        if (model.use_packed_back_rows) {
+          const size_t packed_base =
+            static_cast<size_t>(model.sh_cg_back_row_count) * 2 +
+            static_cast<size_t>(term) * 2;
+          const unsigned int meta = model.sh_cg_back_packed_u32[packed_base + 0];
+          target = static_cast<int>(meta & 0xffffu);
+          other = static_cast<int>(meta >> 16);
+          coeff = sh_const_forward_coeff<RealT>(model.sh_cg_back_packed_u32[packed_base + 1]);
+        } else {
+          const int term_base = term * 2;
+          target = model.sh_cg_back_terms_int[term_base + 0];
+          other = model.sh_cg_back_terms_int[term_base + 1];
+          coeff = sh_cg_back_term_coeff<RealT>(model, term);
+        }
         sum += coeff * static_cast<RealT>(grads[static_cast<size_t>(target) * N + atom]) *
                moments[static_cast<size_t>(other) * N + atom];
       }
@@ -3557,6 +3661,9 @@ SUS2_SH::SUS2_SH(
     parse_sh_const_forward_rows(host_model, num_potential_options, potential_options);
   use_parallel_back_rows_ =
     parse_sh_parallel_back_rows(host_model, num_potential_options, potential_options);
+  use_packed_back_rows_ =
+    parse_sh_packed_back_rows(host_model, num_potential_options, potential_options) &&
+    use_float_moments_ && use_parallel_back_rows_;
   if (use_tensor_product_parallel_) {
     use_cg_block_forward_ = false;
     use_compact_serial_product_ = false;
@@ -3582,6 +3689,9 @@ SUS2_SH::SUS2_SH(
   use_terminal_scalar_fusion_ =
     parse_sh_terminal_scalar_fusion(host_model, num_potential_options, potential_options) &&
     use_compact_serial_product_;
+  use_row_scalar_fusion_ =
+    parse_sh_row_scalar_fusion(host_model, num_potential_options, potential_options) &&
+    use_terminal_scalar_fusion_;
 
   shift_coeffs_.resize(host_model.shift_coeffs.size());
   shift_coeffs_.copy_from_host(host_model.shift_coeffs.data());
@@ -3707,6 +3817,7 @@ SUS2_SH::SUS2_SH(
   }
 
   std::vector<int> terminal_moment_flags(alpha_moments_count_, 0);
+  std::vector<int> row_scalar_moment_flags(alpha_moments_count_, 0);
   std::vector<int> cg_row_scalar_index(sh_cg_row_count_, -1);
   int terminal_scalar_count = 0;
   if (use_terminal_scalar_fusion_) {
@@ -3735,14 +3846,23 @@ SUS2_SH::SUS2_SH(
     for (int row = 0; row < sh_cg_row_count_; ++row) {
       const int target = host_model.cg_rows[row].target;
       if (target >= 0 && target < alpha_moments_count_ &&
-          scalar_index_by_moment[target] >= 0 && !used_as_source[target]) {
-        terminal_moment_flags[target] = 1;
-        cg_row_scalar_index[row] = scalar_index_by_moment[target];
-        ++terminal_scalar_count;
+          scalar_index_by_moment[target] >= 0) {
+        if (use_row_scalar_fusion_) {
+          row_scalar_moment_flags[target] = 1;
+          cg_row_scalar_index[row] = scalar_index_by_moment[target];
+        }
+        if (!used_as_source[target]) {
+          terminal_moment_flags[target] = 1;
+          cg_row_scalar_index[row] = scalar_index_by_moment[target];
+          ++terminal_scalar_count;
+        }
       }
     }
     if (terminal_scalar_count == 0) {
       use_terminal_scalar_fusion_ = false;
+      use_row_scalar_fusion_ = false;
+      std::fill(cg_row_scalar_index.begin(), cg_row_scalar_index.end(), -1);
+      std::fill(row_scalar_moment_flags.begin(), row_scalar_moment_flags.end(), 0);
     }
   }
   sh_cg_row_scalar_index_.resize(cg_row_scalar_index.size());
@@ -3752,6 +3872,42 @@ SUS2_SH::SUS2_SH(
   sh_terminal_moment_flags_.resize(terminal_moment_flags.size());
   if (!terminal_moment_flags.empty()) {
     sh_terminal_moment_flags_.copy_from_host(terminal_moment_flags.data());
+  }
+
+  std::vector<int> active_scalar_moments_host;
+  std::vector<double> active_scalar_coeffs_host;
+  active_scalar_moments_host.reserve(alpha_scalar_moments_);
+  active_scalar_coeffs_host.reserve(alpha_scalar_moments_);
+  for (int s = 0; s < alpha_scalar_moments_; ++s) {
+    const int moment = host_model.alpha_moment_mapping[s];
+    const bool skip_terminal =
+      use_terminal_scalar_fusion_ && moment >= 0 && moment < alpha_moments_count_ &&
+      terminal_moment_flags[moment];
+    const bool skip_row_scalar =
+      use_row_scalar_fusion_ && moment >= 0 && moment < alpha_moments_count_ &&
+      row_scalar_moment_flags[moment];
+    if (skip_terminal || skip_row_scalar) {
+      continue;
+    }
+    active_scalar_moments_host.push_back(moment);
+    active_scalar_coeffs_host.push_back(host_model.moment_coeffs[s]);
+  }
+  active_scalar_moments_ = static_cast<int>(active_scalar_moments_host.size());
+  active_scalar_moment_.resize(active_scalar_moments_host.size());
+  if (!active_scalar_moments_host.empty()) {
+    active_scalar_moment_.copy_from_host(active_scalar_moments_host.data());
+  }
+  active_scalar_coeff_.resize(active_scalar_coeffs_host.size());
+  if (!active_scalar_coeffs_host.empty()) {
+    active_scalar_coeff_.copy_from_host(active_scalar_coeffs_host.data());
+  }
+  if (use_float_moments_) {
+    std::vector<float> active_scalar_coeffs_f(
+      active_scalar_coeffs_host.begin(), active_scalar_coeffs_host.end());
+    active_scalar_coeff_float_.resize(active_scalar_coeffs_f.size());
+    if (!active_scalar_coeffs_f.empty()) {
+      active_scalar_coeff_float_.copy_from_host(active_scalar_coeffs_f.data());
+    }
   }
 
   const int const_forward_u32_count = sh_cg_row_count_ * 3 + sh_cg_row_term_count_ * 2;
@@ -3890,6 +4046,52 @@ SUS2_SH::SUS2_SH(
       sh_cg_back_terms_coeff_float_.copy_from_host(cg_back_term_coeffs_f.data());
     }
   }
+  if (use_packed_back_rows_) {
+    const size_t packed_count =
+      static_cast<size_t>(sh_cg_back_row_count_) * 2 +
+      static_cast<size_t>(sh_cg_back_term_count_) * 2;
+    std::vector<unsigned int> packed_back(packed_count, 0u);
+    for (int row = 0; row < sh_cg_back_row_count_ && use_packed_back_rows_; ++row) {
+      const int row_base = row * 3;
+      const int source = cg_back_row_ints[row_base + 0];
+      const int term_begin = cg_back_row_ints[row_base + 1];
+      const int term_count = cg_back_row_ints[row_base + 2];
+      if (source < 0 || source > 0xffff || term_count < 0 || term_count > 0xffff) {
+        use_packed_back_rows_ = false;
+        break;
+      }
+      packed_back[static_cast<size_t>(row) * 2 + 0] =
+        static_cast<unsigned int>(source) |
+        (static_cast<unsigned int>(term_count) << 16);
+      packed_back[static_cast<size_t>(row) * 2 + 1] = static_cast<unsigned int>(term_begin);
+    }
+    const size_t term_offset = static_cast<size_t>(sh_cg_back_row_count_) * 2;
+    for (int term = 0; term < sh_cg_back_term_count_ && use_packed_back_rows_; ++term) {
+      const int term_base = term * 2;
+      const int target = cg_back_term_ints[term_base + 0];
+      const int other = cg_back_term_ints[term_base + 1];
+      if (target < 0 || target > 0xffff || other < 0 || other > 0xffff) {
+        use_packed_back_rows_ = false;
+        break;
+      }
+      packed_back[term_offset + static_cast<size_t>(term) * 2 + 0] =
+        static_cast<unsigned int>(target) |
+        (static_cast<unsigned int>(other) << 16);
+      const float coeff = static_cast<float>(cg_back_term_coeffs[term]);
+      unsigned int coeff_bits = 0u;
+      std::memcpy(&coeff_bits, &coeff, sizeof(coeff_bits));
+      packed_back[term_offset + static_cast<size_t>(term) * 2 + 1] = coeff_bits;
+    }
+    if (use_packed_back_rows_) {
+      sh_cg_back_packed_u32_.resize(packed_back.size());
+      if (!packed_back.empty()) {
+        sh_cg_back_packed_u32_.copy_from_host(packed_back.data());
+      }
+    }
+  }
+  if (!use_packed_back_rows_) {
+    sh_cg_back_packed_u32_.resize(0);
+  }
   sh_cg_back_layer_offsets_.resize(device_back_layer_offsets.size());
   if (!device_back_layer_offsets.empty()) {
     sh_cg_back_layer_offsets_.copy_from_host(device_back_layer_offsets.data());
@@ -3922,16 +4124,18 @@ SUS2_SH::SUS2_SH(
     alpha_scalar_moments_,
     rc);
   printf(
-    "SUS2-SH GPUMD precision mode: %s; force self-buffer: %s; force basic-grad cache: %s; static basic: %s; static force: %s; terminal scalar fusion: %s; cg-block forward: %s; compact serial product: %s; parallel back rows: %s; const forward rows: %s; tensor-product parallel: %s; tensor grid cap=%d.\n",
+    "SUS2-SH GPUMD precision mode: %s; force self-buffer: %s; force basic-grad cache: %s; static basic: %s; static force: %s; terminal scalar fusion: %s; row scalar fusion: %s; cg-block forward: %s; compact serial product: %s; parallel back rows: %s; packed back rows: %s; const forward rows: %s; tensor-product parallel: %s; tensor grid cap=%d.\n",
     use_float_moments_ ? "NEP-like float moments/gradients/local arithmetic" : "double moments/local arithmetic",
     use_force_self_buffer_ ? "on" : "off",
     use_force_grad_cache_ ? "on" : "off",
     use_static_basic_layout_ ? "on" : "off",
     use_static_force_layout_ ? "on" : "off",
     use_terminal_scalar_fusion_ ? "on" : "off",
+    use_row_scalar_fusion_ ? "on" : "off",
     use_cg_block_forward_ ? "on" : "off",
     use_compact_serial_product_ ? "on" : "off",
     use_parallel_back_rows_ ? "on" : "off",
+    use_packed_back_rows_ ? "on" : "off",
     use_const_forward_rows_ ? "on" : "off",
     use_tensor_product_parallel_ ? "on" : "off",
     tensor_product_grid_cap_);
@@ -3947,8 +4151,9 @@ SUS2_SH::SUS2_SH(
     host_model.sh_standard_cg_layers);
   if (use_terminal_scalar_fusion_) {
     printf(
-      "SUS2-SH terminal scalar fusion: terminal_scalars=%d, removed_back_terms=%d.\n",
+      "SUS2-SH terminal scalar fusion: terminal_scalars=%d, active_scalar_seeds=%d, removed_back_terms=%d.\n",
       terminal_scalar_count,
+      active_scalar_moments_,
       removed_terminal_back_terms);
   }
   if (profile_enabled_) {
@@ -4135,6 +4340,7 @@ void SUS2_SH::compute(
     sh_cg_layer_count_,
     alpha_moments_count_,
     alpha_scalar_moments_,
+    active_scalar_moments_,
     rc,
     shift_coeffs_.data(),
     species_coeffs_.data(),
@@ -4162,13 +4368,18 @@ void SUS2_SH::compute(
     sh_cg_back_terms_coeff_.data(),
     use_float_moments_ ? sh_cg_back_terms_coeff_float_.data() : nullptr,
     sh_cg_back_layer_offsets_.data(),
+    use_packed_back_rows_ ? sh_cg_back_packed_u32_.data() : nullptr,
+    active_scalar_moment_.data(),
+    active_scalar_coeff_.data(),
+    use_float_moments_ ? active_scalar_coeff_float_.data() : nullptr,
     sh_cg_layer_offsets_.data(),
     alpha_moment_mapping_.data(),
     radial_direct_coeffs_.data(),
     radial_direct_scal_s_.data(),
     use_float_moments_,
     use_const_forward_rows_,
-    use_terminal_scalar_fusion_};
+    use_terminal_scalar_fusion_,
+    use_packed_back_rows_};
 
   float* force_self_tmp_ptr = use_force_self_buffer_ ? force_self_tmp_.data() : nullptr;
   if (use_float_moments_) {

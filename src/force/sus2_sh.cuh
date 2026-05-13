@@ -48,6 +48,7 @@ private:
   int sh_cg_layer_count_ = 0;
   int alpha_moments_count_ = 0;
   int alpha_scalar_moments_ = 0;
+  int active_scalar_moments_ = 0;
   int neighbor_capacity_ = 512;
   double rc = 0.0;
   bool use_float_moments_ = true;
@@ -62,6 +63,8 @@ private:
   bool use_static_force_layout_ = false;
   bool use_parallel_back_rows_ = false;
   bool use_terminal_scalar_fusion_ = false;
+  bool use_row_scalar_fusion_ = false;
+  bool use_packed_back_rows_ = false;
   bool use_cached_neighbor_displacements_ = false;
   bool profile_enabled_ = false;
   int profile_interval_ = 50;
@@ -95,6 +98,10 @@ private:
   GPU_Vector<double> sh_cg_back_terms_coeff_;
   GPU_Vector<float> sh_cg_back_terms_coeff_float_;
   GPU_Vector<int> sh_cg_back_layer_offsets_;
+  GPU_Vector<unsigned int> sh_cg_back_packed_u32_;
+  GPU_Vector<int> active_scalar_moment_;
+  GPU_Vector<double> active_scalar_coeff_;
+  GPU_Vector<float> active_scalar_coeff_float_;
   GPU_Vector<int> sh_cg_layer_offsets_;
   GPU_Vector<int> alpha_moment_mapping_;
   GPU_Vector<float> radial_direct_coeffs_;
