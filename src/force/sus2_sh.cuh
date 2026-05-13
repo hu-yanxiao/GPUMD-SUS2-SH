@@ -46,7 +46,12 @@ private:
   bool use_float_moments_ = true;
   bool use_radial_direct_ = true;
   bool use_force_self_buffer_ = true;
+  bool use_force_grad_cache_ = false;
   bool use_cached_neighbor_displacements_ = false;
+  bool profile_enabled_ = false;
+  int profile_interval_ = 50;
+  int profile_steps_ = 0;
+  double profile_ms_[6];
 
   GPU_Vector<double> shift_coeffs_;
   GPU_Vector<double> species_coeffs_;
@@ -55,6 +60,7 @@ private:
   GPU_Vector<float> species_coeffs_float_;
   GPU_Vector<float> moment_coeffs_float_;
   GPU_Vector<int> alpha_basic_;
+  GPU_Vector<int> alpha_basic_mu_yidx_;
   GPU_Vector<int> sh_products_int_;
   GPU_Vector<double> sh_products_coeff_;
   GPU_Vector<float> sh_products_coeff_float_;

@@ -273,3 +273,59 @@ The benchmark directory should be under the new server project, for example:
 
 Do not mix new SH benchmark outputs into the old `GPUMD-SUS2-v1.1-work-codex`
 tree except as read-only references.
+
+## Optimization Notes
+
+First 1,024,000 atom Cu-Zr SH benchmark:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_l3k3_1m_first_profile200_20260513
+steps = 200
+time = 44.0047 s
+speed = 4.65405e6 atom*step/s
+```
+
+Profile on the same model shows the generic flat `sh_products` path is not the
+final SH direction:
+
+```text
+neighbor   ~= 7.2 ms/step
+memset     ~= 5.9 ms/step
+basic      ~= 43.3 ms/step
+product    ~= 71.3 ms/step
+force      ~= 89.8 ms/step
+accumulate ~= 0.15 ms/step
+```
+
+The first accepted low-risk optimization packs basic metadata from `(mu,l,m)` to
+`(mu,yidx)`, where `yidx = l*l + (m+l)`. This reduces repeated integer loads and
+index arithmetic in both basic and force kernels without changing any floating
+point operation order.
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_l3k3_1m_packedbasic_200_20260513
+steps = 200
+time = 42.933 s
+speed = 4.77022e6 atom*step/s
+```
+
+The tested force basic-gradient cache did not improve performance and is kept
+disabled by default. It can still be enabled with `sus2_sh_force_grad_cache=1`
+for experiments when `alpha_index_basic_count <= 64`.
+
+The next material optimization should not continue tuning the flat product DAG.
+SUS2-SH's intended engineering advantage is a standardized block/layer
+execution model:
+
+```text
+basic block:   base, k, mu, l, count = 2*l + 1
+CG block:      layer, left_block, right_block, target_base, l1, l2, L
+CG terms:      M_offset, m1_offset, m2_offset, coeff
+scalar map:    scalar_index -> block/component or moment id
+```
+
+For long-term robustness, SUS2-SH model generation should write explicit
+`sh_cg_blocks`, `sh_cg_terms`, and `sh_cg_layers` metadata, together with the
+real-SH and CG phase convention/version. GPUMD can then validate and execute the
+standard representation directly instead of inferring it from a flat product
+list.

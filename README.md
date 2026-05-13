@@ -28,6 +28,8 @@ The first SH path prioritizes correctness:
   order and reversed for forces;
 - `RBChebyshev_sss`, `scaling_map = LK`, float moments, and direct radial
   recurrence are the default supported path.
+- basic metadata is packed as `(mu,yidx)` for the current low-risk fast path;
+  the next major optimization is standardized CG block/layer execution.
 
 ## Runtime Defaults
 
@@ -111,5 +113,6 @@ CUDA_ARCH=sm_80
 Current status:
 
 ```text
-First SH backend: pending server compile and parity/performance tests.
+Cu-Zr l3k3 1.024M first SH backend: 4.65405e6 atom-step/s
+Cu-Zr l3k3 1.024M packed-basic metadata path: 4.77022e6 atom-step/s
 ```
