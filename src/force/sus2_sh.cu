@@ -3233,7 +3233,6 @@ void SUS2_SH::compute(
         kBlockSize)));
   const size_t moment_size = static_cast<size_t>(alpha_moments_count_) * num_atoms;
   const size_t force_size = static_cast<size_t>(num_atoms) * 3;
-  const size_t virial_size = static_cast<size_t>(num_atoms) * 9;
   stage_start = profile_start();
   if (use_float_moments_) {
     if (!use_cg_block_forward_ && !use_tensor_product_parallel_ &&
@@ -3249,10 +3248,6 @@ void SUS2_SH::compute(
     CHECK(gpuMemset(moment_grads_.data(), 0, moment_size * sizeof(double)));
   }
   CHECK(gpuMemset(force_tmp_.data(), 0, force_size * sizeof(float)));
-  if (use_force_self_buffer_) {
-    CHECK(gpuMemset(force_self_tmp_.data(), 0, force_size * sizeof(float)));
-  }
-  CHECK(gpuMemset(virial_tmp_.data(), 0, virial_size * sizeof(float)));
   profile_stop(sh_profile_memset, stage_start);
 
   SHDeviceModel model{

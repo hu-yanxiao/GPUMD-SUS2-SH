@@ -481,3 +481,62 @@ loads too much shared/register state for l3k3. The useful form of topology
 classification is more likely to be specialized compact component-row kernels
 or layer programs per `(l1,l2,L)` type, not a generic block tile that serializes
 all terms for each atom thread.
+
+### 2026-05-13 NEP/Moment Comparison and Rejected Force Probes
+
+The current working explanation for the speed gap against the old moment
+interface is:
+
+- The old moment path is fast because it has mature low-level fast paths:
+  Cartesian tensor basic/force kernels, graph-specific packed metadata,
+  assign-forward product groups, selective gradient initialization, float
+  intermediates, direct radial tables, and force self-buffering.
+- Official GPUMD NEP uses the spherical-harmonic descriptor form in the
+  documentation, but the CUDA implementation evaluates Cartesian/solid-harmonic
+  polynomials and contracts them into fixed invariants. NEP avoids generic CG
+  tensor products; it stores directed-edge partial forces and later combines
+  reverse edges.
+- SUS2-SH has a different requirement: it must preserve the trained standard
+  SH/CG scalar list and tensor-product path. Therefore NEP's polynomial basis
+  and mixed precision are transferable, but NEP's fixed invariant contraction
+  cannot replace the SUS2-SH CG graph without changing the model definition.
+
+Rejected probes on the 1,024,000 atom Cu-Zr l3k3 model:
+
+```text
+directed-edge force reduce:
+  idea    = NEP-style f12 storage plus reverse-edge reduce, avoiding force atomics
+  case    = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_l3k3_1m_force_edge_reduce_profile200_20260513
+  force   ~= 115 ms/step
+  speed   = 4.32113e6 atom*step/s
+  result  = rejected; reverse-edge lookup and extra edge-force traffic outweighed atomic removal
+
+radial value-only basic:
+  idea    = basic stage calls a value-only direct radial evaluator instead of the value/derivative helper
+  same-GPU A/B speed = 5.23653e6 -> 5.23833e6 atom*step/s
+  result  = not retained; mathematically safe but too small to justify extra code complexity
+
+grouped (k,l) basic/force:
+  idea    = regroup force chain rule by mu=(k,l), forming sum_m adj*Y_lm and sum_m adj*dY_lm
+  case    = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_l3k3_1m_grouped_basic_force_profile200_20260513
+  basic   ~= 47 ms/step
+  force   ~= 103 ms/step
+  speed   = 4.34924e6 atom*step/s
+  result  = rejected; extra local state/control flow increased register pressure
+```
+
+Accepted tiny cleanup: `force_self_tmp` and `virial_tmp` are no longer memset
+before the force kernel because the force kernel overwrites all per-atom entries.
+The same l3k3 profile is unchanged within noise:
+
+```text
+case    = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_l3k3_1m_nomemset_single_profile200_20260513
+speed   = 5.23439e6 atom*step/s
+```
+
+Next high-confidence direction: stop trying per-thread algebraic rearrangements
+for l3k3. The remaining path to a large gain is a standard SH/CG layer program
+that preserves the model definition while reducing the per-atom serial product
+row/back-row walk. Candidate implementations should specialize compact
+component-row kernels or AOT/cache small layer programs by `(l1,l2,L)` topology,
+with correctness checked against the compact serial path after each change.
