@@ -1,10 +1,22 @@
-# GPUMD-SUS2
+# GPUMD-SUS2-SH
 
-Experimental SUS2 v1.1 inference support for GPUMD.
+Experimental SUS2-SH inference support for GPUMD.
 
-This repository is an overlay on top of upstream GPUMD, not a full GPUMD fork. It contains the core files needed to add the `MTP`/SUS2 potential backend, the SUS2 topology code-generation utility, and build notes used on the A100 cluster.
+This repository is the spherical-harmonic line of the GPUMD SUS2 interface. It
+is split from the moment-tensor `GPUMD-SUS2` project so the SH model reader,
+real-spherical-harmonic basic moments, CG contraction path, and later
+matrix-style kernels can evolve without destabilizing the older tensor backend.
 
-## Current Scope
+Initial design and implementation notes are tracked in
+[docs/gpumd-sus2-sh-interface-plan.md](docs/gpumd-sus2-sh-interface-plan.md).
+
+## Status
+
+This initial commit preserves the mature moment-tensor backend as the starting
+point and documents the SUS2-SH design. The next implementation step is a new
+`SUS2_SH` backend selected by `potential_tag = SUS2-SH`.
+
+## Inherited Tensor Backend
 
 - SUS2 model format: `version = 1.1.0`
 - GPUMD potential token: model files beginning with `MTP`
