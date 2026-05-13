@@ -24,12 +24,14 @@
 namespace
 {
 constexpr int kBlockSize = 128;
+constexpr int kProductBlockSize = 128;
 constexpr int kMaxSHL = 4;
 constexpr int kMaxSHComponents = (kMaxSHL + 1) * (kMaxSHL + 1);
 constexpr int kMaxSHRadialFuncs = 32;
 constexpr int kMaxSHRbSize = 16;
 constexpr int kMaxSHBasics = 256;
 constexpr int kSHForceGradCache64 = 64;
+constexpr int kSHForceGradCache128 = 128;
 constexpr int kSHMaxConstForwardU32 = 16000;
 constexpr double kPi = 3.141592653589793238462643383279502884;
 
@@ -535,6 +537,25 @@ bool parse_sh_const_forward_rows(const SHHostModel& model, int nopts, const char
   return use_const;
 }
 
+bool parse_sh_parallel_back_rows(const SHHostModel& model, int nopts, const char** opts)
+{
+  bool use_parallel = model.cg_back_terms.size() >= 4096;
+  const char* env = std::getenv("SUS2_SH_GPUMD_PARALLEL_BACK_ROWS");
+  if (env != nullptr) {
+    use_parallel = parse_bool_value(env, "SUS2_SH_GPUMD_PARALLEL_BACK_ROWS");
+  }
+  const int begin = std::min(nopts, model.species_count);
+  for (int i = begin; i < nopts; ++i) {
+    const std::string option = opts[i] == nullptr ? "" : opts[i];
+    if (starts_with(option, "sus2_sh_parallel_back_rows=") ||
+        starts_with(option, "sus2_parallel_back_rows=")) {
+      const size_t eq = option.find('=');
+      use_parallel = parse_bool_value(option.substr(eq + 1), option.substr(0, eq));
+    }
+  }
+  return use_parallel;
+}
+
 bool parse_sh_static_basic(const SHHostModel& model, int nopts, const char** opts)
 {
   bool use_static = true;
@@ -547,6 +568,25 @@ bool parse_sh_static_basic(const SHHostModel& model, int nopts, const char** opt
     const std::string option = opts[i] == nullptr ? "" : opts[i];
     if (starts_with(option, "sus2_sh_static_basic=") ||
         starts_with(option, "sus2_static_basic=")) {
+      const size_t eq = option.find('=');
+      use_static = parse_bool_value(option.substr(eq + 1), option.substr(0, eq));
+    }
+  }
+  return use_static;
+}
+
+bool parse_sh_static_force(const SHHostModel& model, int nopts, const char** opts)
+{
+  bool use_static = true;
+  const char* env = std::getenv("SUS2_SH_GPUMD_STATIC_FORCE");
+  if (env != nullptr) {
+    use_static = parse_bool_value(env, "SUS2_SH_GPUMD_STATIC_FORCE");
+  }
+  const int begin = std::min(nopts, model.species_count);
+  for (int i = begin; i < nopts; ++i) {
+    const std::string option = opts[i] == nullptr ? "" : opts[i];
+    if (starts_with(option, "sus2_sh_static_force=") ||
+        starts_with(option, "sus2_static_force=")) {
       const size_t eq = option.find('=');
       use_static = parse_bool_value(option.substr(eq + 1), option.substr(0, eq));
     }
@@ -2656,7 +2696,8 @@ static __global__ void gpu_sh_forward_energy_backward_compact_rows(
   const int* type,
   RealT* moments,
   GradT* grads,
-  double* potential)
+  double* potential,
+  bool do_backward)
 {
   const int atom = blockIdx.x * blockDim.x + threadIdx.x;
   if (atom >= N) {
@@ -2749,6 +2790,10 @@ static __global__ void gpu_sh_forward_energy_backward_compact_rows(
       static_cast<GradT>(center_coeff * coeff);
   }
   potential[atom] += static_cast<double>(site_energy);
+
+  if (!do_backward) {
+    return;
+  }
 
   for (int layer = model.sh_cg_layer_count; layer >= 1; --layer) {
     const int row_begin = model.sh_cg_back_layer_offsets[layer];
@@ -2850,6 +2895,63 @@ __device__ __forceinline__ void compute_sh_edge_derivative_cached_grads(
     dEx += adj * (radial_der * dx * inv_r * ylm + radial * sh_ders[3 * yidx + 0]);
     dEy += adj * (radial_der * dy * inv_r * ylm + radial * sh_ders[3 * yidx + 1]);
     dEz += adj * (radial_der * dz * inv_r * ylm + radial * sh_ders[3 * yidx + 2]);
+  }
+}
+
+template <typename GradT, typename RealT, int L, int K, int RbSize>
+__device__ __forceinline__ void compute_sh_edge_derivative_static_layout(
+  SHDeviceModel model,
+  int center_type,
+  int neighbor_type,
+  RealT dx,
+  RealT dy,
+  RealT dz,
+  RealT r,
+  const GradT* grad_cache,
+  RealT& dEx,
+  RealT& dEy,
+  RealT& dEz)
+{
+  constexpr int RadialFuncs = K * (L + 1);
+  RealT radial_vals[RadialFuncs];
+  RealT radial_ders[RadialFuncs];
+  RealT sh_vals[kMaxSHComponents];
+  RealT sh_ders[3 * kMaxSHComponents];
+  const int pair = center_type * model.species_count + neighbor_type;
+  sh_direct_radial_vals_ders_static<RealT, RadialFuncs, RbSize>(
+    model, pair, r, radial_vals, radial_ders);
+  eval_real_sh(dx, dy, dz, r, L, sh_vals, sh_ders);
+
+  const RealT inv_r = static_cast<RealT>(1.0) / r;
+  dEx = dEy = dEz = static_cast<RealT>(0.0);
+  int basic = 0;
+#pragma unroll
+  for (int l_desc = 0; l_desc <= L; ++l_desc) {
+    const int l = L - l_desc;
+#pragma unroll
+    for (int k_desc = 0; k_desc < K; ++k_desc) {
+      const int k = K - 1 - k_desc;
+      const int mu = k * (L + 1) + l;
+      const RealT radial = radial_vals[mu];
+      const RealT radial_der = radial_ders[mu];
+      RealT projected_y = static_cast<RealT>(0.0);
+      RealT projected_dx = static_cast<RealT>(0.0);
+      RealT projected_dy = static_cast<RealT>(0.0);
+      RealT projected_dz = static_cast<RealT>(0.0);
+#pragma unroll
+      for (int c = 0; c < 2 * l + 1; ++c) {
+        const RealT adj = static_cast<RealT>(grad_cache[basic++]);
+        const int yidx = l * l + c;
+        projected_y += adj * sh_vals[yidx];
+        projected_dx += adj * sh_ders[3 * yidx + 0];
+        projected_dy += adj * sh_ders[3 * yidx + 1];
+        projected_dz += adj * sh_ders[3 * yidx + 2];
+      }
+      const RealT radial_projected = radial_der * inv_r * projected_y;
+      dEx += radial_projected * dx + radial * projected_dx;
+      dEy += radial_projected * dy + radial * projected_dy;
+      dEz += radial_projected * dz + radial * projected_dz;
+    }
   }
 }
 
@@ -3060,6 +3162,203 @@ static __global__ void gpu_sh_compute_forces_cached_grads(
   virial_tmp[i + 8 * N] = static_cast<float>(s_zy);
 }
 
+template <typename GradT, typename RealT, int L, int K, int RbSize>
+static __global__ void gpu_sh_compute_forces_static_layout(
+  int N,
+  Box box,
+  double cutoff_square,
+  bool use_cached_displacements,
+  SHDeviceModel model,
+  const int* type,
+  const int* neighbor_count,
+  const int* neighbor_atoms,
+  const double* neighbor_dx,
+  const double* neighbor_dy,
+  const double* neighbor_dz,
+  const double* x,
+  const double* y,
+  const double* z,
+  const GradT* grads,
+  float* force_tmp,
+  float* force_self_tmp,
+  float* virial_tmp)
+{
+  constexpr int BasicCount = K * (L + 1) * (L + 1);
+  constexpr int RadialFuncs = K * (L + 1);
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= N || model.alpha_basic_count != BasicCount ||
+      model.radial_funcs_count != RadialFuncs || model.rb_size != RbSize) {
+    return;
+  }
+
+  GradT grad_cache[BasicCount];
+#pragma unroll
+  for (int b = 0; b < BasicCount; ++b) {
+    grad_cache[b] = grads[static_cast<size_t>(b) * N + i];
+  }
+
+  const int type_i = type[i];
+  const int count = neighbor_count[i];
+  RealT fx_self = static_cast<RealT>(0.0);
+  RealT fy_self = static_cast<RealT>(0.0);
+  RealT fz_self = static_cast<RealT>(0.0);
+  RealT s_xx = static_cast<RealT>(0.0);
+  RealT s_yy = static_cast<RealT>(0.0);
+  RealT s_zz = static_cast<RealT>(0.0);
+  RealT s_xy = static_cast<RealT>(0.0);
+  RealT s_xz = static_cast<RealT>(0.0);
+  RealT s_yz = static_cast<RealT>(0.0);
+  RealT s_yx = static_cast<RealT>(0.0);
+  RealT s_zx = static_cast<RealT>(0.0);
+  RealT s_zy = static_cast<RealT>(0.0);
+
+  for (int nbr = 0; nbr < count; ++nbr) {
+    const size_t edge = static_cast<size_t>(nbr) * N + i;
+    const int j = neighbor_atoms[edge];
+    RealT dx;
+    RealT dy;
+    RealT dz;
+    load_sh_edge_displacement(
+      use_cached_displacements, N, box, edge, i, j, neighbor_dx, neighbor_dy, neighbor_dz,
+      x, y, z, dx, dy, dz);
+    const RealT r2 = dx * dx + dy * dy + dz * dz;
+    if (r2 >= static_cast<RealT>(cutoff_square)) {
+      continue;
+    }
+    const RealT r = sqrt(r2);
+    const int type_j = type[j];
+    RealT dEx;
+    RealT dEy;
+    RealT dEz;
+    compute_sh_edge_derivative_static_layout<GradT, RealT, L, K, RbSize>(
+      model, type_i, type_j, dx, dy, dz, r, grad_cache, dEx, dEy, dEz);
+
+    fx_self += dEx;
+    fy_self += dEy;
+    fz_self += dEz;
+    atomicAdd(force_tmp + j, static_cast<float>(-dEx));
+    atomicAdd(force_tmp + j + N, static_cast<float>(-dEy));
+    atomicAdd(force_tmp + j + 2 * N, static_cast<float>(-dEz));
+
+    s_xx -= dEx * dx;
+    s_yy -= dEy * dy;
+    s_zz -= dEz * dz;
+    s_xy -= dx * dEy;
+    s_xz -= dx * dEz;
+    s_yz -= dy * dEz;
+    s_yx -= dy * dEx;
+    s_zx -= dz * dEx;
+    s_zy -= dz * dEy;
+  }
+
+  if (force_self_tmp != nullptr) {
+    force_self_tmp[i] = static_cast<float>(fx_self);
+    force_self_tmp[i + N] = static_cast<float>(fy_self);
+    force_self_tmp[i + 2 * N] = static_cast<float>(fz_self);
+  } else {
+    atomicAdd(force_tmp + i, static_cast<float>(fx_self));
+    atomicAdd(force_tmp + i + N, static_cast<float>(fy_self));
+    atomicAdd(force_tmp + i + 2 * N, static_cast<float>(fz_self));
+  }
+
+  virial_tmp[i + 0 * N] = static_cast<float>(s_xx);
+  virial_tmp[i + 1 * N] = static_cast<float>(s_yy);
+  virial_tmp[i + 2 * N] = static_cast<float>(s_zz);
+  virial_tmp[i + 3 * N] = static_cast<float>(s_xy);
+  virial_tmp[i + 4 * N] = static_cast<float>(s_xz);
+  virial_tmp[i + 5 * N] = static_cast<float>(s_yz);
+  virial_tmp[i + 6 * N] = static_cast<float>(s_yx);
+  virial_tmp[i + 7 * N] = static_cast<float>(s_zx);
+  virial_tmp[i + 8 * N] = static_cast<float>(s_zy);
+}
+
+template <typename GradT, typename RealT>
+bool launch_sh_compute_forces_static(
+  int lmax,
+  int kmax,
+  int rb_size,
+  int grid_size,
+  int N,
+  Box box,
+  double cutoff_square,
+  bool use_cached_displacements,
+  SHDeviceModel model,
+  const int* type,
+  const int* neighbor_count,
+  const int* neighbor_atoms,
+  const double* neighbor_dx,
+  const double* neighbor_dy,
+  const double* neighbor_dz,
+  const double* x,
+  const double* y,
+  const double* z,
+  const GradT* grads,
+  float* force_tmp,
+  float* force_self_tmp,
+  float* virial_tmp)
+{
+  if (rb_size != 10 || kmax < 1 || kmax > 4) {
+    return false;
+  }
+
+#define SUS2_SH_LAUNCH_STATIC_FORCE_FOR_L(LVAL)                                           \
+  do {                                                                                    \
+    if (kmax == 1) {                                                                      \
+      gpu_sh_compute_forces_static_layout<GradT, RealT, LVAL, 1, 10>                      \
+        <<<grid_size, kBlockSize>>>(                                                      \
+          N, box, cutoff_square, use_cached_displacements, model, type, neighbor_count,   \
+          neighbor_atoms, neighbor_dx, neighbor_dy, neighbor_dz, x, y, z, grads,           \
+          force_tmp, force_self_tmp, virial_tmp);                                         \
+      return true;                                                                        \
+    }                                                                                     \
+    if (kmax == 2) {                                                                      \
+      gpu_sh_compute_forces_static_layout<GradT, RealT, LVAL, 2, 10>                      \
+        <<<grid_size, kBlockSize>>>(                                                      \
+          N, box, cutoff_square, use_cached_displacements, model, type, neighbor_count,   \
+          neighbor_atoms, neighbor_dx, neighbor_dy, neighbor_dz, x, y, z, grads,           \
+          force_tmp, force_self_tmp, virial_tmp);                                         \
+      return true;                                                                        \
+    }                                                                                     \
+    if (kmax == 3) {                                                                      \
+      gpu_sh_compute_forces_static_layout<GradT, RealT, LVAL, 3, 10>                      \
+        <<<grid_size, kBlockSize>>>(                                                      \
+          N, box, cutoff_square, use_cached_displacements, model, type, neighbor_count,   \
+          neighbor_atoms, neighbor_dx, neighbor_dy, neighbor_dz, x, y, z, grads,           \
+          force_tmp, force_self_tmp, virial_tmp);                                         \
+      return true;                                                                        \
+    }                                                                                     \
+    if (kmax == 4) {                                                                      \
+      gpu_sh_compute_forces_static_layout<GradT, RealT, LVAL, 4, 10>                      \
+        <<<grid_size, kBlockSize>>>(                                                      \
+          N, box, cutoff_square, use_cached_displacements, model, type, neighbor_count,   \
+          neighbor_atoms, neighbor_dx, neighbor_dy, neighbor_dz, x, y, z, grads,           \
+          force_tmp, force_self_tmp, virial_tmp);                                         \
+      return true;                                                                        \
+    }                                                                                     \
+  } while (0)
+
+  switch (lmax) {
+    case 0:
+      SUS2_SH_LAUNCH_STATIC_FORCE_FOR_L(0);
+      break;
+    case 1:
+      SUS2_SH_LAUNCH_STATIC_FORCE_FOR_L(1);
+      break;
+    case 2:
+      SUS2_SH_LAUNCH_STATIC_FORCE_FOR_L(2);
+      break;
+    case 3:
+      SUS2_SH_LAUNCH_STATIC_FORCE_FOR_L(3);
+      break;
+    case 4:
+      SUS2_SH_LAUNCH_STATIC_FORCE_FOR_L(4);
+      break;
+  }
+
+#undef SUS2_SH_LAUNCH_STATIC_FORCE_FOR_L
+  return false;
+}
+
 static __global__ void gpu_accumulate_float_to_double(
   int N,
   const float* force_tmp,
@@ -3247,7 +3546,7 @@ SUS2_SH::SUS2_SH(
     parse_sh_force_self_buffer(host_model, num_potential_options, potential_options);
   use_force_grad_cache_ =
     parse_sh_force_grad_cache(host_model, num_potential_options, potential_options) &&
-    alpha_basic_count_ <= kSHForceGradCache64;
+    alpha_basic_count_ <= kSHForceGradCache128;
   use_cg_block_forward_ =
     parse_sh_cg_block_forward(host_model, num_potential_options, potential_options);
   use_tensor_product_parallel_ =
@@ -3256,6 +3555,8 @@ SUS2_SH::SUS2_SH(
     parse_sh_compact_serial_product(host_model, num_potential_options, potential_options);
   use_const_forward_rows_ =
     parse_sh_const_forward_rows(host_model, num_potential_options, potential_options);
+  use_parallel_back_rows_ =
+    parse_sh_parallel_back_rows(host_model, num_potential_options, potential_options);
   if (use_tensor_product_parallel_) {
     use_cg_block_forward_ = false;
     use_compact_serial_product_ = false;
@@ -3263,6 +3564,7 @@ SUS2_SH::SUS2_SH(
   if (use_cg_block_forward_) {
     use_compact_serial_product_ = false;
   }
+  use_parallel_back_rows_ = use_parallel_back_rows_ && use_compact_serial_product_;
   tensor_product_grid_cap_ =
     parse_sh_tensor_product_grid_cap(host_model, num_potential_options, potential_options);
   profile_enabled_ = parse_sh_profile_enabled(host_model, num_potential_options, potential_options);
@@ -3274,6 +3576,9 @@ SUS2_SH::SUS2_SH(
   use_static_basic_layout_ =
     parse_sh_static_basic(host_model, num_potential_options, potential_options) &&
     has_static_full_sh_basic_layout(host_model);
+  use_static_force_layout_ =
+    parse_sh_static_force(host_model, num_potential_options, potential_options) &&
+    has_static_full_sh_basic_layout(host_model) && alpha_basic_count_ <= kSHForceGradCache128;
   use_terminal_scalar_fusion_ =
     parse_sh_terminal_scalar_fusion(host_model, num_potential_options, potential_options) &&
     use_compact_serial_product_;
@@ -3617,14 +3922,16 @@ SUS2_SH::SUS2_SH(
     alpha_scalar_moments_,
     rc);
   printf(
-    "SUS2-SH GPUMD precision mode: %s; force self-buffer: %s; force basic-grad cache: %s; static basic: %s; terminal scalar fusion: %s; cg-block forward: %s; compact serial product: %s; const forward rows: %s; tensor-product parallel: %s; tensor grid cap=%d.\n",
+    "SUS2-SH GPUMD precision mode: %s; force self-buffer: %s; force basic-grad cache: %s; static basic: %s; static force: %s; terminal scalar fusion: %s; cg-block forward: %s; compact serial product: %s; parallel back rows: %s; const forward rows: %s; tensor-product parallel: %s; tensor grid cap=%d.\n",
     use_float_moments_ ? "NEP-like float moments/gradients/local arithmetic" : "double moments/local arithmetic",
     use_force_self_buffer_ ? "on" : "off",
     use_force_grad_cache_ ? "on" : "off",
     use_static_basic_layout_ ? "on" : "off",
+    use_static_force_layout_ ? "on" : "off",
     use_terminal_scalar_fusion_ ? "on" : "off",
     use_cg_block_forward_ ? "on" : "off",
     use_compact_serial_product_ ? "on" : "off",
+    use_parallel_back_rows_ ? "on" : "off",
     use_const_forward_rows_ ? "on" : "off",
     use_tensor_product_parallel_ ? "on" : "off",
     tensor_product_grid_cap_);
@@ -3785,6 +4092,7 @@ void SUS2_SH::compute(
   profile_stop(sh_profile_neighbor, stage_start);
 
   const int grid_size = (num_atoms - 1) / kBlockSize + 1;
+  const int product_grid_size = (num_atoms - 1) / kProductBlockSize + 1;
   const int tensor_grid_size = std::max(
     1,
     std::min(
@@ -3913,22 +4221,43 @@ void SUS2_SH::compute(
         GPU_CHECK_KERNEL
       }
     } else if (use_compact_serial_product_) {
-      gpu_sh_forward_energy_backward_compact_rows<float, float><<<grid_size, kBlockSize>>>(
+      gpu_sh_forward_energy_backward_compact_rows<float, float>
+        <<<product_grid_size, kProductBlockSize>>>(
         num_atoms, model, type.data(), moment_vals_float_.data(), moment_grads_float_.data(),
-        potential.data());
+        potential.data(), !use_parallel_back_rows_);
+      GPU_CHECK_KERNEL
+      if (use_parallel_back_rows_) {
+        for (int layer = sh_cg_layer_count_; layer >= 1; --layer) {
+          gpu_sh_tensor_product_back_rows<float, float><<<tensor_grid_size, kBlockSize>>>(
+            num_atoms, layer, model, moment_vals_float_.data(), moment_grads_float_.data());
+          GPU_CHECK_KERNEL
+        }
+      }
     } else if (use_cg_block_forward_) {
-      gpu_sh_forward_energy_backward_cg_blocks<float, float><<<grid_size, kBlockSize>>>(
+      gpu_sh_forward_energy_backward_cg_blocks<float, float>
+        <<<product_grid_size, kProductBlockSize>>>(
         num_atoms, model, type.data(), moment_vals_float_.data(), moment_grads_float_.data(),
         potential.data());
     } else {
-      gpu_sh_forward_energy_backward<float, float><<<grid_size, kBlockSize>>>(
+      gpu_sh_forward_energy_backward<float, float>
+        <<<product_grid_size, kProductBlockSize>>>(
         num_atoms, model, type.data(), moment_vals_float_.data(), moment_grads_float_.data(),
         potential.data());
     }
     GPU_CHECK_KERNEL
     profile_stop(sh_profile_product, stage_start);
     stage_start = profile_start();
-    if (use_force_grad_cache_) {
+    const bool launched_static_force =
+      use_static_force_layout_ &&
+      launch_sh_compute_forces_static<float, float>(
+        sh_l_max_, sh_k_max_, rb_size_, grid_size, num_atoms, box, rc * rc,
+        use_cached_neighbor_displacements_, model, type.data(), neighbor_count_.data(),
+        neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(), neighbor_dz_.data(),
+        position.data(), position.data() + num_atoms, position.data() + 2 * num_atoms,
+        moment_grads_float_.data(), force_tmp_.data(), force_self_tmp_ptr, virial_tmp_.data());
+    if (launched_static_force) {
+      GPU_CHECK_KERNEL
+    } else if (use_force_grad_cache_) {
       if (alpha_basic_count_ <= 48) {
         gpu_sh_compute_forces_cached_grads<float, float, 48><<<grid_size, kBlockSize>>>(
           num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(),
@@ -3936,8 +4265,15 @@ void SUS2_SH::compute(
           neighbor_dz_.data(), position.data(), position.data() + num_atoms,
           position.data() + 2 * num_atoms, moment_grads_float_.data(), force_tmp_.data(),
           force_self_tmp_ptr, virial_tmp_.data());
-      } else {
+      } else if (alpha_basic_count_ <= kSHForceGradCache64) {
         gpu_sh_compute_forces_cached_grads<float, float, kSHForceGradCache64><<<grid_size, kBlockSize>>>(
+          num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(),
+          neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(),
+          neighbor_dz_.data(), position.data(), position.data() + num_atoms,
+          position.data() + 2 * num_atoms, moment_grads_float_.data(), force_tmp_.data(),
+          force_self_tmp_ptr, virial_tmp_.data());
+      } else {
+        gpu_sh_compute_forces_cached_grads<float, float, kSHForceGradCache128><<<grid_size, kBlockSize>>>(
           num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(),
           neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(),
           neighbor_dz_.data(), position.data(), position.data() + num_atoms,
@@ -4004,22 +4340,43 @@ void SUS2_SH::compute(
         GPU_CHECK_KERNEL
       }
     } else if (use_compact_serial_product_) {
-      gpu_sh_forward_energy_backward_compact_rows<double, double><<<grid_size, kBlockSize>>>(
+      gpu_sh_forward_energy_backward_compact_rows<double, double>
+        <<<product_grid_size, kProductBlockSize>>>(
         num_atoms, model, type.data(), moment_vals_.data(), moment_grads_.data(),
-        potential.data());
+        potential.data(), !use_parallel_back_rows_);
+      GPU_CHECK_KERNEL
+      if (use_parallel_back_rows_) {
+        for (int layer = sh_cg_layer_count_; layer >= 1; --layer) {
+          gpu_sh_tensor_product_back_rows<double, double><<<tensor_grid_size, kBlockSize>>>(
+            num_atoms, layer, model, moment_vals_.data(), moment_grads_.data());
+          GPU_CHECK_KERNEL
+        }
+      }
     } else if (use_cg_block_forward_) {
-      gpu_sh_forward_energy_backward_cg_blocks<double, double><<<grid_size, kBlockSize>>>(
+      gpu_sh_forward_energy_backward_cg_blocks<double, double>
+        <<<product_grid_size, kProductBlockSize>>>(
         num_atoms, model, type.data(), moment_vals_.data(), moment_grads_.data(),
         potential.data());
     } else {
-      gpu_sh_forward_energy_backward<double, double><<<grid_size, kBlockSize>>>(
+      gpu_sh_forward_energy_backward<double, double>
+        <<<product_grid_size, kProductBlockSize>>>(
         num_atoms, model, type.data(), moment_vals_.data(), moment_grads_.data(),
         potential.data());
     }
     GPU_CHECK_KERNEL
     profile_stop(sh_profile_product, stage_start);
     stage_start = profile_start();
-    if (use_force_grad_cache_) {
+    const bool launched_static_force =
+      use_static_force_layout_ &&
+      launch_sh_compute_forces_static<double, double>(
+        sh_l_max_, sh_k_max_, rb_size_, grid_size, num_atoms, box, rc * rc,
+        use_cached_neighbor_displacements_, model, type.data(), neighbor_count_.data(),
+        neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(), neighbor_dz_.data(),
+        position.data(), position.data() + num_atoms, position.data() + 2 * num_atoms,
+        moment_grads_.data(), force_tmp_.data(), force_self_tmp_ptr, virial_tmp_.data());
+    if (launched_static_force) {
+      GPU_CHECK_KERNEL
+    } else if (use_force_grad_cache_) {
       if (alpha_basic_count_ <= 48) {
         gpu_sh_compute_forces_cached_grads<double, double, 48><<<grid_size, kBlockSize>>>(
           num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(),
@@ -4027,8 +4384,15 @@ void SUS2_SH::compute(
           neighbor_dz_.data(), position.data(), position.data() + num_atoms,
           position.data() + 2 * num_atoms, moment_grads_.data(), force_tmp_.data(),
           force_self_tmp_ptr, virial_tmp_.data());
-      } else {
+      } else if (alpha_basic_count_ <= kSHForceGradCache64) {
         gpu_sh_compute_forces_cached_grads<double, double, kSHForceGradCache64><<<grid_size, kBlockSize>>>(
+          num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(),
+          neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(),
+          neighbor_dz_.data(), position.data(), position.data() + num_atoms,
+          position.data() + 2 * num_atoms, moment_grads_.data(), force_tmp_.data(),
+          force_self_tmp_ptr, virial_tmp_.data());
+      } else {
+        gpu_sh_compute_forces_cached_grads<double, double, kSHForceGradCache128><<<grid_size, kBlockSize>>>(
           num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(),
           neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(),
           neighbor_dz_.data(), position.data(), position.data() + num_atoms,

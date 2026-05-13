@@ -639,3 +639,64 @@ walk can be replaced by a smaller set of structured contractions. The next
 force step should mirror the static-basic value path with an equally structured
 derivative path, while keeping the current cached-gradient force kernel as the
 correctness reference.
+
+Accepted change: the force kernel now has a static standard-layout path for
+full SUS2-SH `(l,k,m)` models with `l <= 4`, `k <= 4`, and
+`radial_basis_size = 10`. It keeps the same chain rule,
+`sum_m g_{klm} (R'_{kl} Y_lm rhat + R_{kl} dY_lm/dr)`, but contracts each
+fixed `(k,l)` group before applying the radial derivative. This removes the
+generic per-basic metadata loop in the force stage. The path is guarded by the
+same full-layout check as static basic and can be disabled with
+`sus2_sh_static_force=0` or `SUS2_SH_GPUMD_STATIC_FORCE=0`.
+
+Same-GPU A/B on `a05u22g`, 1,024,000 atom Cu-Zr l3k3, with static basic,
+constant forward metadata, and terminal scalar fusion enabled:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_l3k3_1m_ab_static_force_20260513
+
+static force off:
+  product ~= 65.4-65.7 ms/step
+  force   ~= 79.5-80.1 ms/step
+  speed   = 6.21011e6 atom*step/s
+
+static force on:
+  product ~= 65.5-65.6 ms/step
+  force   ~= 18.8-19.0 ms/step
+  speed   = 9.86625e6 atom*step/s
+```
+
+The maximum printed thermo-column difference was `4.6e-3` in total energy for
+the million-atom system, consistent with changed float contraction order. This
+recovers the old moment interface's force cost level while preserving the
+standard SH basis and CG graph.
+
+Accepted product change: the compact product path can split the final source-row
+reverse pass into a row-by-atom parallel kernel. Forward row evaluation,
+terminal scalar energy/gradient fusion, and scalar gradient seeding remain in
+the compact per-atom kernel; only the pruned back-row table is run in parallel.
+This is enabled by default when the validated graph has at least `4096`
+back-row terms and can be disabled with `sus2_sh_parallel_back_rows=0` or
+`SUS2_SH_GPUMD_PARALLEL_BACK_ROWS=0`.
+
+Same-GPU A/B on `a05u22g`, with static force enabled:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_l3k3_1m_ab_parallel_back_20260513
+
+parallel back rows off:
+  product ~= 65.1-65.3 ms/step
+  force   ~= 18.4-18.8 ms/step
+  speed   = 9.95839e6 atom*step/s
+
+parallel back rows on:
+  product ~= 62.3-62.4 ms/step
+  force   ~= 18.9-19.0 ms/step
+  speed   = 1.01514e7 atom*step/s
+```
+
+The maximum printed thermo-column difference was `2.9e-3` in total energy,
+again within the float-order scale. Product remains the dominant gap versus the
+old moment backend, so the next serious direction is still a more compact
+standard layer program for the layer-1 pair tensor contractions and terminal
+scalar contractions, not more force work.

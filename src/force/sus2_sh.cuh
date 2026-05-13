@@ -59,6 +59,8 @@ private:
   bool use_compact_serial_product_ = false;
   bool use_const_forward_rows_ = false;
   bool use_static_basic_layout_ = false;
+  bool use_static_force_layout_ = false;
+  bool use_parallel_back_rows_ = false;
   bool use_terminal_scalar_fusion_ = false;
   bool use_cached_neighbor_displacements_ = false;
   bool profile_enabled_ = false;
