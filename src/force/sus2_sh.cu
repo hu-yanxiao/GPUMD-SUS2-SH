@@ -438,7 +438,7 @@ bool parse_sh_force_self_buffer(const SHHostModel& model, int nopts, const char*
 
 bool parse_sh_force_grad_cache(const SHHostModel& model, int nopts, const char** opts)
 {
-  bool use_cache = false;
+  bool use_cache = model.alpha_basic_count <= kSHForceGradCache64;
   const char* env = std::getenv("SUS2_SH_GPUMD_FORCE_GRAD_CACHE");
   if (env != nullptr) {
     use_cache = parse_bool_value(env, "SUS2_SH_GPUMD_FORCE_GRAD_CACHE");
@@ -1252,71 +1252,70 @@ void validate_standard_sh_graph(SHHostModel& model)
   model.cg_blocks = graph.cg_blocks;
   model.cg_terms = graph.cg_terms;
 
-  std::vector<std::vector<SHCGRowHost>> rows_by_layer(graph.max_layer + 1);
-  std::vector<std::vector<SHCGRowTermHost>> terms_by_layer(graph.max_layer + 1);
-  for (size_t b = 0; b < graph.cg_blocks.size(); ++b) {
-    const SHCGBlockHost& block = graph.cg_blocks[b];
-    for (int c = 0; c < 2 * block.L + 1; ++c) {
-      SHCGRowHost row;
-      row.layer = block.layer;
-      row.left_base = block.left_base;
-      row.right_base = block.right_base;
-      row.target = block.target_base + c;
-      row.term_begin = static_cast<int>(terms_by_layer[block.layer].size());
-      row.term_count = 0;
-      for (int t = 0; t < block.term_count; ++t) {
-        const SHCGTermHost& term = graph.cg_terms[block.term_begin + t];
-        if (term.target_component != c) {
-          continue;
-        }
-        SHCGRowTermHost row_term;
-        row_term.left_component = term.left_component;
-        row_term.right_component = term.right_component;
-        row_term.coeff = term.coeff;
-        terms_by_layer[block.layer].push_back(row_term);
-        ++row.term_count;
-      }
-      if (row.term_count > 0) {
-        rows_by_layer[block.layer].push_back(row);
+  std::vector<int> node_layer(graph.node_count, 0);
+  std::vector<std::map<int, std::vector<SHCGRowTermHost>>> rows_by_target(
+    graph.max_layer + 1);
+  for (size_t b = 0; b < graph.tensor_blocks.size(); ++b) {
+    const SHTensorBlockHost& block = graph.tensor_blocks[b];
+    if (block.layer <= 0 || block.base < 0) {
+      continue;
+    }
+    const int dim = 2 * block.l + 1;
+    for (int c = 0; c < dim; ++c) {
+      const int node = block.base + c;
+      if (node >= 0 && node < graph.node_count) {
+        node_layer[node] = block.layer;
+        rows_by_target[block.layer][node];
       }
     }
   }
-
+  for (size_t p = 0; p < graph.products.size(); ++p) {
+    const SHProductHost& product = graph.products[p];
+    const int layer = node_layer[product.target];
+    if (layer <= 0 || layer > graph.max_layer) {
+      sh_input_error("SUS2_SH compact tensor row has invalid target layer.");
+    }
+    SHCGRowTermHost term;
+    term.left_component = product.left;
+    term.right_component = product.right;
+    term.coeff = product.coeff;
+    rows_by_target[layer][product.target].push_back(term);
+  }
   model.cg_layer_offsets.assign(graph.max_layer + 2, 0);
   for (int layer = 1; layer <= graph.max_layer; ++layer) {
     model.cg_layer_offsets[layer] = static_cast<int>(model.cg_rows.size());
-    const int term_offset = static_cast<int>(model.cg_row_terms.size());
-    for (size_t r = 0; r < rows_by_layer[layer].size(); ++r) {
-      SHCGRowHost row = rows_by_layer[layer][r];
-      row.term_begin += term_offset;
+    for (std::map<int, std::vector<SHCGRowTermHost>>::const_iterator it =
+           rows_by_target[layer].begin();
+         it != rows_by_target[layer].end();
+         ++it) {
+      SHCGRowHost row;
+      row.layer = layer;
+      row.left_base = 0;
+      row.right_base = 0;
+      row.target = it->first;
+      row.term_begin = static_cast<int>(model.cg_row_terms.size());
+      row.term_count = static_cast<int>(it->second.size());
       model.cg_rows.push_back(row);
+      model.cg_row_terms.insert(model.cg_row_terms.end(), it->second.begin(), it->second.end());
     }
-    model.cg_row_terms.insert(
-      model.cg_row_terms.end(), terms_by_layer[layer].begin(), terms_by_layer[layer].end());
   }
   model.cg_layer_offsets[graph.max_layer + 1] = static_cast<int>(model.cg_rows.size());
 
   std::vector<std::map<int, std::vector<SHCGBackTermHost>>> back_by_layer(graph.max_layer + 1);
-  for (size_t b = 0; b < graph.cg_blocks.size(); ++b) {
-    const SHCGBlockHost& block = graph.cg_blocks[b];
-    for (int t = 0; t < block.term_count; ++t) {
-      const SHCGTermHost& term = graph.cg_terms[block.term_begin + t];
-      const int target = block.target_base + term.target_component;
-      const int left = block.left_base + term.left_component;
-      const int right = block.right_base + term.right_component;
+  for (size_t p = 0; p < graph.products.size(); ++p) {
+    const SHProductHost& product = graph.products[p];
+    const int layer = node_layer[product.target];
+    SHCGBackTermHost left_term;
+    left_term.target = product.target;
+    left_term.other = product.right;
+    left_term.coeff = product.coeff;
+    back_by_layer[layer][product.left].push_back(left_term);
 
-      SHCGBackTermHost left_term;
-      left_term.target = target;
-      left_term.other = right;
-      left_term.coeff = term.coeff;
-      back_by_layer[block.layer][left].push_back(left_term);
-
-      SHCGBackTermHost right_term;
-      right_term.target = target;
-      right_term.other = left;
-      right_term.coeff = term.coeff;
-      back_by_layer[block.layer][right].push_back(right_term);
-    }
+    SHCGBackTermHost right_term;
+    right_term.target = product.target;
+    right_term.other = product.left;
+    right_term.coeff = product.coeff;
+    back_by_layer[layer][product.right].push_back(right_term);
   }
   model.cg_back_layer_offsets.assign(graph.max_layer + 2, 0);
   for (int layer = 1; layer <= graph.max_layer; ++layer) {
@@ -1686,7 +1685,8 @@ __device__ __forceinline__ void eval_real_sh(
   RealT* vals,
   RealT* ders)
 {
-  for (int i = 0; i < kMaxSHComponents; ++i) {
+  const int clear_count = ders == nullptr ? (lmax + 1) * (lmax + 1) : kMaxSHComponents;
+  for (int i = 0; i < clear_count; ++i) {
     vals[i] = static_cast<RealT>(0.0);
     if (ders != nullptr) {
       ders[3 * i + 0] = ders[3 * i + 1] = ders[3 * i + 2] = static_cast<RealT>(0.0);
@@ -1953,7 +1953,7 @@ __device__ __forceinline__ void load_sh_edge_displacement(
   apply_mic(box, dx, dy, dz);
 }
 
-template <typename RealT>
+template <typename RealT, int BasicCapacity = kMaxSHBasics>
 static __global__ void gpu_sh_compute_basic(
   int N,
   Box box,
@@ -1976,7 +1976,11 @@ static __global__ void gpu_sh_compute_basic(
     return;
   }
 
-  RealT basic[kMaxSHBasics];
+  if (model.alpha_basic_count > BasicCapacity) {
+    return;
+  }
+
+  RealT basic[BasicCapacity];
   for (int b = 0; b < model.alpha_basic_count; ++b) {
     basic[b] = static_cast<RealT>(0.0);
   }
@@ -3200,11 +3204,25 @@ void SUS2_SH::compute(
   float* force_self_tmp_ptr = use_force_self_buffer_ ? force_self_tmp_.data() : nullptr;
   if (use_float_moments_) {
     stage_start = profile_start();
-    gpu_sh_compute_basic<float><<<grid_size, kBlockSize>>>(
-      num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(),
-      neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(),
-      neighbor_dz_.data(), position.data(), position.data() + num_atoms,
-      position.data() + 2 * num_atoms, moment_vals_float_.data());
+    if (alpha_basic_count_ <= 64) {
+      gpu_sh_compute_basic<float, 64><<<grid_size, kBlockSize>>>(
+        num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(),
+        neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(),
+        neighbor_dz_.data(), position.data(), position.data() + num_atoms,
+        position.data() + 2 * num_atoms, moment_vals_float_.data());
+    } else if (alpha_basic_count_ <= 128) {
+      gpu_sh_compute_basic<float, 128><<<grid_size, kBlockSize>>>(
+        num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(),
+        neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(),
+        neighbor_dz_.data(), position.data(), position.data() + num_atoms,
+        position.data() + 2 * num_atoms, moment_vals_float_.data());
+    } else {
+      gpu_sh_compute_basic<float><<<grid_size, kBlockSize>>>(
+        num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(),
+        neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(),
+        neighbor_dz_.data(), position.data(), position.data() + num_atoms,
+        position.data() + 2 * num_atoms, moment_vals_float_.data());
+    }
     GPU_CHECK_KERNEL
     profile_stop(sh_profile_basic, stage_start);
     stage_start = profile_start();
@@ -3263,11 +3281,25 @@ void SUS2_SH::compute(
     profile_stop(sh_profile_force, stage_start);
   } else {
     stage_start = profile_start();
-    gpu_sh_compute_basic<double><<<grid_size, kBlockSize>>>(
-      num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(),
-      neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(),
-      neighbor_dz_.data(), position.data(), position.data() + num_atoms,
-      position.data() + 2 * num_atoms, moment_vals_.data());
+    if (alpha_basic_count_ <= 64) {
+      gpu_sh_compute_basic<double, 64><<<grid_size, kBlockSize>>>(
+        num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(),
+        neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(),
+        neighbor_dz_.data(), position.data(), position.data() + num_atoms,
+        position.data() + 2 * num_atoms, moment_vals_.data());
+    } else if (alpha_basic_count_ <= 128) {
+      gpu_sh_compute_basic<double, 128><<<grid_size, kBlockSize>>>(
+        num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(),
+        neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(),
+        neighbor_dz_.data(), position.data(), position.data() + num_atoms,
+        position.data() + 2 * num_atoms, moment_vals_.data());
+    } else {
+      gpu_sh_compute_basic<double><<<grid_size, kBlockSize>>>(
+        num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(),
+        neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(),
+        neighbor_dz_.data(), position.data(), position.data() + num_atoms,
+        position.data() + 2 * num_atoms, moment_vals_.data());
+    }
     GPU_CHECK_KERNEL
     profile_stop(sh_profile_basic, stage_start);
     stage_start = profile_start();

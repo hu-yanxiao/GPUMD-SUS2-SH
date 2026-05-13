@@ -102,6 +102,9 @@ export SUS2_GPUMD_FORCE_SELF_BUFFER=0
 The default `sus2_float=1` stores SH moments and reverse gradients in float,
 evaluates local moment arithmetic in float, and still writes GPUMD
 energy/force/virial outputs to the existing double arrays.
+For models with at most 64 SH basic components, the force kernel now caches the
+center basic gradients by default; set `sus2_sh_force_grad_cache=0` to disable
+that profiling path.
 
 The experimental tensor-product path can be enabled with:
 
@@ -128,5 +131,6 @@ Current status:
 ```text
 Cu-Zr l3k3 1.024M first SH backend: 4.65405e6 atom-step/s
 Cu-Zr l3k3 1.024M packed-basic metadata path: 4.77022e6 atom-step/s
-Cu-Zr l3k3 1.024M tensor row-adjoint path: correct, ~4.65e6 atom-step/s
+Cu-Zr l3k3 1.024M default flat path after basis/cache pass: 5.14507e6 atom-step/s
+Cu-Zr l3k3 1.024M tensor row-adjoint path: correct, 4.92559e6 atom-step/s
 ```

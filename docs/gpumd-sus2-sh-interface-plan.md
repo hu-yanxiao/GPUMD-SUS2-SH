@@ -309,9 +309,11 @@ time = 42.933 s
 speed = 4.77022e6 atom*step/s
 ```
 
-The tested force basic-gradient cache did not improve performance and is kept
-disabled by default. It can still be enabled with `sus2_sh_force_grad_cache=1`
-for experiments when `alpha_index_basic_count <= 64`.
+The force basic-gradient cache was retested after the SH basic kernel changes
+and is now enabled by default when `alpha_index_basic_count <= 64`. It can still
+be disabled with `sus2_sh_force_grad_cache=0`. The cache keeps each center
+atom's basic adjoints in a small local array while traversing its neighbors;
+this preserves the force expression but avoids repeated global gradient loads.
 
 The next material optimization should not continue tuning the flat product DAG.
 SUS2-SH's intended engineering advantage is a standardized block/layer
@@ -384,3 +386,41 @@ backward: (layer, source block, atom tile, source m)
 
 This keeps the standardized SH/CG tensor-product representation while avoiding
 both per-atom serial DAG execution and overly fragmented component-row kernels.
+
+### 2026-05-13 Basis/Force Cache Pass
+
+Accepted low-risk changes:
+
+- `eval_real_sh()` clears only the active `(lmax+1)^2` values for the no-derivative
+  basic-moment path, while the force derivative path keeps the original fixed
+  `kMaxSHComponents` clearing.
+- `gpu_sh_compute_basic` dispatches to 64/128/basic-capacity specializations so
+  the common l3k3 case uses a 64-entry local basic array instead of the 256-entry
+  fallback.
+- `sus2_sh_force_grad_cache` defaults on for `alpha_index_basic_count <= 64`.
+- The block-forward tensor experiment was removed after profiling showed it was
+  slower than the row-adjoint path.
+
+Verified on the 1,024,000 atom Cu-Zr l3k3 model on A100:
+
+```text
+default flat path:
+  case    = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_l3k3_1m_default_flat_profile200_20260513
+  basic   ~= 35.8 ms/step
+  product ~= 71.5 ms/step
+  force   ~= 77.7-78.0 ms/step
+  speed   = 5.14507e6 atom*step/s
+
+tensor row-adjoint path:
+  case    = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_l3k3_1m_default_tensor_profile200_20260513
+  basic   ~= 35.8 ms/step
+  product ~= 83.8 ms/step
+  force   ~= 77.1-77.6 ms/step
+  speed   = 4.92559e6 atom*step/s
+```
+
+Current conclusion: basis/basic is no longer the immediate bottleneck for l3k3;
+the default flat product path is still faster than the current tensor row-adjoint
+implementation. The next meaningful tensor-product optimization should target
+block/source-block tiled contractions or a compact standard layer program, not
+the rejected one-thread-per-block forward kernel.
