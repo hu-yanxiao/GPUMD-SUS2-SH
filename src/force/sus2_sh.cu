@@ -493,6 +493,25 @@ bool parse_sh_tensor_product_parallel(const SHHostModel& model, int nopts, const
   return use_tensor;
 }
 
+bool parse_sh_compact_serial_product(const SHHostModel& model, int nopts, const char** opts)
+{
+  bool use_compact = true;
+  const char* env = std::getenv("SUS2_SH_GPUMD_COMPACT_SERIAL_PRODUCT");
+  if (env != nullptr) {
+    use_compact = parse_bool_value(env, "SUS2_SH_GPUMD_COMPACT_SERIAL_PRODUCT");
+  }
+  const int begin = std::min(nopts, model.species_count);
+  for (int i = begin; i < nopts; ++i) {
+    const std::string option = opts[i] == nullptr ? "" : opts[i];
+    if (starts_with(option, "sus2_sh_compact_serial_product=") ||
+        starts_with(option, "sus2_compact_serial_product=")) {
+      const size_t eq = option.find('=');
+      use_compact = parse_bool_value(option.substr(eq + 1), option.substr(0, eq));
+    }
+  }
+  return use_compact;
+}
+
 int parse_sh_tensor_product_grid_cap(const SHHostModel& model, int nopts, const char** opts)
 {
   int cap = 8192;
@@ -2283,6 +2302,79 @@ static __global__ void gpu_sh_tensor_product_back_rows(
   }
 }
 
+template <typename RealT, typename GradT>
+static __global__ void gpu_sh_forward_energy_backward_compact_rows(
+  int N,
+  SHDeviceModel model,
+  const int* type,
+  RealT* moments,
+  GradT* grads,
+  double* potential)
+{
+  const int atom = blockIdx.x * blockDim.x + threadIdx.x;
+  if (atom >= N) {
+    return;
+  }
+
+  for (int layer = 1; layer <= model.sh_cg_layer_count; ++layer) {
+    const int row_begin = model.sh_cg_layer_offsets[layer];
+    const int row_end = model.sh_cg_layer_offsets[layer + 1];
+    for (int row = row_begin; row < row_end; ++row) {
+      const int row_base = row * 5;
+      const int left_base = model.sh_cg_rows_int[row_base + 0];
+      const int right_base = model.sh_cg_rows_int[row_base + 1];
+      const int target = model.sh_cg_rows_int[row_base + 2];
+      const int term_begin = model.sh_cg_rows_int[row_base + 3];
+      const int term_count = model.sh_cg_rows_int[row_base + 4];
+      RealT sum = static_cast<RealT>(0.0);
+      for (int t = 0; t < term_count; ++t) {
+        const int term = term_begin + t;
+        const int term_base = term * 2;
+        const int left = left_base + model.sh_cg_row_terms_int[term_base + 0];
+        const int right = right_base + model.sh_cg_row_terms_int[term_base + 1];
+        const RealT coeff = sh_cg_row_term_coeff<RealT>(model, term);
+        sum += coeff * moments[static_cast<size_t>(left) * N + atom] *
+               moments[static_cast<size_t>(right) * N + atom];
+      }
+      moments[static_cast<size_t>(target) * N + atom] = sum;
+    }
+  }
+
+  const int type_i = type[atom];
+  const RealT center_coeff = sh_species_coeff<RealT>(model, type_i);
+  RealT site_energy = sh_shift_coeff<RealT>(model, type_i) + center_coeff;
+  for (int s = 0; s < model.alpha_scalar_moments; ++s) {
+    const int moment_id = model.alpha_moment_mapping[s];
+    const RealT coeff = sh_moment_coeff<RealT>(model, s);
+    site_energy += center_coeff * coeff * moments[static_cast<size_t>(moment_id) * N + atom];
+    grads[static_cast<size_t>(moment_id) * N + atom] +=
+      static_cast<GradT>(center_coeff * coeff);
+  }
+  potential[atom] += static_cast<double>(site_energy);
+
+  for (int layer = model.sh_cg_layer_count; layer >= 1; --layer) {
+    const int row_begin = model.sh_cg_back_layer_offsets[layer];
+    const int row_end = model.sh_cg_back_layer_offsets[layer + 1];
+    for (int row = row_begin; row < row_end; ++row) {
+      const int row_base = row * 3;
+      const int source = model.sh_cg_back_rows_int[row_base + 0];
+      const int term_begin = model.sh_cg_back_rows_int[row_base + 1];
+      const int term_count = model.sh_cg_back_rows_int[row_base + 2];
+      RealT sum = static_cast<RealT>(0.0);
+      for (int t = 0; t < term_count; ++t) {
+        const int term = term_begin + t;
+        const int term_base = term * 2;
+        const int target = model.sh_cg_back_terms_int[term_base + 0];
+        const int other = model.sh_cg_back_terms_int[term_base + 1];
+        const RealT coeff = sh_cg_back_term_coeff<RealT>(model, term);
+        sum += coeff * static_cast<RealT>(grads[static_cast<size_t>(target) * N + atom]) *
+               moments[static_cast<size_t>(other) * N + atom];
+      }
+      grads[static_cast<size_t>(source) * N + atom] += static_cast<GradT>(sum);
+    }
+  }
+}
+
 template <typename GradT, typename RealT>
 __device__ __forceinline__ void compute_sh_edge_derivative(
   int N,
@@ -2762,8 +2854,14 @@ SUS2_SH::SUS2_SH(
     parse_sh_cg_block_forward(host_model, num_potential_options, potential_options);
   use_tensor_product_parallel_ =
     parse_sh_tensor_product_parallel(host_model, num_potential_options, potential_options);
+  use_compact_serial_product_ =
+    parse_sh_compact_serial_product(host_model, num_potential_options, potential_options);
   if (use_tensor_product_parallel_) {
     use_cg_block_forward_ = false;
+    use_compact_serial_product_ = false;
+  }
+  if (use_cg_block_forward_) {
+    use_compact_serial_product_ = false;
   }
   tensor_product_grid_cap_ =
     parse_sh_tensor_product_grid_cap(host_model, num_potential_options, potential_options);
@@ -2967,11 +3065,12 @@ SUS2_SH::SUS2_SH(
     alpha_scalar_moments_,
     rc);
   printf(
-    "SUS2-SH GPUMD precision mode: %s; force self-buffer: %s; force basic-grad cache: %s; cg-block forward: %s; tensor-product parallel: %s; tensor grid cap=%d.\n",
+    "SUS2-SH GPUMD precision mode: %s; force self-buffer: %s; force basic-grad cache: %s; cg-block forward: %s; compact serial product: %s; tensor-product parallel: %s; tensor grid cap=%d.\n",
     use_float_moments_ ? "NEP-like float moments/gradients/local arithmetic" : "double moments/local arithmetic",
     use_force_self_buffer_ ? "on" : "off",
     use_force_grad_cache_ ? "on" : "off",
     use_cg_block_forward_ ? "on" : "off",
+    use_compact_serial_product_ ? "on" : "off",
     use_tensor_product_parallel_ ? "on" : "off",
     tensor_product_grid_cap_);
   printf(
@@ -3137,12 +3236,14 @@ void SUS2_SH::compute(
   const size_t virial_size = static_cast<size_t>(num_atoms) * 9;
   stage_start = profile_start();
   if (use_float_moments_) {
-    if (!use_cg_block_forward_ && !use_tensor_product_parallel_) {
+    if (!use_cg_block_forward_ && !use_tensor_product_parallel_ &&
+        !use_compact_serial_product_) {
       CHECK(gpuMemset(moment_vals_float_.data(), 0, moment_size * sizeof(float)));
     }
     CHECK(gpuMemset(moment_grads_float_.data(), 0, moment_size * sizeof(float)));
   } else {
-    if (!use_cg_block_forward_ && !use_tensor_product_parallel_) {
+    if (!use_cg_block_forward_ && !use_tensor_product_parallel_ &&
+        !use_compact_serial_product_) {
       CHECK(gpuMemset(moment_vals_.data(), 0, moment_size * sizeof(double)));
     }
     CHECK(gpuMemset(moment_grads_.data(), 0, moment_size * sizeof(double)));
@@ -3241,6 +3342,10 @@ void SUS2_SH::compute(
           num_atoms, layer, model, moment_vals_float_.data(), moment_grads_float_.data());
         GPU_CHECK_KERNEL
       }
+    } else if (use_compact_serial_product_) {
+      gpu_sh_forward_energy_backward_compact_rows<float, float><<<grid_size, kBlockSize>>>(
+        num_atoms, model, type.data(), moment_vals_float_.data(), moment_grads_float_.data(),
+        potential.data());
     } else if (use_cg_block_forward_) {
       gpu_sh_forward_energy_backward_cg_blocks<float, float><<<grid_size, kBlockSize>>>(
         num_atoms, model, type.data(), moment_vals_float_.data(), moment_grads_float_.data(),
@@ -3318,6 +3423,10 @@ void SUS2_SH::compute(
           num_atoms, layer, model, moment_vals_.data(), moment_grads_.data());
         GPU_CHECK_KERNEL
       }
+    } else if (use_compact_serial_product_) {
+      gpu_sh_forward_energy_backward_compact_rows<double, double><<<grid_size, kBlockSize>>>(
+        num_atoms, model, type.data(), moment_vals_.data(), moment_grads_.data(),
+        potential.data());
     } else if (use_cg_block_forward_) {
       gpu_sh_forward_energy_backward_cg_blocks<double, double><<<grid_size, kBlockSize>>>(
         num_atoms, model, type.data(), moment_vals_.data(), moment_grads_.data(),

@@ -56,6 +56,7 @@ private:
   bool use_force_grad_cache_ = false;
   bool use_cg_block_forward_ = false;
   bool use_tensor_product_parallel_ = false;
+  bool use_compact_serial_product_ = false;
   bool use_cached_neighbor_displacements_ = false;
   bool profile_enabled_ = false;
   int profile_interval_ = 50;

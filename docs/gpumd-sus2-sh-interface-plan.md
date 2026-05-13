@@ -424,3 +424,60 @@ the default flat product path is still faster than the current tensor row-adjoin
 implementation. The next meaningful tensor-product optimization should target
 block/source-block tiled contractions or a compact standard layer program, not
 the rejected one-thread-per-block forward kernel.
+
+### 2026-05-13 Compact Serial Row Program
+
+Accepted change: the default non-tensor product path now uses the compact
+target-row/source-row program inside the existing per-atom fused kernel. This
+keeps one product kernel launch and the same layer-ordered chain rule, but each
+forward target moment and each backward source gradient is accumulated in a
+register and written once. Because all tensor targets are assigned explicitly,
+the product value buffer no longer needs the full `alpha_moments_count * N`
+memset. The old flat product loop remains available with
+`sus2_sh_compact_serial_product=0`.
+
+Verified on the 1,024,000 atom Cu-Zr l3k3 model on A100:
+
+```text
+case    = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_l3k3_1m_compact_serial_profile200_20260513
+basic   ~= 35.7-35.8 ms/step
+product ~= 71.4-71.5 ms/step
+force   ~= 77.0-77.2 ms/step
+memset  ~= 3.0 ms/step
+speed   = 5.23633e6 atom*step/s
+```
+
+Thermo comparison against the previous flat path over the 200-step profile run
+showed maximum total-energy difference `3.1e-3 eV` for 1,024,000 atoms, i.e.
+about `3e-9 eV/atom`, consistent with float summation order differences.
+
+Follow-up basis probe from the Cartesian-polynomial observation: a dedicated
+value-only `eval_real_sh` path was tested so the basic-moment kernel would not
+share the derivative helper. This was not retained. On the same l3k3 A100
+profile, `basic` stayed at about `35.7-36.0 ms/step` and speed was
+`5.23573e6 atom*step/s`, indistinguishable from the compact-serial run. This
+confirms that the current SH evaluation is already polynomial-based and that the
+remaining basic-stage cost is dominated by neighbor traversal, radial
+tanh/Chebyshev evaluation, and basic-channel accumulation rather than the
+Cartesian harmonic value formulas.
+
+### 2026-05-13 Block/Topology Tile Probe
+
+Tested a topology-aware CG-block/atom-tile forward kernel grouped by layer and
+`(l1,l2)->L` topology, while keeping the existing source-row backward path for
+chain-rule safety. The code was reverted after profiling because it increased
+the product stage substantially:
+
+```text
+case    = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_l3k3_1m_tensor_blocktile_profile200_20260513
+basic   ~= 35.8 ms/step
+product ~= 120.3 ms/step
+force   ~= 77.2 ms/step
+speed   = 4.18693e6 atom*step/s
+```
+
+Conclusion: merely batching one CG block over atom tiles is too coarse and
+loads too much shared/register state for l3k3. The useful form of topology
+classification is more likely to be specialized compact component-row kernels
+or layer programs per `(l1,l2,L)` type, not a generic block tile that serializes
+all terms for each atom thread.
