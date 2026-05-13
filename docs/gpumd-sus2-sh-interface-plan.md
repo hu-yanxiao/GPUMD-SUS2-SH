@@ -329,3 +329,58 @@ For long-term robustness, SUS2-SH model generation should write explicit
 real-SH and CG phase convention/version. GPUMD can then validate and execute the
 standard representation directly instead of inferring it from a flat product
 list.
+
+### 2026-05-13 Tensor-Product Tests
+
+The GPUMD loader now reconstructs the same standard real-CG graph used by
+SUS2-SH model generation and validates it against the saved `sh_products`:
+
+```text
+tensor_blocks = 701
+cg_blocks     = 689
+cg_terms      = 5787
+cg_rows       = 1301
+cg_row_terms  = 5787
+cg_back_rows  = 783
+cg_back_terms = 11574
+layers        = 2
+```
+
+The first true tensor-product experiment uses component rows for the forward
+CG contraction and source-component adjoint rows for the reverse pass. This is
+mathematically correct on the 1,024,000 atom Cu-Zr test: the one-step total
+energy agrees with the flat path to displayed precision, with stress-level
+differences around `1e-5` from floating-point ordering.
+
+Performance on A100:
+
+```text
+flat packed-basic path:
+  product ~= 71-73 ms/step
+  speed   ~= 4.79e6 atom*step/s
+
+tensor row-adjoint, original 65535 CTA cap:
+  product ~= 87.8 ms/step
+  speed   ~= 4.58e6 atom*step/s
+
+tensor row-adjoint, 8192 CTA cap:
+  product ~= 84.4 ms/step
+  speed   ~= 4.65e6 atom*step/s
+```
+
+A 2D `(row, atom-tile)` launch that removed the flattened `task / N` and
+`task % N` indexing was tested and rejected. It remained correct, but product
+time rose to about `141 ms/step` because each row received too few CTAs and the
+kernel turned into long per-thread atom loops. That experiment was reverted.
+
+Current conclusion: the tensor-product direction is right, but global
+component-row kernels are not the final GPU mapping. The next implementation
+should use layer-synchronous CG block/source-block tiles:
+
+```text
+forward:  (layer, CG block, atom tile, output M)
+backward: (layer, source block, atom tile, source m)
+```
+
+This keeps the standardized SH/CG tensor-product representation while avoiding
+both per-atom serial DAG execution and overly fragmented component-row kernels.

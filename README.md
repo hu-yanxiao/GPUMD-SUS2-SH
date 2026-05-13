@@ -26,10 +26,13 @@ The first SH path prioritizes correctness:
 - `alpha_index_basic = {(k,l,m), ...}` is read as SH basic moments;
 - saved `sh_products = {left,right,target,coeff}` are executed in topological
   order and reversed for forces;
+- the standard SUS2-SH real-CG graph is reconstructed on load and validated
+  against the saved flat products;
 - `RBChebyshev_sss`, `scaling_map = LK`, float moments, and direct radial
   recurrence are the default supported path.
 - basic metadata is packed as `(mu,yidx)` for the current low-risk fast path;
-  the next major optimization is standardized CG block/layer execution.
+  experimental tensor-product execution is available for profiling, but is not
+  the default production path yet.
 
 ## Runtime Defaults
 
@@ -100,6 +103,16 @@ The default `sus2_float=1` stores SH moments and reverse gradients in float,
 evaluates local moment arithmetic in float, and still writes GPUMD
 energy/force/virial outputs to the existing double arrays.
 
+The experimental tensor-product path can be enabled with:
+
+```text
+potential p.mtp Cu Zr sus2_sh_tensor_product_parallel=1
+```
+
+It reconstructs the standardized CG rows/layers from the model and uses a
+source-adjoint reverse pass. The current default tensor grid cap is 8192 CTAs;
+override it for profiling with `sus2_sh_tensor_grid_cap=<n>`.
+
 ## Validation Snapshot
 
 The experimental A100 build uses:
@@ -115,4 +128,5 @@ Current status:
 ```text
 Cu-Zr l3k3 1.024M first SH backend: 4.65405e6 atom-step/s
 Cu-Zr l3k3 1.024M packed-basic metadata path: 4.77022e6 atom-step/s
+Cu-Zr l3k3 1.024M tensor row-adjoint path: correct, ~4.65e6 atom-step/s
 ```
