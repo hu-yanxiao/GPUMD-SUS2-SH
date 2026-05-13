@@ -111,7 +111,10 @@ Add a new `SUS2_SH` potential class, selected when the model file starts with
 potential_tag = SUS2-SH
 ```
 
-Keep the old tensor `SUS2_V11` class available for non-SH SUS2 models.
+Do not compile the old tensor `SUS2_V11` class in this independent SH build.
+Moment-tensor SUS2 models remain in the separate `GPUMD-SUS2` repository. This
+keeps the SH compile path short and avoids carrying tensor product-codegen
+optimizations that cannot be reused by the SH `sh_products`/CG path.
 
 Required parser fields:
 
@@ -146,6 +149,18 @@ The first correctness path should be deliberately simple:
 This path is expected to be slower than the final target, but it fixes parsing,
 physics, units, force signs, virial convention, periodic image handling, and
 model compatibility first.
+
+First implementation status:
+
+- `src/force/sus2_sh.cu/.cuh` implements this generic path;
+- `src/force/force.cu` dispatches `MTP` plus `potential_tag = SUS2-SH` to
+  `SUS2_SH`;
+- non-SH `MTP` files are rejected instead of falling back to the old tensor
+  backend;
+- the default SH runtime mode is the tested SUS2 setting: float moments and
+  direct radial recurrence;
+- the initial supported subset is `RBChebyshev_sss`, `scaling_map = LK`, and
+  `sh_l_max <= 4`.
 
 ### Phase 2: Real-SH Basic Fast Path
 

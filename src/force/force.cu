@@ -34,7 +34,7 @@ The driver class calculating force and related quantities.
 #include "nep_multigpu.cuh"
 #include "nep_charge.cuh"
 #include "potential.cuh"
-#include "sus2_v11.cuh"
+#include "sus2_sh.cuh"
 #include "tersoff1988.cuh"
 #include "tersoff1989.cuh"
 #include "tersoff_mini.cuh"
@@ -110,7 +110,13 @@ void Force::parse_potential(
   } else if (strcmp(potential_name, "adp") == 0) {
     potential.reset(new ADP(param[1], number_of_atoms));
   } else if (is_sus2_mtp) {
-    potential.reset(new SUS2_V11(param[1], number_of_atoms, num_param - 2, param + 2));
+    if (is_sus2_sh_potential_file(param[1])) {
+      potential.reset(new SUS2_SH(param[1], number_of_atoms, num_param - 2, param + 2));
+    } else {
+      PRINT_INPUT_ERROR(
+        "This GPUMD-SUS2-SH build accepts only SUS2-SH MTP models with potential_tag = SUS2-SH.\n"
+        "Use the separate GPUMD-SUS2 tensor project for moment-tensor SUS2 models.\n");
+    }
   } else if (strcmp(potential_name, "fcp") == 0) {
     potential.reset(new FCP(fid_potential, num_types, number_of_atoms, box));
     is_fcp = true;

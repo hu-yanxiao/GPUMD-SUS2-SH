@@ -10,11 +10,10 @@ overlay_root=$1
 gpumd_root=$2
 
 required_files=(
-  "src/force/sus2_v11.cu"
-  "src/force/sus2_v11.cuh"
+  "src/force/sus2_sh.cu"
+  "src/force/sus2_sh.cuh"
   "src/force/force.cu"
   "src/model/read_xyz.cu"
-  "tools/sus2_v11_codegen.py"
 )
 
 for rel in "${required_files[@]}"; do
@@ -37,7 +36,18 @@ for rel in "${required_files[@]}"; do
   echo "installed ${rel}"
 done
 
-chmod +x "${gpumd_root}/tools/sus2_v11_codegen.py"
+stale_files=(
+  "src/force/sus2_v11.cu"
+  "src/force/sus2_v11.cuh"
+  "tools/sus2_v11_codegen.py"
+)
+
+for rel in "${stale_files[@]}"; do
+  if [[ -e "${gpumd_root}/${rel}" ]]; then
+    rm -f "${gpumd_root}/${rel}"
+    echo "removed stale tensor file ${rel}"
+  fi
+done
 
 cat <<EOF
 
@@ -50,4 +60,3 @@ Build example:
   module load gcc/12.2.0 cuda/12.4
   make -j2 gpumd CUDA_ARCH=-arch=sm_80
 EOF
-
