@@ -12,6 +12,7 @@
 #include <cmath>
 #include <complex>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -29,7 +30,10 @@ constexpr int kMaxSHRadialFuncs = 32;
 constexpr int kMaxSHRbSize = 16;
 constexpr int kMaxSHBasics = 256;
 constexpr int kSHForceGradCache64 = 64;
+constexpr int kSHMaxConstForwardU32 = 16000;
 constexpr double kPi = 3.141592653589793238462643383279502884;
+
+__constant__ unsigned int c_sh_forward_u32[kSHMaxConstForwardU32];
 
 enum SHProfileStage {
   sh_profile_neighbor = 0,
@@ -510,6 +514,63 @@ bool parse_sh_compact_serial_product(const SHHostModel& model, int nopts, const 
     }
   }
   return use_compact;
+}
+
+bool parse_sh_const_forward_rows(const SHHostModel& model, int nopts, const char** opts)
+{
+  bool use_const = true;
+  const char* env = std::getenv("SUS2_SH_GPUMD_CONST_FORWARD");
+  if (env != nullptr) {
+    use_const = parse_bool_value(env, "SUS2_SH_GPUMD_CONST_FORWARD");
+  }
+  const int begin = std::min(nopts, model.species_count);
+  for (int i = begin; i < nopts; ++i) {
+    const std::string option = opts[i] == nullptr ? "" : opts[i];
+    if (starts_with(option, "sus2_sh_const_forward=") ||
+        starts_with(option, "sus2_const_forward=")) {
+      const size_t eq = option.find('=');
+      use_const = parse_bool_value(option.substr(eq + 1), option.substr(0, eq));
+    }
+  }
+  return use_const;
+}
+
+bool parse_sh_static_basic(const SHHostModel& model, int nopts, const char** opts)
+{
+  bool use_static = true;
+  const char* env = std::getenv("SUS2_SH_GPUMD_STATIC_BASIC");
+  if (env != nullptr) {
+    use_static = parse_bool_value(env, "SUS2_SH_GPUMD_STATIC_BASIC");
+  }
+  const int begin = std::min(nopts, model.species_count);
+  for (int i = begin; i < nopts; ++i) {
+    const std::string option = opts[i] == nullptr ? "" : opts[i];
+    if (starts_with(option, "sus2_sh_static_basic=") ||
+        starts_with(option, "sus2_static_basic=")) {
+      const size_t eq = option.find('=');
+      use_static = parse_bool_value(option.substr(eq + 1), option.substr(0, eq));
+    }
+  }
+  return use_static;
+}
+
+bool parse_sh_terminal_scalar_fusion(const SHHostModel& model, int nopts, const char** opts)
+{
+  bool use_fusion = true;
+  const char* env = std::getenv("SUS2_SH_GPUMD_TERMINAL_SCALAR_FUSION");
+  if (env != nullptr) {
+    use_fusion = parse_bool_value(env, "SUS2_SH_GPUMD_TERMINAL_SCALAR_FUSION");
+  }
+  const int begin = std::min(nopts, model.species_count);
+  for (int i = begin; i < nopts; ++i) {
+    const std::string option = opts[i] == nullptr ? "" : opts[i];
+    if (starts_with(option, "sus2_sh_terminal_scalar_fusion=") ||
+        starts_with(option, "sus2_terminal_scalar_fusion=")) {
+      const size_t eq = option.find('=');
+      use_fusion = parse_bool_value(option.substr(eq + 1), option.substr(0, eq));
+    }
+  }
+  return use_fusion;
 }
 
 int parse_sh_tensor_product_grid_cap(const SHHostModel& model, int nopts, const char** opts)
@@ -1543,6 +1604,38 @@ void build_direct_radial_tables(
   }
 }
 
+bool has_static_full_sh_basic_layout(const SHHostModel& model)
+{
+  if (model.sh_l_max < 0 || model.sh_l_max > 4 ||
+      model.sh_k_max <= 0 || model.sh_k_max > 4 ||
+      model.rb_size != 10) {
+    return false;
+  }
+  const int expected_count =
+    model.sh_k_max * (model.sh_l_max + 1) * (model.sh_l_max + 1);
+  if (model.alpha_basic_count != expected_count ||
+      static_cast<int>(model.alpha_basic.size()) != expected_count * 3) {
+    return false;
+  }
+
+  int index = 0;
+  for (int l = model.sh_l_max; l >= 0; --l) {
+    for (int k = model.sh_k_max - 1; k >= 0; --k) {
+      const int mu = k * (model.sh_l_max + 1) + l;
+      for (int m = -l; m <= l; ++m) {
+        const int base = index * 3;
+        if (model.alpha_basic[base + 0] != mu ||
+            model.alpha_basic[base + 1] != l ||
+            model.alpha_basic[base + 2] != m) {
+          return false;
+        }
+        ++index;
+      }
+    }
+  }
+  return true;
+}
+
 struct SHDeviceModel {
   int species_count;
   int sh_l_max;
@@ -1579,6 +1672,8 @@ struct SHDeviceModel {
   const int* sh_cg_row_terms_int;
   const double* sh_cg_row_terms_coeff;
   const float* sh_cg_row_terms_coeff_float;
+  const int* sh_cg_row_scalar_index;
+  const int* sh_terminal_moment_flags;
   const int* sh_cg_back_rows_int;
   const int* sh_cg_back_terms_int;
   const double* sh_cg_back_terms_coeff;
@@ -1589,6 +1684,8 @@ struct SHDeviceModel {
   const float* radial_direct_coeffs;
   const float* radial_direct_scal_s;
   bool use_float_model_params;
+  bool use_const_forward_rows;
+  bool use_terminal_scalar_fusion;
 };
 
 template <typename RealT>
@@ -1638,6 +1735,12 @@ __device__ __forceinline__ RealT sh_cg_back_term_coeff(const SHDeviceModel& mode
 {
   return model.use_float_model_params ? static_cast<RealT>(model.sh_cg_back_terms_coeff_float[idx])
                                       : static_cast<RealT>(model.sh_cg_back_terms_coeff[idx]);
+}
+
+template <typename RealT>
+__device__ __forceinline__ RealT sh_const_forward_coeff(unsigned int bits)
+{
+  return static_cast<RealT>(__uint_as_float(bits));
 }
 
 __device__ __forceinline__ int sh_flat_index(int l, int m)
@@ -2038,6 +2141,250 @@ static __global__ void gpu_sh_compute_basic(
   }
 }
 
+template <typename RealT, int L>
+__device__ __forceinline__ void eval_real_sh_static_values(
+  RealT x,
+  RealT y,
+  RealT z,
+  RealT r,
+  RealT* sh)
+{
+  const RealT inv_r = static_cast<RealT>(1.0) / r;
+  const RealT inv_r2 = inv_r * inv_r;
+  const RealT inv_r3 = inv_r2 * inv_r;
+  const RealT x2 = x * x;
+  const RealT y2 = y * y;
+  const RealT z2 = z * z;
+  const RealT xy = x * y;
+  const RealT xz = x * z;
+  const RealT yz = y * z;
+
+  sh[0] = static_cast<RealT>(0.5 / sqrt(kPi));
+  if (L == 0) {
+    return;
+  }
+
+  const RealT c1 = static_cast<RealT>(0.5 * sqrt(3.0 / kPi));
+  sh[1] = c1 * y * inv_r;
+  sh[2] = c1 * z * inv_r;
+  sh[3] = c1 * x * inv_r;
+  if (L == 1) {
+    return;
+  }
+
+  const RealT c2a = static_cast<RealT>(0.5 * sqrt(15.0 / kPi));
+  const RealT c20 = static_cast<RealT>(0.25 * sqrt(5.0 / kPi));
+  const RealT c22 = static_cast<RealT>(0.25 * sqrt(15.0 / kPi));
+  sh[4] = c2a * xy * inv_r2;
+  sh[5] = c2a * yz * inv_r2;
+  sh[6] = c20 * (static_cast<RealT>(2.0) * z2 - x2 - y2) * inv_r2;
+  sh[7] = c2a * xz * inv_r2;
+  sh[8] = c22 * (x2 - y2) * inv_r2;
+  if (L == 2) {
+    return;
+  }
+
+  const RealT c33 = static_cast<RealT>(0.125 * sqrt(70.0 / kPi));
+  const RealT c32 = static_cast<RealT>(0.5 * sqrt(105.0 / kPi));
+  const RealT c31 = static_cast<RealT>(0.125 * sqrt(42.0 / kPi));
+  const RealT c30 = static_cast<RealT>(0.25 * sqrt(7.0 / kPi));
+  const RealT c3p2 = static_cast<RealT>(0.25 * sqrt(105.0 / kPi));
+  const RealT p3m3 = y * (static_cast<RealT>(3.0) * x2 - y2);
+  const RealT a31 = static_cast<RealT>(4.0) * z2 - x2 - y2;
+  const RealT p30 = z * (static_cast<RealT>(2.0) * z2 -
+                         static_cast<RealT>(3.0) * x2 -
+                         static_cast<RealT>(3.0) * y2);
+  const RealT p32 = z * (x2 - y2);
+  const RealT p33 = x * (x2 - static_cast<RealT>(3.0) * y2);
+  sh[9] = c33 * p3m3 * inv_r3;
+  sh[10] = c32 * xy * z * inv_r3;
+  sh[11] = c31 * y * a31 * inv_r3;
+  sh[12] = c30 * p30 * inv_r3;
+  sh[13] = c31 * x * a31 * inv_r3;
+  sh[14] = c3p2 * p32 * inv_r3;
+  sh[15] = c33 * p33 * inv_r3;
+  if (L == 3) {
+    return;
+  }
+
+  const RealT inv_r4 = inv_r2 * inv_r2;
+  const RealT c44m = static_cast<RealT>(0.75 * sqrt(35.0 / kPi));
+  const RealT c43 = static_cast<RealT>(0.375 * sqrt(70.0 / kPi));
+  const RealT c42m = static_cast<RealT>(0.75 * sqrt(5.0 / kPi));
+  const RealT c41 = static_cast<RealT>(0.375 * sqrt(10.0 / kPi));
+  const RealT c40 = static_cast<RealT>(0.1875 / sqrt(kPi));
+  const RealT c42 = static_cast<RealT>(0.375 * sqrt(5.0 / kPi));
+  const RealT c44 = static_cast<RealT>(0.1875 * sqrt(35.0 / kPi));
+  const RealT rho2 = x2 + y2;
+  const RealT p44base = x2 - y2;
+  const RealT p4m4 = x * y * p44base;
+  const RealT a42 = static_cast<RealT>(6.0) * z2 - rho2;
+  const RealT a41 = static_cast<RealT>(4.0) * z2 - static_cast<RealT>(3.0) * rho2;
+  const RealT p40 = static_cast<RealT>(8.0) * z2 * z2 -
+                    static_cast<RealT>(24.0) * z2 * rho2 +
+                    static_cast<RealT>(3.0) * rho2 * rho2;
+  const RealT p44 = x2 * x2 - static_cast<RealT>(6.0) * x2 * y2 + y2 * y2;
+  sh[16] = c44m * p4m4 * inv_r4;
+  sh[17] = c43 * z * p3m3 * inv_r4;
+  sh[18] = c42m * x * y * a42 * inv_r4;
+  sh[19] = c41 * y * z * a41 * inv_r4;
+  sh[20] = c40 * p40 * inv_r4;
+  sh[21] = c41 * x * z * a41 * inv_r4;
+  sh[22] = c42 * p44base * a42 * inv_r4;
+  sh[23] = c43 * z * p33 * inv_r4;
+  sh[24] = c44 * p44 * inv_r4;
+}
+
+template <typename RealT, int L, int K, int RbSize>
+static __global__ void gpu_sh_compute_basic_static(
+  int N,
+  Box box,
+  double cutoff_square,
+  bool use_cached_displacements,
+  SHDeviceModel model,
+  const int* type,
+  const int* neighbor_count,
+  const int* neighbor_atoms,
+  const double* neighbor_dx,
+  const double* neighbor_dy,
+  const double* neighbor_dz,
+  const double* x,
+  const double* y,
+  const double* z,
+  RealT* moments)
+{
+  constexpr int Components = (L + 1) * (L + 1);
+  constexpr int RadialFuncs = K * (L + 1);
+  constexpr int BasicCount = K * Components;
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= N || model.alpha_basic_count != BasicCount) {
+    return;
+  }
+
+  RealT acc[BasicCount];
+#pragma unroll
+  for (int b = 0; b < BasicCount; ++b) {
+    acc[b] = static_cast<RealT>(0.0);
+  }
+
+  const int type_i = type[i];
+  const int count = neighbor_count[i];
+  for (int nbr = 0; nbr < count; ++nbr) {
+    const size_t edge = static_cast<size_t>(nbr) * N + i;
+    const int j = neighbor_atoms[edge];
+    RealT dx;
+    RealT dy;
+    RealT dz;
+    load_sh_edge_displacement(
+      use_cached_displacements, N, box, edge, i, j, neighbor_dx, neighbor_dy, neighbor_dz,
+      x, y, z, dx, dy, dz);
+    const RealT r2 = dx * dx + dy * dy + dz * dz;
+    if (r2 >= static_cast<RealT>(cutoff_square)) {
+      continue;
+    }
+    const RealT r = sqrt(r2);
+    const int pair = type_i * model.species_count + type[j];
+    RealT radial_vals[RadialFuncs];
+    RealT sh[Components];
+    sh_direct_radial_vals_ders_static<RealT, RadialFuncs, RbSize>(
+      model, pair, r, radial_vals, static_cast<RealT*>(nullptr));
+    eval_real_sh_static_values<RealT, L>(dx, dy, dz, r, sh);
+
+    int b = 0;
+#pragma unroll
+    for (int l = L; l >= 0; --l) {
+#pragma unroll
+      for (int k = K - 1; k >= 0; --k) {
+        const RealT radial = radial_vals[k * (L + 1) + l];
+        const int ybase = l * l;
+#pragma unroll
+        for (int c = 0; c < 2 * l + 1; ++c) {
+          acc[b++] += radial * sh[ybase + c];
+        }
+      }
+    }
+  }
+
+#pragma unroll
+  for (int b = 0; b < BasicCount; ++b) {
+    moments[static_cast<size_t>(b) * N + i] = acc[b];
+  }
+}
+
+template <typename RealT>
+bool launch_sh_compute_basic_static(
+  int lmax,
+  int kmax,
+  int rb_size,
+  int grid_size,
+  int N,
+  Box box,
+  double cutoff_square,
+  bool use_cached_displacements,
+  SHDeviceModel model,
+  const int* type,
+  const int* neighbor_count,
+  const int* neighbor_atoms,
+  const double* neighbor_dx,
+  const double* neighbor_dy,
+  const double* neighbor_dz,
+  const double* x,
+  const double* y,
+  const double* z,
+  RealT* moments)
+{
+  if (rb_size != 10 || kmax < 1 || kmax > 4 || lmax < 0 || lmax > 4) {
+    return false;
+  }
+
+#define SUS2_SH_LAUNCH_STATIC_BASIC_FOR_L(LVAL)                                           \
+  do {                                                                                    \
+    switch (kmax) {                                                                       \
+      case 1:                                                                             \
+        gpu_sh_compute_basic_static<RealT, LVAL, 1, 10><<<grid_size, kBlockSize>>>(       \
+          N, box, cutoff_square, use_cached_displacements, model, type, neighbor_count,   \
+          neighbor_atoms, neighbor_dx, neighbor_dy, neighbor_dz, x, y, z, moments);        \
+        return true;                                                                      \
+      case 2:                                                                             \
+        gpu_sh_compute_basic_static<RealT, LVAL, 2, 10><<<grid_size, kBlockSize>>>(       \
+          N, box, cutoff_square, use_cached_displacements, model, type, neighbor_count,   \
+          neighbor_atoms, neighbor_dx, neighbor_dy, neighbor_dz, x, y, z, moments);        \
+        return true;                                                                      \
+      case 3:                                                                             \
+        gpu_sh_compute_basic_static<RealT, LVAL, 3, 10><<<grid_size, kBlockSize>>>(       \
+          N, box, cutoff_square, use_cached_displacements, model, type, neighbor_count,   \
+          neighbor_atoms, neighbor_dx, neighbor_dy, neighbor_dz, x, y, z, moments);        \
+        return true;                                                                      \
+      case 4:                                                                             \
+        gpu_sh_compute_basic_static<RealT, LVAL, 4, 10><<<grid_size, kBlockSize>>>(       \
+          N, box, cutoff_square, use_cached_displacements, model, type, neighbor_count,   \
+          neighbor_atoms, neighbor_dx, neighbor_dy, neighbor_dz, x, y, z, moments);        \
+        return true;                                                                      \
+    }                                                                                     \
+  } while (0)
+
+  switch (lmax) {
+    case 0:
+      SUS2_SH_LAUNCH_STATIC_BASIC_FOR_L(0);
+      break;
+    case 1:
+      SUS2_SH_LAUNCH_STATIC_BASIC_FOR_L(1);
+      break;
+    case 2:
+      SUS2_SH_LAUNCH_STATIC_BASIC_FOR_L(2);
+      break;
+    case 3:
+      SUS2_SH_LAUNCH_STATIC_BASIC_FOR_L(3);
+      break;
+    case 4:
+      SUS2_SH_LAUNCH_STATIC_BASIC_FOR_L(4);
+      break;
+  }
+
+#undef SUS2_SH_LAUNCH_STATIC_BASIC_FOR_L
+  return false;
+}
+
 template <typename RealT, typename GradT>
 static __global__ void gpu_sh_forward_energy_backward(
   int N,
@@ -2316,35 +2663,86 @@ static __global__ void gpu_sh_forward_energy_backward_compact_rows(
     return;
   }
 
+  const int type_i = type[atom];
+  const RealT center_coeff = sh_species_coeff<RealT>(model, type_i);
+  RealT site_energy = sh_shift_coeff<RealT>(model, type_i) + center_coeff;
+
   for (int layer = 1; layer <= model.sh_cg_layer_count; ++layer) {
     const int row_begin = model.sh_cg_layer_offsets[layer];
     const int row_end = model.sh_cg_layer_offsets[layer + 1];
     for (int row = row_begin; row < row_end; ++row) {
-      const int row_base = row * 5;
-      const int left_base = model.sh_cg_rows_int[row_base + 0];
-      const int right_base = model.sh_cg_rows_int[row_base + 1];
-      const int target = model.sh_cg_rows_int[row_base + 2];
-      const int term_begin = model.sh_cg_rows_int[row_base + 3];
-      const int term_count = model.sh_cg_rows_int[row_base + 4];
+      int left_base;
+      int right_base;
+      int target;
+      int term_begin;
+      int term_count;
+      if (model.use_const_forward_rows) {
+        const int const_row = row * 3;
+        const unsigned int row0 = c_sh_forward_u32[const_row + 0];
+        const unsigned int row1 = c_sh_forward_u32[const_row + 1];
+        left_base = static_cast<int>(row0 & 0xffffu);
+        right_base = static_cast<int>(row0 >> 16);
+        target = static_cast<int>(row1 & 0xffffu);
+        term_count = static_cast<int>(row1 >> 16);
+        term_begin = static_cast<int>(c_sh_forward_u32[const_row + 2]);
+      } else {
+        const int row_base = row * 5;
+        left_base = model.sh_cg_rows_int[row_base + 0];
+        right_base = model.sh_cg_rows_int[row_base + 1];
+        target = model.sh_cg_rows_int[row_base + 2];
+        term_begin = model.sh_cg_rows_int[row_base + 3];
+        term_count = model.sh_cg_rows_int[row_base + 4];
+      }
       RealT sum = static_cast<RealT>(0.0);
+      const int scalar_index = model.use_terminal_scalar_fusion
+        ? model.sh_cg_row_scalar_index[row]
+        : -1;
+      const RealT terminal_gtarget = scalar_index >= 0
+        ? center_coeff * sh_moment_coeff<RealT>(model, scalar_index)
+        : static_cast<RealT>(0.0);
       for (int t = 0; t < term_count; ++t) {
         const int term = term_begin + t;
-        const int term_base = term * 2;
-        const int left = left_base + model.sh_cg_row_terms_int[term_base + 0];
-        const int right = right_base + model.sh_cg_row_terms_int[term_base + 1];
-        const RealT coeff = sh_cg_row_term_coeff<RealT>(model, term);
-        sum += coeff * moments[static_cast<size_t>(left) * N + atom] *
-               moments[static_cast<size_t>(right) * N + atom];
+        int left_component;
+        int right_component;
+        RealT coeff;
+        if (model.use_const_forward_rows) {
+          const int const_term = model.sh_cg_row_count * 3 + term * 2;
+          const unsigned int term_meta = c_sh_forward_u32[const_term + 0];
+          left_component = static_cast<int>(term_meta & 0xffffu);
+          right_component = static_cast<int>(term_meta >> 16);
+          coeff = sh_const_forward_coeff<RealT>(c_sh_forward_u32[const_term + 1]);
+        } else {
+          const int term_base = term * 2;
+          left_component = model.sh_cg_row_terms_int[term_base + 0];
+          right_component = model.sh_cg_row_terms_int[term_base + 1];
+          coeff = sh_cg_row_term_coeff<RealT>(model, term);
+        }
+        const int left = left_base + left_component;
+        const int right = right_base + right_component;
+        const RealT left_value = moments[static_cast<size_t>(left) * N + atom];
+        const RealT right_value = moments[static_cast<size_t>(right) * N + atom];
+        sum += coeff * left_value * right_value;
+        if (scalar_index >= 0) {
+          const RealT weighted = coeff * terminal_gtarget;
+          grads[static_cast<size_t>(left) * N + atom] +=
+            static_cast<GradT>(weighted * right_value);
+          grads[static_cast<size_t>(right) * N + atom] +=
+            static_cast<GradT>(weighted * left_value);
+        }
       }
-      moments[static_cast<size_t>(target) * N + atom] = sum;
+      if (scalar_index >= 0) {
+        site_energy += terminal_gtarget * sum;
+      } else {
+        moments[static_cast<size_t>(target) * N + atom] = sum;
+      }
     }
   }
 
-  const int type_i = type[atom];
-  const RealT center_coeff = sh_species_coeff<RealT>(model, type_i);
-  RealT site_energy = sh_shift_coeff<RealT>(model, type_i) + center_coeff;
   for (int s = 0; s < model.alpha_scalar_moments; ++s) {
     const int moment_id = model.alpha_moment_mapping[s];
+    if (model.use_terminal_scalar_fusion && model.sh_terminal_moment_flags[moment_id]) {
+      continue;
+    }
     const RealT coeff = sh_moment_coeff<RealT>(model, s);
     site_energy += center_coeff * coeff * moments[static_cast<size_t>(moment_id) * N + atom];
     grads[static_cast<size_t>(moment_id) * N + atom] +=
@@ -2856,6 +3254,8 @@ SUS2_SH::SUS2_SH(
     parse_sh_tensor_product_parallel(host_model, num_potential_options, potential_options);
   use_compact_serial_product_ =
     parse_sh_compact_serial_product(host_model, num_potential_options, potential_options);
+  use_const_forward_rows_ =
+    parse_sh_const_forward_rows(host_model, num_potential_options, potential_options);
   if (use_tensor_product_parallel_) {
     use_cg_block_forward_ = false;
     use_compact_serial_product_ = false;
@@ -2871,6 +3271,12 @@ SUS2_SH::SUS2_SH(
   if (!use_radial_direct_) {
     sh_input_error("SUS2_SH first backend currently requires direct radial evaluation.");
   }
+  use_static_basic_layout_ =
+    parse_sh_static_basic(host_model, num_potential_options, potential_options) &&
+    has_static_full_sh_basic_layout(host_model);
+  use_terminal_scalar_fusion_ =
+    parse_sh_terminal_scalar_fusion(host_model, num_potential_options, potential_options) &&
+    use_compact_serial_product_;
 
   shift_coeffs_.resize(host_model.shift_coeffs.size());
   shift_coeffs_.copy_from_host(host_model.shift_coeffs.data());
@@ -2994,13 +3400,159 @@ SUS2_SH::SUS2_SH(
       sh_cg_row_terms_coeff_float_.copy_from_host(cg_row_term_coeffs_f.data());
     }
   }
+
+  std::vector<int> terminal_moment_flags(alpha_moments_count_, 0);
+  std::vector<int> cg_row_scalar_index(sh_cg_row_count_, -1);
+  int terminal_scalar_count = 0;
+  if (use_terminal_scalar_fusion_) {
+    std::vector<int> scalar_index_by_moment(alpha_moments_count_, -1);
+    for (int s = 0; s < alpha_scalar_moments_; ++s) {
+      const int moment = host_model.alpha_moment_mapping[s];
+      if (moment >= 0 && moment < alpha_moments_count_) {
+        scalar_index_by_moment[moment] = s;
+      }
+    }
+    std::vector<unsigned char> used_as_source(alpha_moments_count_, 0);
+    for (int row = 0; row < sh_cg_row_count_; ++row) {
+      const SHCGRowHost& cg_row = host_model.cg_rows[row];
+      for (int t = 0; t < cg_row.term_count; ++t) {
+        const SHCGRowTermHost& term = host_model.cg_row_terms[cg_row.term_begin + t];
+        const int left = cg_row.left_base + term.left_component;
+        const int right = cg_row.right_base + term.right_component;
+        if (left >= 0 && left < alpha_moments_count_) {
+          used_as_source[left] = 1;
+        }
+        if (right >= 0 && right < alpha_moments_count_) {
+          used_as_source[right] = 1;
+        }
+      }
+    }
+    for (int row = 0; row < sh_cg_row_count_; ++row) {
+      const int target = host_model.cg_rows[row].target;
+      if (target >= 0 && target < alpha_moments_count_ &&
+          scalar_index_by_moment[target] >= 0 && !used_as_source[target]) {
+        terminal_moment_flags[target] = 1;
+        cg_row_scalar_index[row] = scalar_index_by_moment[target];
+        ++terminal_scalar_count;
+      }
+    }
+    if (terminal_scalar_count == 0) {
+      use_terminal_scalar_fusion_ = false;
+    }
+  }
+  sh_cg_row_scalar_index_.resize(cg_row_scalar_index.size());
+  if (!cg_row_scalar_index.empty()) {
+    sh_cg_row_scalar_index_.copy_from_host(cg_row_scalar_index.data());
+  }
+  sh_terminal_moment_flags_.resize(terminal_moment_flags.size());
+  if (!terminal_moment_flags.empty()) {
+    sh_terminal_moment_flags_.copy_from_host(terminal_moment_flags.data());
+  }
+
+  const int const_forward_u32_count = sh_cg_row_count_ * 3 + sh_cg_row_term_count_ * 2;
+  use_const_forward_rows_ =
+    use_const_forward_rows_ && use_float_moments_ && use_compact_serial_product_ &&
+    const_forward_u32_count <= kSHMaxConstForwardU32;
+  if (use_const_forward_rows_) {
+    std::vector<unsigned int> packed_forward(static_cast<size_t>(const_forward_u32_count), 0u);
+    for (int row = 0; row < sh_cg_row_count_; ++row) {
+      const int row_base = row * 5;
+      const int left_base = cg_row_ints[row_base + 0];
+      const int right_base = cg_row_ints[row_base + 1];
+      const int target = cg_row_ints[row_base + 2];
+      const int term_begin = cg_row_ints[row_base + 3];
+      const int term_count = cg_row_ints[row_base + 4];
+      if (left_base < 0 || left_base > 0xffff || right_base < 0 || right_base > 0xffff ||
+          target < 0 || target > 0xffff || term_count < 0 || term_count > 0xffff) {
+        use_const_forward_rows_ = false;
+        break;
+      }
+      packed_forward[static_cast<size_t>(row) * 3 + 0] =
+        static_cast<unsigned int>(left_base) |
+        (static_cast<unsigned int>(right_base) << 16);
+      packed_forward[static_cast<size_t>(row) * 3 + 1] =
+        static_cast<unsigned int>(target) |
+        (static_cast<unsigned int>(term_count) << 16);
+      packed_forward[static_cast<size_t>(row) * 3 + 2] =
+        static_cast<unsigned int>(term_begin);
+    }
+    if (use_const_forward_rows_) {
+      const int term_offset = sh_cg_row_count_ * 3;
+      for (int term = 0; term < sh_cg_row_term_count_; ++term) {
+        const int term_base = term * 2;
+        const int left_component = cg_row_term_ints[term_base + 0];
+        const int right_component = cg_row_term_ints[term_base + 1];
+        if (left_component < 0 || left_component > 0xffff ||
+            right_component < 0 || right_component > 0xffff) {
+          use_const_forward_rows_ = false;
+          break;
+        }
+        packed_forward[term_offset + static_cast<size_t>(term) * 2 + 0] =
+          static_cast<unsigned int>(left_component) |
+          (static_cast<unsigned int>(right_component) << 16);
+        const float coeff = static_cast<float>(cg_row_term_coeffs[term]);
+        unsigned int coeff_bits = 0u;
+        std::memcpy(&coeff_bits, &coeff, sizeof(coeff_bits));
+        packed_forward[term_offset + static_cast<size_t>(term) * 2 + 1] = coeff_bits;
+      }
+    }
+    if (use_const_forward_rows_) {
+      CHECK(cudaMemcpyToSymbol(
+        c_sh_forward_u32,
+        packed_forward.data(),
+        packed_forward.size() * sizeof(unsigned int)));
+    }
+  }
   sh_cg_layer_offsets_.resize(host_model.cg_layer_offsets.size());
   if (!host_model.cg_layer_offsets.empty()) {
     sh_cg_layer_offsets_.copy_from_host(host_model.cg_layer_offsets.data());
   }
+  std::vector<SHCGBackRowHost> device_back_rows;
+  std::vector<SHCGBackTermHost> device_back_terms;
+  std::vector<int> device_back_layer_offsets(host_model.cg_back_layer_offsets.size(), 0);
+  int removed_terminal_back_terms = 0;
+  for (int layer = 1; layer <= sh_cg_layer_count_; ++layer) {
+    device_back_layer_offsets[layer] = static_cast<int>(device_back_rows.size());
+    const int row_begin = host_model.cg_back_layer_offsets[layer];
+    const int row_end = host_model.cg_back_layer_offsets[layer + 1];
+    for (int r = row_begin; r < row_end; ++r) {
+      const SHCGBackRowHost& old_row = host_model.cg_back_rows[r];
+      SHCGBackRowHost new_row;
+      new_row.layer = old_row.layer;
+      new_row.source = old_row.source;
+      new_row.term_begin = static_cast<int>(device_back_terms.size());
+      new_row.term_count = 0;
+      for (int t = 0; t < old_row.term_count; ++t) {
+        const SHCGBackTermHost& term =
+          host_model.cg_back_terms[old_row.term_begin + t];
+        const bool skip_terminal =
+          use_terminal_scalar_fusion_ && term.target >= 0 &&
+          term.target < alpha_moments_count_ && terminal_moment_flags[term.target];
+        if (skip_terminal) {
+          ++removed_terminal_back_terms;
+          continue;
+        }
+        device_back_terms.push_back(term);
+        ++new_row.term_count;
+      }
+      if (new_row.term_count > 0) {
+        device_back_rows.push_back(new_row);
+      }
+    }
+  }
+  if (!device_back_layer_offsets.empty()) {
+    device_back_layer_offsets[sh_cg_layer_count_ + 1] =
+      static_cast<int>(device_back_rows.size());
+  }
+  if (use_terminal_scalar_fusion_ && removed_terminal_back_terms == 0) {
+    use_terminal_scalar_fusion_ = false;
+  }
+  sh_cg_back_row_count_ = static_cast<int>(device_back_rows.size());
+  sh_cg_back_term_count_ = static_cast<int>(device_back_terms.size());
+
   std::vector<int> cg_back_row_ints(static_cast<size_t>(sh_cg_back_row_count_) * 3);
   for (int r = 0; r < sh_cg_back_row_count_; ++r) {
-    const SHCGBackRowHost& row = host_model.cg_back_rows[r];
+    const SHCGBackRowHost& row = device_back_rows[r];
     cg_back_row_ints[r * 3 + 0] = row.source;
     cg_back_row_ints[r * 3 + 1] = row.term_begin;
     cg_back_row_ints[r * 3 + 2] = row.term_count;
@@ -3008,7 +3560,7 @@ SUS2_SH::SUS2_SH(
   std::vector<int> cg_back_term_ints(static_cast<size_t>(sh_cg_back_term_count_) * 2);
   std::vector<double> cg_back_term_coeffs(sh_cg_back_term_count_);
   for (int t = 0; t < sh_cg_back_term_count_; ++t) {
-    const SHCGBackTermHost& term = host_model.cg_back_terms[t];
+    const SHCGBackTermHost& term = device_back_terms[t];
     cg_back_term_ints[t * 2 + 0] = term.target;
     cg_back_term_ints[t * 2 + 1] = term.other;
     cg_back_term_coeffs[t] = term.coeff;
@@ -3033,9 +3585,9 @@ SUS2_SH::SUS2_SH(
       sh_cg_back_terms_coeff_float_.copy_from_host(cg_back_term_coeffs_f.data());
     }
   }
-  sh_cg_back_layer_offsets_.resize(host_model.cg_back_layer_offsets.size());
-  if (!host_model.cg_back_layer_offsets.empty()) {
-    sh_cg_back_layer_offsets_.copy_from_host(host_model.cg_back_layer_offsets.data());
+  sh_cg_back_layer_offsets_.resize(device_back_layer_offsets.size());
+  if (!device_back_layer_offsets.empty()) {
+    sh_cg_back_layer_offsets_.copy_from_host(device_back_layer_offsets.data());
   }
   alpha_moment_mapping_.resize(host_model.alpha_moment_mapping.size());
   alpha_moment_mapping_.copy_from_host(host_model.alpha_moment_mapping.data());
@@ -3065,12 +3617,15 @@ SUS2_SH::SUS2_SH(
     alpha_scalar_moments_,
     rc);
   printf(
-    "SUS2-SH GPUMD precision mode: %s; force self-buffer: %s; force basic-grad cache: %s; cg-block forward: %s; compact serial product: %s; tensor-product parallel: %s; tensor grid cap=%d.\n",
+    "SUS2-SH GPUMD precision mode: %s; force self-buffer: %s; force basic-grad cache: %s; static basic: %s; terminal scalar fusion: %s; cg-block forward: %s; compact serial product: %s; const forward rows: %s; tensor-product parallel: %s; tensor grid cap=%d.\n",
     use_float_moments_ ? "NEP-like float moments/gradients/local arithmetic" : "double moments/local arithmetic",
     use_force_self_buffer_ ? "on" : "off",
     use_force_grad_cache_ ? "on" : "off",
+    use_static_basic_layout_ ? "on" : "off",
+    use_terminal_scalar_fusion_ ? "on" : "off",
     use_cg_block_forward_ ? "on" : "off",
     use_compact_serial_product_ ? "on" : "off",
+    use_const_forward_rows_ ? "on" : "off",
     use_tensor_product_parallel_ ? "on" : "off",
     tensor_product_grid_cap_);
   printf(
@@ -3083,6 +3638,12 @@ SUS2_SH::SUS2_SH(
     sh_cg_back_row_count_,
     sh_cg_back_term_count_,
     host_model.sh_standard_cg_layers);
+  if (use_terminal_scalar_fusion_) {
+    printf(
+      "SUS2-SH terminal scalar fusion: terminal_scalars=%d, removed_back_terms=%d.\n",
+      terminal_scalar_count,
+      removed_terminal_back_terms);
+  }
   if (profile_enabled_) {
     printf("SUS2-SH GPUMD profile enabled; interval=%d steps.\n", profile_interval_);
   }
@@ -3286,6 +3847,8 @@ void SUS2_SH::compute(
     sh_cg_row_terms_int_.data(),
     sh_cg_row_terms_coeff_.data(),
     use_float_moments_ ? sh_cg_row_terms_coeff_float_.data() : nullptr,
+    sh_cg_row_scalar_index_.data(),
+    sh_terminal_moment_flags_.data(),
     sh_cg_back_rows_int_.data(),
     sh_cg_back_terms_int_.data(),
     sh_cg_back_terms_coeff_.data(),
@@ -3295,12 +3858,24 @@ void SUS2_SH::compute(
     alpha_moment_mapping_.data(),
     radial_direct_coeffs_.data(),
     radial_direct_scal_s_.data(),
-    use_float_moments_};
+    use_float_moments_,
+    use_const_forward_rows_,
+    use_terminal_scalar_fusion_};
 
   float* force_self_tmp_ptr = use_force_self_buffer_ ? force_self_tmp_.data() : nullptr;
   if (use_float_moments_) {
     stage_start = profile_start();
-    if (alpha_basic_count_ <= 64) {
+    const bool launched_static_basic =
+      use_static_basic_layout_ &&
+      launch_sh_compute_basic_static<float>(
+        sh_l_max_, sh_k_max_, rb_size_, grid_size, num_atoms, box, rc * rc,
+        use_cached_neighbor_displacements_, model, type.data(), neighbor_count_.data(),
+        neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(), neighbor_dz_.data(),
+        position.data(), position.data() + num_atoms, position.data() + 2 * num_atoms,
+        moment_vals_float_.data());
+    if (launched_static_basic) {
+      GPU_CHECK_KERNEL
+    } else if (alpha_basic_count_ <= 64) {
       gpu_sh_compute_basic<float, 64><<<grid_size, kBlockSize>>>(
         num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(),
         neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(),
@@ -3381,7 +3956,17 @@ void SUS2_SH::compute(
     profile_stop(sh_profile_force, stage_start);
   } else {
     stage_start = profile_start();
-    if (alpha_basic_count_ <= 64) {
+    const bool launched_static_basic =
+      use_static_basic_layout_ &&
+      launch_sh_compute_basic_static<double>(
+        sh_l_max_, sh_k_max_, rb_size_, grid_size, num_atoms, box, rc * rc,
+        use_cached_neighbor_displacements_, model, type.data(), neighbor_count_.data(),
+        neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(), neighbor_dz_.data(),
+        position.data(), position.data() + num_atoms, position.data() + 2 * num_atoms,
+        moment_vals_.data());
+    if (launched_static_basic) {
+      GPU_CHECK_KERNEL
+    } else if (alpha_basic_count_ <= 64) {
       gpu_sh_compute_basic<double, 64><<<grid_size, kBlockSize>>>(
         num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(),
         neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(),

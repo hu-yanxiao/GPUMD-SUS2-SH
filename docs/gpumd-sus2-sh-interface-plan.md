@@ -534,9 +534,108 @@ case    = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cu
 speed   = 5.23439e6 atom*step/s
 ```
 
-Next high-confidence direction: stop trying per-thread algebraic rearrangements
-for l3k3. The remaining path to a large gain is a standard SH/CG layer program
-that preserves the model definition while reducing the per-atom serial product
-row/back-row walk. Candidate implementations should specialize compact
-component-row kernels or AOT/cache small layer programs by `(l1,l2,L)` topology,
-with correctness checked against the compact serial path after each change.
+Accepted metadata cleanup: the compact serial forward row table is now also
+packed into CUDA constant memory when it fits the 64 KiB constant-memory budget.
+This borrows the old moment interface idea of keeping small, read-only graph
+metadata off the regular global-memory path. The backward source-row table stays
+in global memory because it is too large for this budget. The feature is enabled
+by default for the float compact path and can be disabled with
+`sus2_sh_const_forward=0` or `SUS2_SH_GPUMD_CONST_FORWARD=0`.
+
+Same-GPU A/B on `a05u22g` for the 1,024,000 atom Cu-Zr l3k3 model:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_l3k3_1m_ab_const_forward_20260513
+
+const forward off:
+  product ~= 75.0-75.2 ms/step
+  speed   = 5.03222e6 atom*step/s
+
+const forward on:
+  product ~= 74.0-74.2 ms/step
+  speed   = 5.06498e6 atom*step/s
+```
+
+The maximum thermo difference over the A/B run was `3.5e-3` in the printed
+columns, consistent with the already accepted float summation-order scale for
+this million-atom test. This is a small gain, but it is low-risk and keeps the
+path closer to the old optimized moment metadata layout.
+
+Rejected full direct-polynomial expansion probe: expanding all scalar outputs
+for the l3k3 5body model into weighted products of basic `B(k,l,m)` channels
+created `11536` merged monomials with derivative occurrence work around
+`45028`. The degree distribution was dominated by 4-factor terms. This is not
+clearly cheaper than the current compact forward/backward row walk unless it is
+recast into a block/quadratic pair-tensor form, so no direct scalar polynomial
+kernel was kept.
+
+### 2026-05-13 Static SH Basic and Terminal Scalar Fusion
+
+Accepted change: the GPUMD basic-stage kernel now has a guarded static path for
+the SUS2-SH generator's full `(l,k,m)` layout with `l <= 4`, `k <= 4`, and
+`radial_basis_size = 10`. The guard checks the actual `alpha_index_basic` order
+from the model: active `q=(k,l)` tensors are generated in the training order
+`l` descending, `k` descending, and `m=-l..l`. If the model does not match that
+layout, GPUMD falls back to the generic SH path. The static path can be disabled
+with `sus2_sh_static_basic=0` or `SUS2_SH_GPUMD_STATIC_BASIC=0`.
+
+Same-GPU A/B on `c04u01g`, 1,024,000 atom Cu-Zr l3k3:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_l3k3_1m_ab_static_basic_20260513
+
+static basic off:
+  basic ~= 35.7 ms/step
+  speed = 5.25315e6 atom*step/s
+
+static basic on:
+  basic ~= 7.1 ms/step
+  speed = 6.16893e6 atom*step/s
+```
+
+The maximum printed thermo difference over the run was `2.1e-3`, consistent
+with float summation-order changes. This confirms that the previous SH basic
+bottleneck was mostly the generic per-basic accumulation and repeated
+value-form bookkeeping, not the radial recurrence itself.
+
+Accepted change: the compact product kernel now fuses terminal scalar rows.
+For scalar targets that are not used as sources by any later tensor product, the
+kernel accumulates site energy and the direct chain-rule contributions to the
+left/right source moments inside the forward row. The corresponding terminal
+targets are skipped in scalar seeding, and their back-row terms are removed
+from the reverse table. This keeps the trained scalar definition unchanged but
+avoids materializing and then immediately differentiating terminal scalar nodes.
+The feature is enabled by default for the compact product path and can be
+disabled with `sus2_sh_terminal_scalar_fusion=0` or
+`SUS2_SH_GPUMD_TERMINAL_SCALAR_FUSION=0`.
+
+Same-GPU A/B on `a05u22g`, with static basic and constant forward metadata both
+enabled:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_l3k3_1m_ab_terminal_scalar_20260513
+
+terminal fusion off:
+  product ~= 76.6-77.1 ms/step
+  speed   = 5.82452e6 atom*step/s
+
+terminal fusion on:
+  terminal_scalars = 545
+  removed_back_terms = 4470
+  product ~= 65.7-65.8 ms/step
+  speed   = 6.19759e6 atom*step/s
+```
+
+The maximum printed thermo difference over the terminal-fusion A/B run was
+`1.03e-2` on the million-atom system, i.e. about `1e-8` per atom in the energy
+scale. This is larger than the pure static-basic A/B because scalar accumulation
+order changes more substantially, but still in the expected float-order range
+for this system size.
+
+Next high-confidence direction: product and force are now the dominant costs.
+The next product step should group the remaining non-terminal rows by
+`(l1,l2,L)` topology or by pair-tensor block so the current per-atom serial row
+walk can be replaced by a smaller set of structured contractions. The next
+force step should mirror the static-basic value path with an equally structured
+derivative path, while keeping the current cached-gradient force kernel as the
+correctness reference.
