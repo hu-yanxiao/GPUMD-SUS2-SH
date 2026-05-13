@@ -64,7 +64,11 @@ private:
   bool use_parallel_back_rows_ = false;
   bool use_terminal_scalar_fusion_ = false;
   bool use_row_scalar_fusion_ = false;
+  bool use_terminal_dot_rows_ = false;
+  bool use_product_basic_cache_ = false;
   bool use_packed_back_rows_ = false;
+  bool use_const_back_rows_ = false;
+  bool use_merge_back_duplicates_ = true;
   bool use_cached_neighbor_displacements_ = false;
   bool profile_enabled_ = false;
   int profile_interval_ = 50;
@@ -93,6 +97,7 @@ private:
   GPU_Vector<float> sh_cg_row_terms_coeff_float_;
   GPU_Vector<int> sh_cg_row_scalar_index_;
   GPU_Vector<int> sh_terminal_moment_flags_;
+  GPU_Vector<unsigned int> sh_cg_row_dot_u32_;
   GPU_Vector<int> sh_cg_back_rows_int_;
   GPU_Vector<int> sh_cg_back_terms_int_;
   GPU_Vector<double> sh_cg_back_terms_coeff_;

@@ -793,3 +793,74 @@ global moment traffic and fewer repeated per-row loops. The safest first
 experiment is a limited terminal-scalar or layer-1 pair-tensor microkernel for
 the hottest `(l1,l2,L)` groups, with the compact row program retained as the
 correctness fallback.
+
+2026-05-14 product optimization pass:
+
+- `sus2_sh_const_back=1` was tested by moving packed back-row metadata into the
+  constant buffer while disabling forward constant metadata. It was slower on
+  l3333 (`product ~=57.9 ms` versus `56.5 ms`), so it remains an experimental
+  off-by-default option.
+- A terminal-scalar dot fast path is now used for rows whose terms are exactly
+  contiguous dot products with one uniform CG coefficient. In the l3333 model
+  all 545 terminal scalar rows match this pattern (`2235` terms); in l3322 all
+  240 terminal rows match (`738` terms).
+- Duplicate back terms with the same `(target, other)` inside a source row are
+  merged by summing coefficients. This removes `204/6480` back terms in l3333
+  and `90/1356` in l3322.
+- A coarse product basic-moment register cache was tested and rejected. Although
+  it removes repeated basic-moment global loads, caching 48 basics per thread
+  increases register pressure enough to slow l3333 (`product ~=56.8 ms` to
+  `58.0 ms`). Any future basic reuse should be topology-local, not a full basic
+  cache.
+
+Four-way l3333 A/B on the 1,024,000 atom Cu-Zr box, 200 NPT steps:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_tdot_merge_matrix_20260514
+
+base:
+  cg_back_terms = 6480
+  product = 56.980 ms
+  speed   = 1.11158e7 atom*step/s
+
+terminal-dot only:
+  product = 56.800 ms
+  speed   = 1.11377e7 atom*step/s
+
+merge-back only:
+  cg_back_terms = 6276
+  product = 56.374 ms
+  speed   = 1.12032e7 atom*step/s
+
+terminal-dot + merge-back:
+  product = 56.204 ms
+  speed   = 1.12130e7 atom*step/s
+```
+
+The l3322 default check with the same final code gave:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_final_l3322_check_20260514
+
+cg_back_terms = 1266
+product = 14.764 ms
+speed   = 2.13467e7 atom*step/s
+```
+
+Correctness check, l3333 first 4096 atoms, `time_step 0`, `run 1`, comparing
+base (`terminal_dot=0`, `merge_back_duplicates=0`) against the final default
+path:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_tdot_merge_mathcheck_20260514
+
+total-energy diff = 1.87e-4 eV over 4096 atoms
+force max abs diff = 5.96e-7
+force rms diff     = 1.26e-7
+```
+
+This is within float summation-order scale. The next high-potential direction
+is not full per-thread basic caching, but a generated topology-local product
+program for the hottest layer-1 `(l1,l2,L)` groups, where a small set of basic
+components can be reused without inflating register pressure across the whole
+kernel.
