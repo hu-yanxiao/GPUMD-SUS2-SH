@@ -46,6 +46,7 @@ private:
   int sh_cg_back_row_count_ = 0;
   int sh_cg_back_term_count_ = 0;
   int sh_cg_layer_count_ = 0;
+  int sh_grad_zero_count_ = 0;
   int alpha_moments_count_ = 0;
   int alpha_scalar_moments_ = 0;
   int active_scalar_moments_ = 0;
@@ -65,6 +66,7 @@ private:
   bool use_terminal_scalar_fusion_ = false;
   bool use_row_scalar_fusion_ = false;
   bool use_terminal_dot_rows_ = false;
+  bool use_selective_grad_zero_ = false;
   bool use_product_basic_cache_ = false;
   bool use_packed_back_rows_ = false;
   bool use_const_back_rows_ = false;
@@ -104,6 +106,7 @@ private:
   GPU_Vector<float> sh_cg_back_terms_coeff_float_;
   GPU_Vector<int> sh_cg_back_layer_offsets_;
   GPU_Vector<unsigned int> sh_cg_back_packed_u32_;
+  GPU_Vector<int> sh_grad_zero_moments_;
   GPU_Vector<int> active_scalar_moment_;
   GPU_Vector<double> active_scalar_coeff_;
   GPU_Vector<float> active_scalar_coeff_float_;

@@ -690,6 +690,25 @@ bool parse_sh_terminal_dot_rows(const SHHostModel& model, int nopts, const char*
   return use_dot;
 }
 
+bool parse_sh_selective_grad_zero(const SHHostModel& model, int nopts, const char** opts)
+{
+  bool use_selective = true;
+  const char* env = std::getenv("SUS2_SH_GPUMD_SELECTIVE_GRAD_ZERO");
+  if (env != nullptr) {
+    use_selective = parse_bool_value(env, "SUS2_SH_GPUMD_SELECTIVE_GRAD_ZERO");
+  }
+  const int begin = std::min(nopts, model.species_count);
+  for (int i = begin; i < nopts; ++i) {
+    const std::string option = opts[i] == nullptr ? "" : opts[i];
+    if (starts_with(option, "sus2_sh_selective_grad_zero=") ||
+        starts_with(option, "sus2_selective_grad_zero=")) {
+      const size_t eq = option.find('=');
+      use_selective = parse_bool_value(option.substr(eq + 1), option.substr(0, eq));
+    }
+  }
+  return use_selective;
+}
+
 bool parse_sh_product_basic_cache(const SHHostModel& model, int nopts, const char** opts)
 {
   bool use_cache = false;
@@ -2848,6 +2867,24 @@ static __global__ void gpu_sh_tensor_product_back_rows(
   }
 }
 
+template <typename GradT>
+static __global__ void gpu_sh_zero_selected_grads(
+  int N,
+  int moment_count,
+  const int* moments,
+  GradT* grads)
+{
+  const size_t total = static_cast<size_t>(moment_count) * static_cast<size_t>(N);
+  const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+  for (size_t task = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       task < total;
+       task += stride) {
+    const int atom = static_cast<int>(task % static_cast<size_t>(N));
+    const int moment = moments[task / static_cast<size_t>(N)];
+    grads[static_cast<size_t>(moment) * N + atom] = static_cast<GradT>(0.0);
+  }
+}
+
 template <typename RealT, typename GradT, int BasicCache>
 static __global__ void gpu_sh_forward_energy_backward_compact_rows(
   int N,
@@ -3844,6 +3881,9 @@ SUS2_SH::SUS2_SH(
   use_terminal_dot_rows_ =
     parse_sh_terminal_dot_rows(host_model, num_potential_options, potential_options) &&
     use_terminal_scalar_fusion_ && use_compact_serial_product_ && use_float_moments_;
+  use_selective_grad_zero_ =
+    parse_sh_selective_grad_zero(host_model, num_potential_options, potential_options) &&
+    use_compact_serial_product_;
   use_product_basic_cache_ =
     parse_sh_product_basic_cache(host_model, num_potential_options, potential_options) &&
     use_compact_serial_product_ && use_float_moments_ &&
@@ -4336,6 +4376,68 @@ SUS2_SH::SUS2_SH(
   if (!device_back_layer_offsets.empty()) {
     sh_cg_back_layer_offsets_.copy_from_host(device_back_layer_offsets.data());
   }
+
+  std::vector<int> grad_zero_moments;
+  if (use_selective_grad_zero_) {
+    std::vector<unsigned char> needs_zero(alpha_moments_count_, 0);
+    auto mark_grad_zero = [&](int moment) {
+      if (moment >= 0 && moment < alpha_moments_count_) {
+        needs_zero[moment] = 1;
+      }
+    };
+    for (int b = 0; b < alpha_basic_count_; ++b) {
+      mark_grad_zero(b);
+    }
+    for (int moment : active_scalar_moments_host) {
+      mark_grad_zero(moment);
+    }
+    if (use_terminal_scalar_fusion_) {
+      for (int row = 0; row < sh_cg_row_count_; ++row) {
+        const SHCGRowHost& cg_row = host_model.cg_rows[row];
+        const bool scalar_row = cg_row_scalar_index[row] >= 0;
+        if (!scalar_row) {
+          continue;
+        }
+        const bool terminal_row =
+          cg_row.target >= 0 && cg_row.target < alpha_moments_count_ &&
+          terminal_moment_flags[cg_row.target] != 0;
+        if (terminal_row) {
+          for (int t = 0; t < cg_row.term_count; ++t) {
+            const SHCGRowTermHost& term =
+              host_model.cg_row_terms[cg_row.term_begin + t];
+            mark_grad_zero(cg_row.left_base + term.left_component);
+            mark_grad_zero(cg_row.right_base + term.right_component);
+          }
+        } else if (use_row_scalar_fusion_) {
+          mark_grad_zero(cg_row.target);
+        }
+      }
+    }
+    for (const SHCGBackRowHost& row : device_back_rows) {
+      mark_grad_zero(row.source);
+    }
+    for (const SHCGBackTermHost& term : device_back_terms) {
+      mark_grad_zero(term.target);
+    }
+    grad_zero_moments.reserve(alpha_moments_count_);
+    for (int moment = 0; moment < alpha_moments_count_; ++moment) {
+      if (needs_zero[moment]) {
+        grad_zero_moments.push_back(moment);
+      }
+    }
+    sh_grad_zero_count_ = static_cast<int>(grad_zero_moments.size());
+    if (sh_grad_zero_count_ <= 0 ||
+        sh_grad_zero_count_ * 10 >= alpha_moments_count_ * 9) {
+      use_selective_grad_zero_ = false;
+      sh_grad_zero_count_ = 0;
+      grad_zero_moments.clear();
+    }
+  }
+  sh_grad_zero_moments_.resize(grad_zero_moments.size());
+  if (!grad_zero_moments.empty()) {
+    sh_grad_zero_moments_.copy_from_host(grad_zero_moments.data());
+  }
+
   alpha_moment_mapping_.resize(host_model.alpha_moment_mapping.size());
   alpha_moment_mapping_.copy_from_host(host_model.alpha_moment_mapping.data());
 
@@ -4364,7 +4466,7 @@ SUS2_SH::SUS2_SH(
     alpha_scalar_moments_,
     rc);
   printf(
-    "SUS2-SH GPUMD precision mode: %s; force self-buffer: %s; force basic-grad cache: %s; static basic: %s; static force: %s; terminal scalar fusion: %s; terminal dot rows: %s; product basic cache: %s; row scalar fusion: %s; cg-block forward: %s; compact serial product: %s; parallel back rows: %s; packed back rows: %s; const forward rows: %s; const back rows: %s; tensor-product parallel: %s; tensor grid cap=%d.\n",
+    "SUS2-SH GPUMD precision mode: %s; force self-buffer: %s; force basic-grad cache: %s; static basic: %s; static force: %s; terminal scalar fusion: %s; terminal dot rows: %s; selective grad zero: %s; product basic cache: %s; row scalar fusion: %s; cg-block forward: %s; compact serial product: %s; parallel back rows: %s; packed back rows: %s; const forward rows: %s; const back rows: %s; tensor-product parallel: %s; tensor grid cap=%d.\n",
     use_float_moments_ ? "NEP-like float moments/gradients/local arithmetic" : "double moments/local arithmetic",
     use_force_self_buffer_ ? "on" : "off",
     use_force_grad_cache_ ? "on" : "off",
@@ -4372,6 +4474,7 @@ SUS2_SH::SUS2_SH(
     use_static_force_layout_ ? "on" : "off",
     use_terminal_scalar_fusion_ ? "on" : "off",
     use_terminal_dot_rows_ ? "on" : "off",
+    use_selective_grad_zero_ ? "on" : "off",
     use_product_basic_cache_ ? "on" : "off",
     use_row_scalar_fusion_ ? "on" : "off",
     use_cg_block_forward_ ? "on" : "off",
@@ -4407,6 +4510,12 @@ SUS2_SH::SUS2_SH(
       "SUS2-SH terminal dot rows: rows=%d, terms=%d.\n",
       terminal_dot_row_count,
       terminal_dot_term_count);
+  }
+  if (use_selective_grad_zero_) {
+    printf(
+      "SUS2-SH selective grad zero: moments=%d/%d.\n",
+      sh_grad_zero_count_,
+      alpha_moments_count_);
   }
   if (profile_enabled_) {
     printf("SUS2-SH GPUMD profile enabled; interval=%d steps.\n", profile_interval_);
@@ -4565,13 +4674,31 @@ void SUS2_SH::compute(
         !use_compact_serial_product_) {
       CHECK(gpuMemset(moment_vals_float_.data(), 0, moment_size * sizeof(float)));
     }
-    CHECK(gpuMemset(moment_grads_float_.data(), 0, moment_size * sizeof(float)));
+    if (use_selective_grad_zero_) {
+      gpu_sh_zero_selected_grads<float><<<grid_size, kBlockSize>>>(
+        num_atoms,
+        sh_grad_zero_count_,
+        sh_grad_zero_moments_.data(),
+        moment_grads_float_.data());
+      GPU_CHECK_KERNEL
+    } else {
+      CHECK(gpuMemset(moment_grads_float_.data(), 0, moment_size * sizeof(float)));
+    }
   } else {
     if (!use_cg_block_forward_ && !use_tensor_product_parallel_ &&
         !use_compact_serial_product_) {
       CHECK(gpuMemset(moment_vals_.data(), 0, moment_size * sizeof(double)));
     }
-    CHECK(gpuMemset(moment_grads_.data(), 0, moment_size * sizeof(double)));
+    if (use_selective_grad_zero_) {
+      gpu_sh_zero_selected_grads<double><<<grid_size, kBlockSize>>>(
+        num_atoms,
+        sh_grad_zero_count_,
+        sh_grad_zero_moments_.data(),
+        moment_grads_.data());
+      GPU_CHECK_KERNEL
+    } else {
+      CHECK(gpuMemset(moment_grads_.data(), 0, moment_size * sizeof(double)));
+    }
   }
   CHECK(gpuMemset(force_tmp_.data(), 0, force_size * sizeof(float)));
   profile_stop(sh_profile_memset, stage_start);

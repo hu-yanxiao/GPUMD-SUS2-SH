@@ -864,3 +864,67 @@ is not full per-thread basic caching, but a generated topology-local product
 program for the hottest layer-1 `(l1,l2,L)` groups, where a small set of basic
 components can be reused without inflating register pressure across the whole
 kernel.
+
+2026-05-14 follow-up optimization pass:
+
+- Accepted change: selective gradient zeroing is now enabled for the compact
+  product path. Instead of clearing every `alpha_moments_count * N` gradient
+  entry, the loader marks only moments that can receive a gradient seed or a
+  reverse-mode contribution. The full memset path remains available with
+  `sus2_sh_selective_grad_zero=0` or `SUS2_SH_GPUMD_SELECTIVE_GRAD_ZERO=0`.
+- l3333 marks `804/1349` moments for gradient clearing. In the million-atom,
+  200-step A100 check, `memset` dropped from about `2.96 ms` to about
+  `2.59-2.63 ms` and speed improved from `1.12077e7` to `1.12467e7`
+  atom-step/s. A rebuild after reverting the failed direct-back experiment
+  reproduced `product ~=56.21 ms` and `speed = 1.12568e7`.
+- l3322 marks `285/525` moments. The current binary gives `memset ~=0.93 ms`,
+  `product ~=14.77 ms`, and `speed = 2.1461e7` atom-step/s on the same
+  million-atom, 200-step A100 check.
+- Correctness check for l3333 first 4096 atoms, `time_step 0`, `run 1`,
+  comparing selective zero off/on:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_selective_grad_zero_mathcheck_20260514
+
+force max abs diff = 1.192092896e-7
+force rms diff     = 1.4153e-8
+```
+
+Rejected experiments from this pass:
+
+- Layer-1 block-forward microkernel: force differences were only float
+  summation-order scale (`max ~=4.8e-7`, `rms ~=6.9e-8`), but the million-atom
+  run slowed from `1.12605e7` to `1.08194e7` atom-step/s. The likely cause is
+  register/local-array pressure, so the code was reverted.
+- Terminal direct-back expansion: replacing terminal-row reverse propagation
+  with nested direct propagation preserved energy and kept force differences
+  near float scale (`max ~=6.1e-6`, `rms ~=1.1e-6`), but it slowed product from
+  about `61 ms` to about `123 ms`. The nested per-terminal CG expansion
+  duplicated too much work, and the runtime branch also slowed the off path.
+  The implementation was removed completely; no `terminal_direct` code remains.
+
+CUDA SH / tensor-product references checked for future work:
+
+- [`sphericart`](https://github.com/lab-cosmo/sphericart): useful reference for
+  real/solid spherical harmonics and derivatives with CUDA C++ APIs. The most
+  relevant idea is generating low-order SH values and derivatives together
+  using fixed polynomial/recurrence structure.
+- [`OpenEquivariance`](https://github.com/vbharadwaj-bk/OpenEquivariance) and
+  [`cuEquivariance`](https://github.com/NVIDIA/cuEquivariance): useful design
+  references for sparse equivariant tensor-product kernels, segmented tensor
+  products, and generated contraction schedules.
+- [`e3nn.c`](https://github.com/teddykoker/e3nn.c): useful small C reference
+  for spherical harmonics and tensor products, especially the distinction
+  between generic sparse CG traversal and generated straight-line formulas.
+
+Current product conclusion: product remains the largest cost, and the next
+high-confidence direction is a guarded product-v2 path rather than more tuning
+inside the current compact row loop. The old compact path must stay as the
+default fallback while product-v2 is tested. The product-v2 candidate should
+group rows by `(l_left, l_right, L, layer, term pattern)` and exploit that the
+CG topology is independent of `k`: the same component contraction repeats for
+many radial-channel pairs. The implementation should avoid large per-thread
+arrays and avoid recursive terminal expansion. A generated or prepacked
+topology-local contraction plan, with coefficients in constant memory and only
+small per-group reusable component windows in registers, is the most plausible
+route to a larger product reduction.
