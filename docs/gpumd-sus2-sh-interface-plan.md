@@ -1584,3 +1584,200 @@ Conclusion: the idea is mathematically clean and avoids the previous extra
 kernel/global-pass mistake, but it still does not remove enough global moment
 traffic. It only trims row interpretation and a few target writes. This is not
 a substantial optimization path and was reverted.
+
+2026-05-14 rejected metadata/fixed-row micro-optimizations:
+
+- Tested a constant-memory metadata pool for pattern rows and terminal-dot
+  groups. It preserved correctness on the first 4096 Cu-Zr atoms, but the
+  100k A100 A/B effect was at noise scale:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-exp-product-codex/codex_bench/const_pool_ab_100k_20260514
+
+model   mode  product(ms)  forward(ms)  backward(ms)  total(ms)
+l3333   off   5.8573       3.7477       2.1070        9.3930
+l3333   on    5.8547       3.7453       2.1067        9.3913
+l4k4    off   2.9973       2.2023       0.7923        8.7680
+l4k4    on    2.9963       2.2013       0.7923        8.7660
+l4k5    off   5.4633       4.1440       1.3167        12.5203
+l4k5    on    5.4597       4.1400       1.3170        12.5137
+```
+
+- Tested fixed `term_count` expansion for the ordinary compact forward rows,
+  specializing counts 1 through 9. This leaves the CG contraction order
+  unchanged and only reduces dynamic loop/control overhead. Correctness against
+  the stable binary on the first 4096 Cu-Zr atoms stayed within float scale:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-exp-product-codex/codex_bench/fixed_terms_correctness_20260514
+
+model   force max abs diff  force RMS diff  thermo max abs diff
+l3333   1.49e-7             1.40e-8         0
+l3322   2.38e-7             1.37e-8         0
+l4k4    2.68e-7             2.81e-8         0
+l4k5    2.38e-7             2.55e-8         0
+```
+
+  The 100k, 1000-step A100 A/B test showed only a small product improvement
+  and less than 1% total speed movement:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-exp-product-codex/codex_bench/fixed_terms_ab_100k_20260514
+
+model   product speedup  total speedup  speed change
+l3333   1.039%           0.668%         0.906%
+l3322   1.350%           0.435%         0.447%
+l4k4    0.797%           0.220%         0.208%
+l4k5    0.547%           0.238%         0.218%
+```
+
+Conclusion: small metadata and row-interpreter changes are not the requested
+10% path. They are useful probes, but the product bottleneck is now dominated
+by global `moment_vals`/`moment_grads` traffic and long per-atom contraction
+chains. These experiments were reverted and the stable code remains unchanged.
+
+2026-05-14 rejected terminal-dot producer inline variants:
+
+- A narrow left-producer inline prototype handled only layer-1 non-scalar rows
+  used by terminal-dot groups. It was mathematically correct but gave only small
+  gains: l3333 product about 2%, l4k4/l4k5 smaller, and l3322 unchanged. It was
+  not kept because the complexity did not meet the 10% target.
+- A broader full terminal-dot inline prototype handled both left and right
+  terminal-dot-only producers. The first version was wrong because active scalar
+  moments were still skipped although the active-scalar loop still reads them.
+  After excluding active scalar moments, first-4096-atom correctness returned to
+  float-scale differences, but forward recomputation exploded:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-exp-product-codex/codex_bench/inline_full_scalarfix_correctness_20260514
+
+model   force max abs diff  force RMS diff  thermo max abs diff
+l3333   1.61e-6             4.03e-7         7.74e-9
+l4k4    2.26e-6             4.87e-7         1.29e-8
+l4k5    6.35e-5             8.37e-6         7.63e-8
+
+4096-atom product detail after scalar fix:
+l3333   forward=5.554 ms  backward=0.057 ms
+l4k4    forward=3.813 ms  backward=0.058 ms
+l4k5    forward=6.156 ms  backward=0.060 ms
+```
+
+Conclusion: terminal-dot inline can remove backward terms, but if it recomputes
+producer values or introduces dynamic terminal handlers, the forward cost grows
+more than the backward saving. Future producer-consumer fusion must compute a
+producer once in a static topology-local schedule and consume/backpropagate it
+without recomputation or local-memory spill.
+
+2026-05-14 rejected global register cap:
+
+- The product compact kernel uses about 48 registers with no spills, so it is
+  not register-pressure limited. Static basic/force kernels for large
+  `l<=4,k>=5` can hit the 255-register ceiling and spill, so a compile-only
+  experiment rebuilt `sus2_sh.o` with `-maxrregcount=128`.
+- Correctness against the stable binary on the first 4096 Cu-Zr atoms stayed
+  within float scale:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-exp-product-codex/codex_bench/maxreg128_correctness_20260514
+
+model   force max abs diff  force RMS diff  thermo max abs diff
+l3333   1.27e-7             1.59e-8         0
+l3322   2.38e-7             2.16e-8         0
+l4k4    2.38e-7             3.10e-8         0
+l4k5    2.98e-7             3.03e-8         0
+```
+
+- The 100k, 1000-step A100 A/B was clearly slower:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-exp-product-codex/codex_bench/maxreg128_ab_100k_20260514
+
+model   speed change  product speedup  basic speedup  force speedup  total speedup
+l3333   -8.367%       -14.842%         +1.413%        -1.599%        -9.411%
+l3322   -0.037%       +1.450%          +1.261%        -1.816%        +0.016%
+l4k4    -30.817%      -18.513%         +10.158%       -106.295%      -46.225%
+l4k5    -34.294%      -20.268%         -6.169%        -121.989%      -53.614%
+```
+
+Conclusion: global register limiting is unsafe for the static force path. It
+can reduce static basic time for `l4k4`, but force spills/occupancy losses
+dominate. Any register-pressure work must be a targeted force-kernel redesign
+or chunking strategy, not a global compiler cap.
+
+2026-05-14 rejected static-force direct-grad variant:
+
+- Tested a static force variant that kept the existing static `l,k,m`
+  derivative order but removed the per-thread full `grad_cache[BasicCount]`.
+  Instead, each neighbor edge read `moment_grads[b*N+i]` directly while forming
+  the same projected SH/radial derivative sums. This preserved the chain rule
+  and was meant to reduce register/local-memory pressure for `l4,k>=4`.
+- Correctness against the stable binary on the first 4096 Cu-Zr atoms stayed
+  within float scale:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-exp-product-codex/codex_bench/direct_grads_correctness_20260514
+
+model   force max abs diff  force RMS diff  thermo max abs diff
+l3333   1.19e-7             1.46e-8         0
+l3322   2.38e-7             1.76e-8         0
+l4k4    2.98e-7             2.87e-8         0
+l4k5    2.38e-7             3.07e-8         0
+```
+
+- The 100k, 1000-step A100 A/B was slower because each neighbor now rereads
+  all basic gradients from global memory:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-exp-product-codex/codex_bench/direct_grads_ab_100k_20260514
+
+model   force speedup  total speedup  product speedup
+l3333   -8.595%        -1.578%        +0.248%
+l3322   -9.031%        -3.393%        -0.051%
+l4k4    -12.359%       -4.847%        -0.023%
+l4k5    -20.589%       -7.385%        +0.051%
+```
+
+Conclusion: full `grad_cache` is still better than repeating global gradient
+loads per neighbor. Future static-force work should reduce live registers
+without increasing global gradient traffic, for example by chunking the
+projected derivative work while keeping each gradient loaded once per center.
+
+2026-05-14 rejected terminal-producer back fusion:
+
+- Tested a conservative product-path fusion that did not recompute producer
+  forward values and did not skip `moment_vals` writes. It identified producer
+  rows whose target moments are used only by terminal-dot scalar rows, removed
+  the corresponding generic back-row terms, and propagated those producer
+  adjoints inside the compact product kernel after terminal-dot accumulation.
+- Correctness against the stable binary on the first 4096 Cu-Zr atoms stayed
+  within float accumulation scale:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-exp-product-codex/codex_bench/producer_back_fusion_correctness_20260514
+
+model   force max abs diff  force RMS diff  thermo max abs diff  fused rows/terms
+l3333   1.92e-6             2.99e-7         3.13e-9              684 / 2924
+l3322   2.38e-7             1.57e-8         0                    off
+l4k4    2.53e-6             4.59e-7         6.44e-9              365 / 1066
+l4k5    2.24e-5             3.48e-6         1.87e-8              567 / 1700
+```
+
+- The 100k, 1000-step A100 A/B showed that this only helps l3333 and hurts
+  the l4 models:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-exp-product-codex/codex_bench/producer_back_fusion_ab_100k_20260514
+
+model   product speedup  total speedup  stable forward/back(ms)  fused forward/back(ms)
+l3333   +3.334%          +2.344%        3.735 / 2.101            5.432 / 0.225
+l3322   -0.084%          -0.176%        off                      off
+l4k4    -3.829%          -1.330%        not retained             not retained
+l4k5    -1.873%          -0.744%        4.140 / 1.314            5.407 / 0.149
+```
+
+Conclusion: the removed parallel backward work is real, but moving those
+producer backpropagations into the serial per-atom compact kernel increases
+forward time by about the same amount, and more for `l4`. The next product
+redesign should not serialize producer backpropagation in the main compact
+loop. It needs either a topology-local schedule that preserves parallelism or a
+forward-side reduction in global moment traffic.
