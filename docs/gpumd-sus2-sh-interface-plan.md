@@ -1417,3 +1417,83 @@ models without changing the graph definition. The `l3322` improvement is not
 attributed to terminal-dot specialization because terminal-dot groups are
 disabled for that shape; treat it as normal run-to-run or recompilation
 variation unless repeated A/B evidence shows otherwise.
+
+2026-05-14 rejected grouped backward source-row contraction:
+
+- Tested a generic SH backward-row layout that groups each source row by the
+  common `other` moment:
+  `sum_other M[other] * sum_terms c * grad[target]`. This is mathematically
+  equivalent to the existing reverse-mode contraction, apart from float
+  accumulation order, and does not depend on any radial basis type.
+- Correctness on the first 4096 Cu-Zr atoms was acceptable for a float-order
+  change:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_grouped_back_correctness_20260514
+
+model   force max abs diff  force RMS diff  thermo max abs diff
+l3333   1.59e-6             2.29e-7         7.00e-6
+l3322   8.94e-7             1.28e-7         4.00e-8
+l4k4    5.16e-6             3.41e-7         7.00e-6
+l4k5    7.41e-5             5.47e-6         7.90e-5
+```
+
+- The 100k A/B test showed the grouped layout is slower, so this path was
+  reverted before merge:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_grouped_back_ab_profile1000_20260514
+
+model       mode  speed(atom*step/s)  forward(ms)  backward(ms)  product(ms)
+l3333       off   1.04921e7           3.738        2.101         5.842
+l3333       on    1.01920e7           3.743        2.486         6.231
+l3322       off   1.89531e7           1.308        0.425         1.736
+l3322       on    1.84293e7           1.307        0.578         1.888
+l4k4_4422   off   1.12603e7           2.201        0.791         2.995
+l4k4_4422   on    1.09618e7           2.201        1.033         3.237
+l4k5_4422   off   7.97799e6           4.138        1.313         5.454
+l4k5_4422   on    7.78416e6           4.139        1.630         5.772
+```
+
+Conclusion: reducing repeated `M[other]` reads is not the dominant bottleneck
+for the current packed backward row kernel. The extra grouping layer and less
+regular metadata traversal cost more than the saved loads. Future backward
+optimization should keep the original term order and focus on lower-overhead
+row/count specialization or a more substantial layer-program schedule.
+
+2026-05-14 rejected value-only direct radial path for basic:
+
+- Tested a separate value-only radial evaluator for the basic stage. The intent
+  was to avoid derivative recurrence work when `compute_basic` only needs
+  radial values; force evaluation still used the original value+derivative
+  evaluator.
+- Correctness against the pre-change binary on the first 4096 Cu-Zr atoms was
+  within float scale:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_value_radial_correctness_20260514
+
+model   force max abs diff  force RMS diff  thermo max abs diff
+l3333   1.64e-7             1.36e-8         1.00e-8
+l3322   2.38e-7             1.62e-8         1.00e-8
+l4k4    7.45e-7             3.65e-8         4.15e-11
+l4k5    7.75e-7             3.33e-8         2.00e-6
+```
+
+- The 100k A100 test showed no reliable speed gain compared with the current
+  dot-count-specialized baseline:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_value_radial_100k_1m_profile1000_20260514
+
+model       speed(atom*step/s)  basic(ms)  product(ms)  total(ms)
+l3333       1.05077e7           0.845      5.847        9.360
+l3322       1.87473e7           0.848      1.735        5.048
+l4k4_4422   1.12814e7           1.643      2.983        8.705
+l4k5_4422   7.98508e6           1.774      5.442        12.460
+```
+
+Conclusion: nvcc appears to eliminate the derivative-only recurrence work when
+the caller passes a compile-time null derivative pointer in the static basic
+path. Keeping a separate value-only implementation adds code surface without a
+measurable benefit, so it was reverted.
