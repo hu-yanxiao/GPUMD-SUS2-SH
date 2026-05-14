@@ -1925,3 +1925,26 @@ l4k5 back 12.4272 -> 11.5364 ms, product 49.4736 -> 48.5822 ms, total +0.71%
 `sus2_sh_const_back` now defaults on, with automatic fallback when the combined
 constant table would exceed capacity. This is a retained micro-optimization,
 not the larger product-forward redesign still needed for a 10% gain.
+
+2026-05-14 rejected terminal-dot single-entry specialization:
+
+- Tested a device specialization for terminal-dot groups with
+  `entry_count == 1`, directly writing left/right gradients instead of using
+  the normal left-gradient local accumulation path.
+- Correctness remained at float accumulation scale, and the current models had
+  some single-entry groups (`l3333=23`, `l3322=17`, `l4k4=24`, `l4k5=30`), but
+  the 100k, 1000-step A100 A/B was strongly negative:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-exp-product-codex/codex_bench/single_dot_ab100k_1000_20260514
+
+model   forward speedup  product speedup  total speedup
+l3333   -28.16%          -18.68%          -11.51%
+l3322   -26.50%          -26.47%           -9.41%
+l4k4    -26.43%          -20.10%           -6.65%
+l4k5    -29.18%          -22.81%           -9.73%
+```
+
+Conclusion: adding the single-entry branch and extra device helper changes the
+compiled terminal-dot kernel enough to hurt register/control-flow behavior.
+Do not repeat this specialization in the current compact product kernel.
