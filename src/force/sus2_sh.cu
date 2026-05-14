@@ -2974,15 +2974,15 @@ template <
   typename GradT,
   int BasicCache,
   int PatternRows,
-  int DotGroups>
+  int DotGroups,
+  int DoBackward>
 static __global__ void gpu_sh_forward_energy_backward_compact_rows(
   int N,
   SHDeviceModel model,
   const int* type,
   RealT* moments,
   GradT* grads,
-  double* potential,
-  bool do_backward)
+  double* potential)
 {
   const int atom = blockIdx.x * blockDim.x + threadIdx.x;
   if (atom >= N) {
@@ -3232,60 +3232,88 @@ static __global__ void gpu_sh_forward_energy_backward_compact_rows(
   }
   potential[atom] += static_cast<double>(site_energy);
 
-  if (!do_backward) {
-    return;
-  }
-
-  for (int layer = model.sh_cg_layer_count; layer >= 1; --layer) {
-    const int row_begin = model.sh_cg_back_layer_offsets[layer];
-    const int row_end = model.sh_cg_back_layer_offsets[layer + 1];
-    for (int row = row_begin; row < row_end; ++row) {
-      int source;
-      int term_begin;
-      int term_count;
-      if (model.use_packed_back_rows) {
-        const unsigned int* back_u32 =
-          model.use_const_back_rows ? c_sh_forward_u32 : model.sh_cg_back_packed_u32;
-        const unsigned int row0 = back_u32[static_cast<size_t>(row) * 2 + 0];
-        source = static_cast<int>(row0 & 0xffffu);
-        term_count = static_cast<int>(row0 >> 16);
-        term_begin = static_cast<int>(back_u32[static_cast<size_t>(row) * 2 + 1]);
-      } else {
-        const int row_base = row * 3;
-        source = model.sh_cg_back_rows_int[row_base + 0];
-        term_begin = model.sh_cg_back_rows_int[row_base + 1];
-        term_count = model.sh_cg_back_rows_int[row_base + 2];
-      }
-      RealT sum = static_cast<RealT>(0.0);
-      for (int t = 0; t < term_count; ++t) {
-        const int term = term_begin + t;
-        int target;
-        int other;
-        RealT coeff;
+  if (DoBackward != 0) {
+    for (int layer = model.sh_cg_layer_count; layer >= 1; --layer) {
+      const int row_begin = model.sh_cg_back_layer_offsets[layer];
+      const int row_end = model.sh_cg_back_layer_offsets[layer + 1];
+      for (int row = row_begin; row < row_end; ++row) {
+        int source;
+        int term_begin;
+        int term_count;
         if (model.use_packed_back_rows) {
           const unsigned int* back_u32 =
             model.use_const_back_rows ? c_sh_forward_u32 : model.sh_cg_back_packed_u32;
-          const size_t packed_base =
-            static_cast<size_t>(model.sh_cg_back_row_count) * 2 +
-            static_cast<size_t>(term) * 2;
-          const unsigned int meta = back_u32[packed_base + 0];
-          target = static_cast<int>(meta & 0xffffu);
-          other = static_cast<int>(meta >> 16);
-          coeff = sh_const_forward_coeff<RealT>(back_u32[packed_base + 1]);
+          const unsigned int row0 = back_u32[static_cast<size_t>(row) * 2 + 0];
+          source = static_cast<int>(row0 & 0xffffu);
+          term_count = static_cast<int>(row0 >> 16);
+          term_begin = static_cast<int>(back_u32[static_cast<size_t>(row) * 2 + 1]);
         } else {
-          const int term_base = term * 2;
-          target = model.sh_cg_back_terms_int[term_base + 0];
-          other = model.sh_cg_back_terms_int[term_base + 1];
-          coeff = sh_cg_back_term_coeff<RealT>(model, term);
+          const int row_base = row * 3;
+          source = model.sh_cg_back_rows_int[row_base + 0];
+          term_begin = model.sh_cg_back_rows_int[row_base + 1];
+          term_count = model.sh_cg_back_rows_int[row_base + 2];
         }
-        sum += coeff * static_cast<RealT>(grads[static_cast<size_t>(target) * N + atom]) *
-               ((BasicCache > 0 && model.use_product_basic_cache &&
-                 other < model.alpha_basic_count)
-                ? basic_cache[other]
-                : moments[static_cast<size_t>(other) * N + atom]);
+        RealT sum = static_cast<RealT>(0.0);
+        for (int t = 0; t < term_count; ++t) {
+          const int term = term_begin + t;
+          int target;
+          int other;
+          RealT coeff;
+          if (model.use_packed_back_rows) {
+            const unsigned int* back_u32 =
+              model.use_const_back_rows ? c_sh_forward_u32 : model.sh_cg_back_packed_u32;
+            const size_t packed_base =
+              static_cast<size_t>(model.sh_cg_back_row_count) * 2 +
+              static_cast<size_t>(term) * 2;
+            const unsigned int meta = back_u32[packed_base + 0];
+            target = static_cast<int>(meta & 0xffffu);
+            other = static_cast<int>(meta >> 16);
+            coeff = sh_const_forward_coeff<RealT>(back_u32[packed_base + 1]);
+          } else {
+            const int term_base = term * 2;
+            target = model.sh_cg_back_terms_int[term_base + 0];
+            other = model.sh_cg_back_terms_int[term_base + 1];
+            coeff = sh_cg_back_term_coeff<RealT>(model, term);
+          }
+          sum += coeff * static_cast<RealT>(grads[static_cast<size_t>(target) * N + atom]) *
+                 ((BasicCache > 0 && model.use_product_basic_cache &&
+                   other < model.alpha_basic_count)
+                  ? basic_cache[other]
+                  : moments[static_cast<size_t>(other) * N + atom]);
+        }
+        grads[static_cast<size_t>(source) * N + atom] += static_cast<GradT>(sum);
       }
-      grads[static_cast<size_t>(source) * N + atom] += static_cast<GradT>(sum);
     }
+  }
+}
+
+template <
+  typename RealT,
+  typename GradT,
+  int BasicCache,
+  int PatternRows,
+  int DotGroups>
+void launch_sh_forward_energy_backward_compact_rows(
+  int grid_size,
+  int block_size,
+  int N,
+  SHDeviceModel model,
+  const int* type,
+  RealT* moments,
+  GradT* grads,
+  double* potential,
+  bool do_backward)
+{
+  if (do_backward) {
+    gpu_sh_forward_energy_backward_compact_rows<
+      RealT, GradT, BasicCache, PatternRows, DotGroups, 1>
+      <<<grid_size, block_size>>>(
+        N, model, type, moments, grads, potential);
+  } else {
+    gpu_sh_forward_energy_backward_compact_rows<
+      RealT, GradT, BasicCache, PatternRows, DotGroups, 0>
+      <<<grid_size, block_size>>>(
+        N, model, type, moments, grads, potential);
   }
 }
 
@@ -5300,25 +5328,25 @@ void SUS2_SH::compute(
       if (use_product_basic_cache_) {
         if (use_product_pattern_rows_) {
           if (use_terminal_dot_groups_) {
-            gpu_sh_forward_energy_backward_compact_rows<float, float, kSHProductBasicCache, 1, 1>
-              <<<product_grid_size, kProductBlockSize>>>(
+            launch_sh_forward_energy_backward_compact_rows<float, float, kSHProductBasicCache, 1, 1>(
+              product_grid_size, kProductBlockSize,
               num_atoms, model, type.data(), moment_vals_float_.data(), moment_grads_float_.data(),
               potential.data(), !use_parallel_back_rows_);
           } else {
-            gpu_sh_forward_energy_backward_compact_rows<float, float, kSHProductBasicCache, 1, 0>
-              <<<product_grid_size, kProductBlockSize>>>(
+            launch_sh_forward_energy_backward_compact_rows<float, float, kSHProductBasicCache, 1, 0>(
+              product_grid_size, kProductBlockSize,
               num_atoms, model, type.data(), moment_vals_float_.data(), moment_grads_float_.data(),
               potential.data(), !use_parallel_back_rows_);
           }
         } else {
           if (use_terminal_dot_groups_) {
-            gpu_sh_forward_energy_backward_compact_rows<float, float, kSHProductBasicCache, 0, 1>
-              <<<product_grid_size, kProductBlockSize>>>(
+            launch_sh_forward_energy_backward_compact_rows<float, float, kSHProductBasicCache, 0, 1>(
+              product_grid_size, kProductBlockSize,
               num_atoms, model, type.data(), moment_vals_float_.data(), moment_grads_float_.data(),
               potential.data(), !use_parallel_back_rows_);
           } else {
-            gpu_sh_forward_energy_backward_compact_rows<float, float, kSHProductBasicCache, 0, 0>
-              <<<product_grid_size, kProductBlockSize>>>(
+            launch_sh_forward_energy_backward_compact_rows<float, float, kSHProductBasicCache, 0, 0>(
+              product_grid_size, kProductBlockSize,
               num_atoms, model, type.data(), moment_vals_float_.data(), moment_grads_float_.data(),
               potential.data(), !use_parallel_back_rows_);
           }
@@ -5326,25 +5354,25 @@ void SUS2_SH::compute(
       } else {
         if (use_product_pattern_rows_) {
           if (use_terminal_dot_groups_) {
-            gpu_sh_forward_energy_backward_compact_rows<float, float, 0, 1, 1>
-              <<<product_grid_size, kProductBlockSize>>>(
+            launch_sh_forward_energy_backward_compact_rows<float, float, 0, 1, 1>(
+              product_grid_size, kProductBlockSize,
               num_atoms, model, type.data(), moment_vals_float_.data(), moment_grads_float_.data(),
               potential.data(), !use_parallel_back_rows_);
           } else {
-            gpu_sh_forward_energy_backward_compact_rows<float, float, 0, 1, 0>
-              <<<product_grid_size, kProductBlockSize>>>(
+            launch_sh_forward_energy_backward_compact_rows<float, float, 0, 1, 0>(
+              product_grid_size, kProductBlockSize,
               num_atoms, model, type.data(), moment_vals_float_.data(), moment_grads_float_.data(),
               potential.data(), !use_parallel_back_rows_);
           }
         } else {
           if (use_terminal_dot_groups_) {
-            gpu_sh_forward_energy_backward_compact_rows<float, float, 0, 0, 1>
-              <<<product_grid_size, kProductBlockSize>>>(
+            launch_sh_forward_energy_backward_compact_rows<float, float, 0, 0, 1>(
+              product_grid_size, kProductBlockSize,
               num_atoms, model, type.data(), moment_vals_float_.data(), moment_grads_float_.data(),
               potential.data(), !use_parallel_back_rows_);
           } else {
-            gpu_sh_forward_energy_backward_compact_rows<float, float, 0, 0, 0>
-              <<<product_grid_size, kProductBlockSize>>>(
+            launch_sh_forward_energy_backward_compact_rows<float, float, 0, 0, 0>(
+              product_grid_size, kProductBlockSize,
               num_atoms, model, type.data(), moment_vals_float_.data(), moment_grads_float_.data(),
               potential.data(), !use_parallel_back_rows_);
           }
@@ -5472,8 +5500,8 @@ void SUS2_SH::compute(
         GPU_CHECK_KERNEL
       }
     } else if (use_compact_serial_product_) {
-      gpu_sh_forward_energy_backward_compact_rows<double, double, 0, 0, 0>
-        <<<product_grid_size, kProductBlockSize>>>(
+      launch_sh_forward_energy_backward_compact_rows<double, double, 0, 0, 0>(
+        product_grid_size, kProductBlockSize,
         num_atoms, model, type.data(), moment_vals_.data(), moment_grads_.data(),
         potential.data(), !use_parallel_back_rows_);
       GPU_CHECK_KERNEL

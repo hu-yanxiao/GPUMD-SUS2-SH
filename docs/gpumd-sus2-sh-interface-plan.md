@@ -1150,6 +1150,41 @@ l4k4_4422   pattern + dot groups + row-list     about -0.50 ms product
 l4k5_4422   pattern + dot groups + row-list     about -0.92 ms product
 ```
 
+2026-05-14 forward-only compact product specialization:
+
+- The compact product kernel now has compile-time `DoBackward=0/1`
+  specializations. With `parallel_back_rows=on`, the main compact kernel uses
+  the forward-only instance and the existing packed parallel back kernels remain
+  responsible for reverse propagation.
+- This does not change the computation graph. It only lets NVCC eliminate the
+  unused serial-backward branch from the compact kernel used by the default
+  large-model path.
+
+Correctness check: first 4096 Cu-Zr atoms, `l4k5_4422`, comparing the row-list
+version before and after the forward-only specialization:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_forwardonly_correctness_20260514
+
+force max abs diff = 2.384185791e-7
+thermo max abs diff = 1.599999430e-13
+```
+
+A100 `sm_80`, 1,024,000 Cu-Zr atoms, 200 steps. Times are averages over the
+last three 50-step profile windows:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_forwardonly_profile200_20260514
+
+model       previous row-list product  forward-only product  speed(atom*step/s)
+l3333       51.852 ms                  51.803 ms             1.18313e7
+l4k5_4422   52.658 ms                  52.481 ms             8.47799e6
+```
+
+The gain is small. It is worth keeping as a clean kernel specialization, but it
+also confirms that substantial product improvement requires changing the tensor
+contraction path rather than only trimming inactive branches.
+
 Next memory-friendly product directions:
 
 - Do not transpose `moments[moment * N + atom]` to atom-major globally. The
