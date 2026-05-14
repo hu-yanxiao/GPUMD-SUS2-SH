@@ -539,6 +539,25 @@ bool parse_sh_const_forward_rows(const SHHostModel& model, int nopts, const char
   return use_const;
 }
 
+bool parse_sh_product_pattern_rows(const SHHostModel& model, int nopts, const char** opts)
+{
+  bool use_pattern = model.cg_row_terms.size() >= 2500;
+  const char* env = std::getenv("SUS2_SH_GPUMD_PRODUCT_PATTERN_ROWS");
+  if (env != nullptr) {
+    use_pattern = parse_bool_value(env, "SUS2_SH_GPUMD_PRODUCT_PATTERN_ROWS");
+  }
+  const int begin = std::min(nopts, model.species_count);
+  for (int i = begin; i < nopts; ++i) {
+    const std::string option = opts[i] == nullptr ? "" : opts[i];
+    if (starts_with(option, "sus2_sh_product_pattern_rows=") ||
+        starts_with(option, "sus2_product_pattern_rows=")) {
+      const size_t eq = option.find('=');
+      use_pattern = parse_bool_value(option.substr(eq + 1), option.substr(0, eq));
+    }
+  }
+  return use_pattern;
+}
+
 bool parse_sh_parallel_back_rows(const SHHostModel& model, int nopts, const char** opts)
 {
   bool use_parallel = model.cg_back_terms.size() >= 4096;
@@ -1822,6 +1841,8 @@ struct SHDeviceModel {
   int sh_cg_term_count;
   int sh_cg_row_count;
   int sh_cg_row_term_count;
+  int sh_cg_row_pattern_count;
+  int sh_cg_row_pattern_term_count;
   int sh_cg_back_row_count;
   int sh_cg_back_term_count;
   int sh_cg_layer_count;
@@ -1851,6 +1872,7 @@ struct SHDeviceModel {
   const int* sh_cg_row_scalar_index;
   const int* sh_terminal_moment_flags;
   const unsigned int* sh_cg_row_dot_u32;
+  const unsigned int* sh_cg_row_pattern_u32;
   const int* sh_cg_back_rows_int;
   const int* sh_cg_back_terms_int;
   const double* sh_cg_back_terms_coeff;
@@ -1866,6 +1888,8 @@ struct SHDeviceModel {
   const float* radial_direct_scal_s;
   bool use_float_model_params;
   bool use_const_forward_rows;
+  bool use_product_pattern_rows;
+  bool use_const_pattern_rows;
   bool use_terminal_scalar_fusion;
   bool use_packed_back_rows;
   bool use_const_back_rows;
@@ -2896,7 +2920,7 @@ static __global__ void gpu_sh_zero_selected_grads(
   }
 }
 
-template <typename RealT, typename GradT, int BasicCache>
+template <typename RealT, typename GradT, int BasicCache, int PatternRows>
 static __global__ void gpu_sh_forward_energy_backward_compact_rows(
   int N,
   SHDeviceModel model,
@@ -2930,7 +2954,23 @@ static __global__ void gpu_sh_forward_energy_backward_compact_rows(
       int target;
       int term_begin;
       int term_count;
-      if (model.use_const_forward_rows) {
+      int pattern_id = -1;
+      if (PatternRows > 0) {
+        const unsigned int* pattern_u32 =
+          model.use_const_pattern_rows ? c_sh_forward_u32 : model.sh_cg_row_pattern_u32;
+        const size_t pattern_row = static_cast<size_t>(row) * 2;
+        const unsigned int row0 = pattern_u32[pattern_row + 0];
+        const unsigned int row1 = pattern_u32[pattern_row + 1];
+        left_base = static_cast<int>(row0 & 0xffffu);
+        right_base = static_cast<int>(row0 >> 16);
+        target = static_cast<int>(row1 & 0xffffu);
+        pattern_id = static_cast<int>(row1 >> 16);
+        const size_t header_base =
+          static_cast<size_t>(model.sh_cg_row_count) * 2 +
+          static_cast<size_t>(pattern_id) * 2;
+        term_begin = static_cast<int>(pattern_u32[header_base + 0]);
+        term_count = static_cast<int>(pattern_u32[header_base + 1]);
+      } else if (model.use_const_forward_rows) {
         const int const_row = row * 3;
         const unsigned int row0 = c_sh_forward_u32[const_row + 0];
         const unsigned int row1 = c_sh_forward_u32[const_row + 1];
@@ -2996,7 +3036,18 @@ static __global__ void gpu_sh_forward_energy_backward_compact_rows(
         int left_component;
         int right_component;
         RealT coeff;
-        if (model.use_const_forward_rows) {
+        if (PatternRows > 0) {
+          const unsigned int* pattern_u32 =
+            model.use_const_pattern_rows ? c_sh_forward_u32 : model.sh_cg_row_pattern_u32;
+          const size_t pattern_term_base =
+            static_cast<size_t>(model.sh_cg_row_count) * 2 +
+            static_cast<size_t>(model.sh_cg_row_pattern_count) * 2 +
+            static_cast<size_t>(term_begin + t) * 2;
+          const unsigned int term_meta = pattern_u32[pattern_term_base + 0];
+          left_component = static_cast<int>(term_meta & 0xffffu);
+          right_component = static_cast<int>(term_meta >> 16);
+          coeff = sh_const_forward_coeff<RealT>(pattern_u32[pattern_term_base + 1]);
+        } else if (model.use_const_forward_rows) {
           const int const_term = model.sh_cg_row_count * 3 + term * 2;
           const unsigned int term_meta = c_sh_forward_u32[const_term + 0];
           left_component = static_cast<int>(term_meta & 0xffffu);
@@ -3866,6 +3917,8 @@ SUS2_SH::SUS2_SH(
     parse_sh_compact_serial_product(host_model, num_potential_options, potential_options);
   use_const_forward_rows_ =
     parse_sh_const_forward_rows(host_model, num_potential_options, potential_options);
+  use_product_pattern_rows_ =
+    parse_sh_product_pattern_rows(host_model, num_potential_options, potential_options);
   use_parallel_back_rows_ =
     parse_sh_parallel_back_rows(host_model, num_potential_options, potential_options);
   use_packed_back_rows_ =
@@ -3885,6 +3938,8 @@ SUS2_SH::SUS2_SH(
     use_compact_serial_product_ = false;
   }
   use_parallel_back_rows_ = use_parallel_back_rows_ && use_compact_serial_product_;
+  use_product_pattern_rows_ =
+    use_product_pattern_rows_ && use_compact_serial_product_ && use_float_moments_;
   tensor_product_grid_cap_ =
     parse_sh_tensor_product_grid_cap(host_model, num_potential_options, potential_options);
   profile_enabled_ = parse_sh_profile_enabled(host_model, num_potential_options, potential_options);
@@ -4184,9 +4239,128 @@ SUS2_SH::SUS2_SH(
     }
   }
 
+  int product_pattern_u32_count = 0;
+  if (use_product_pattern_rows_) {
+    std::vector<unsigned int> pattern_rows(static_cast<size_t>(sh_cg_row_count_) * 2, 0u);
+    std::vector<unsigned int> pattern_headers;
+    std::vector<unsigned int> pattern_terms;
+    std::map<std::vector<unsigned int>, int> pattern_lookup;
+    bool valid_pattern_rows = true;
+
+    for (int row = 0; row < sh_cg_row_count_ && valid_pattern_rows; ++row) {
+      const int row_base = row * 5;
+      const int row_left_base = cg_row_ints[row_base + 0];
+      const int row_right_base = cg_row_ints[row_base + 1];
+      const int target = cg_row_ints[row_base + 2];
+      const int term_begin = cg_row_ints[row_base + 3];
+      const int term_count = cg_row_ints[row_base + 4];
+      int left_base = 0;
+      int right_base = 0;
+      if (target < 0 || target > 0xffff || term_count < 0) {
+        valid_pattern_rows = false;
+        break;
+      }
+      if (term_count > 0) {
+        left_base = row_left_base + cg_row_term_ints[term_begin * 2 + 0];
+        right_base = row_right_base + cg_row_term_ints[term_begin * 2 + 1];
+        for (int t = 1; t < term_count; ++t) {
+          const int term_base = (term_begin + t) * 2;
+          left_base = std::min(left_base, row_left_base + cg_row_term_ints[term_base + 0]);
+          right_base = std::min(right_base, row_right_base + cg_row_term_ints[term_base + 1]);
+        }
+      }
+      if (left_base < 0 || left_base > 0xffff || right_base < 0 || right_base > 0xffff) {
+        valid_pattern_rows = false;
+        break;
+      }
+
+      std::vector<unsigned int> key;
+      key.reserve(static_cast<size_t>(std::max(term_count, 0)) * 2);
+      for (int t = 0; t < term_count; ++t) {
+        const int term = term_begin + t;
+        const int term_base = term * 2;
+        const int left_offset = row_left_base + cg_row_term_ints[term_base + 0] - left_base;
+        const int right_offset = row_right_base + cg_row_term_ints[term_base + 1] - right_base;
+        if (left_offset < 0 || left_offset > 0xffff ||
+            right_offset < 0 || right_offset > 0xffff) {
+          valid_pattern_rows = false;
+          break;
+        }
+        const float coeff = static_cast<float>(cg_row_term_coeffs[term]);
+        unsigned int coeff_bits = 0u;
+        std::memcpy(&coeff_bits, &coeff, sizeof(coeff_bits));
+        key.push_back(
+          static_cast<unsigned int>(left_offset) |
+          (static_cast<unsigned int>(right_offset) << 16));
+        key.push_back(coeff_bits);
+      }
+      if (!valid_pattern_rows) {
+        break;
+      }
+
+      std::map<std::vector<unsigned int>, int>::const_iterator found =
+        pattern_lookup.find(key);
+      int pattern_id = -1;
+      if (found == pattern_lookup.end()) {
+        pattern_id = static_cast<int>(pattern_lookup.size());
+        if (pattern_id > 0xffff) {
+          valid_pattern_rows = false;
+          break;
+        }
+        pattern_lookup[key] = pattern_id;
+        pattern_headers.push_back(static_cast<unsigned int>(pattern_terms.size() / 2));
+        pattern_headers.push_back(static_cast<unsigned int>(term_count));
+        pattern_terms.insert(pattern_terms.end(), key.begin(), key.end());
+      } else {
+        pattern_id = found->second;
+      }
+
+      pattern_rows[static_cast<size_t>(row) * 2 + 0] =
+        static_cast<unsigned int>(left_base) |
+        (static_cast<unsigned int>(right_base) << 16);
+      pattern_rows[static_cast<size_t>(row) * 2 + 1] =
+        static_cast<unsigned int>(target) |
+        (static_cast<unsigned int>(pattern_id) << 16);
+    }
+
+    if (valid_pattern_rows) {
+      sh_cg_row_pattern_count_ = static_cast<int>(pattern_lookup.size());
+      sh_cg_row_pattern_term_count_ = static_cast<int>(pattern_terms.size() / 2);
+      std::vector<unsigned int> packed_pattern;
+      packed_pattern.reserve(pattern_rows.size() + pattern_headers.size() + pattern_terms.size());
+      packed_pattern.insert(packed_pattern.end(), pattern_rows.begin(), pattern_rows.end());
+      packed_pattern.insert(packed_pattern.end(), pattern_headers.begin(), pattern_headers.end());
+      packed_pattern.insert(packed_pattern.end(), pattern_terms.begin(), pattern_terms.end());
+      product_pattern_u32_count = static_cast<int>(packed_pattern.size());
+      use_const_pattern_rows_ =
+        !use_const_back_rows_ && packed_pattern.size() <= kSHMaxConstForwardU32;
+      if (use_const_pattern_rows_) {
+        CHECK(cudaMemcpyToSymbol(
+          c_sh_forward_u32,
+          packed_pattern.data(),
+          packed_pattern.size() * sizeof(unsigned int)));
+        sh_cg_row_pattern_u32_.resize(0);
+      } else {
+        sh_cg_row_pattern_u32_.resize(packed_pattern.size());
+        if (!packed_pattern.empty()) {
+          sh_cg_row_pattern_u32_.copy_from_host(packed_pattern.data());
+        }
+      }
+    } else {
+      use_product_pattern_rows_ = false;
+      use_const_pattern_rows_ = false;
+      sh_cg_row_pattern_count_ = 0;
+      sh_cg_row_pattern_term_count_ = 0;
+      sh_cg_row_pattern_u32_.resize(0);
+    }
+  } else {
+    sh_cg_row_pattern_u32_.resize(0);
+  }
+
   const int const_forward_u32_count = sh_cg_row_count_ * 3 + sh_cg_row_term_count_ * 2;
   use_const_forward_rows_ =
-    use_const_forward_rows_ && use_float_moments_ && use_compact_serial_product_ &&
+    use_const_forward_rows_ && !use_product_pattern_rows_ &&
+    use_float_moments_ && use_compact_serial_product_ &&
     const_forward_u32_count <= kSHMaxConstForwardU32;
   if (use_const_forward_rows_) {
     std::vector<unsigned int> packed_forward(static_cast<size_t>(const_forward_u32_count), 0u);
@@ -4493,7 +4667,7 @@ SUS2_SH::SUS2_SH(
     alpha_scalar_moments_,
     rc);
   printf(
-    "SUS2-SH GPUMD precision mode: %s; force self-buffer: %s; force basic-grad cache: %s; static basic: %s; static force: %s; terminal scalar fusion: %s; terminal dot rows: %s; selective grad zero: %s; product basic cache: %s; row scalar fusion: %s; cg-block forward: %s; compact serial product: %s; parallel back rows: %s; packed back rows: %s; const forward rows: %s; const back rows: %s; tensor-product parallel: %s; tensor grid cap=%d.\n",
+    "SUS2-SH GPUMD precision mode: %s; force self-buffer: %s; force basic-grad cache: %s; static basic: %s; static force: %s; terminal scalar fusion: %s; terminal dot rows: %s; selective grad zero: %s; product basic cache: %s; row scalar fusion: %s; cg-block forward: %s; compact serial product: %s; product pattern rows: %s; const pattern rows: %s; parallel back rows: %s; packed back rows: %s; const forward rows: %s; const back rows: %s; tensor-product parallel: %s; tensor grid cap=%d.\n",
     use_float_moments_ ? "NEP-like float moments/gradients/local arithmetic" : "double moments/local arithmetic",
     use_force_self_buffer_ ? "on" : "off",
     use_force_grad_cache_ ? "on" : "off",
@@ -4506,6 +4680,8 @@ SUS2_SH::SUS2_SH(
     use_row_scalar_fusion_ ? "on" : "off",
     use_cg_block_forward_ ? "on" : "off",
     use_compact_serial_product_ ? "on" : "off",
+    use_product_pattern_rows_ ? "on" : "off",
+    use_const_pattern_rows_ ? "on" : "off",
     use_parallel_back_rows_ ? "on" : "off",
     use_packed_back_rows_ ? "on" : "off",
     use_const_forward_rows_ ? "on" : "off",
@@ -4522,6 +4698,13 @@ SUS2_SH::SUS2_SH(
     sh_cg_back_row_count_,
     sh_cg_back_term_count_,
     host_model.sh_standard_cg_layers);
+  if (use_product_pattern_rows_) {
+    printf(
+      "SUS2-SH product pattern rows: patterns=%d, pattern_terms=%d, packed_u32=%d.\n",
+      sh_cg_row_pattern_count_,
+      sh_cg_row_pattern_term_count_,
+      product_pattern_u32_count);
+  }
   if (use_terminal_scalar_fusion_) {
     printf(
       "SUS2-SH terminal scalar fusion: terminal_scalars=%d, active_scalar_seeds=%d, removed_back_terms=%d.\n",
@@ -4741,6 +4924,8 @@ void SUS2_SH::compute(
     sh_cg_term_count_,
     sh_cg_row_count_,
     sh_cg_row_term_count_,
+    sh_cg_row_pattern_count_,
+    sh_cg_row_pattern_term_count_,
     sh_cg_back_row_count_,
     sh_cg_back_term_count_,
     sh_cg_layer_count_,
@@ -4770,6 +4955,7 @@ void SUS2_SH::compute(
     sh_cg_row_scalar_index_.data(),
     sh_terminal_moment_flags_.data(),
     use_terminal_dot_rows_ ? sh_cg_row_dot_u32_.data() : nullptr,
+    use_product_pattern_rows_ && !use_const_pattern_rows_ ? sh_cg_row_pattern_u32_.data() : nullptr,
     sh_cg_back_rows_int_.data(),
     sh_cg_back_terms_int_.data(),
     sh_cg_back_terms_coeff_.data(),
@@ -4785,6 +4971,8 @@ void SUS2_SH::compute(
     radial_direct_scal_s_.data(),
     use_float_moments_,
     use_const_forward_rows_,
+    use_product_pattern_rows_,
+    use_const_pattern_rows_,
     use_terminal_scalar_fusion_,
     use_packed_back_rows_,
     use_const_back_rows_,
@@ -4843,15 +5031,29 @@ void SUS2_SH::compute(
       }
     } else if (use_compact_serial_product_) {
       if (use_product_basic_cache_) {
-        gpu_sh_forward_energy_backward_compact_rows<float, float, kSHProductBasicCache>
-          <<<product_grid_size, kProductBlockSize>>>(
-          num_atoms, model, type.data(), moment_vals_float_.data(), moment_grads_float_.data(),
-          potential.data(), !use_parallel_back_rows_);
+        if (use_product_pattern_rows_) {
+          gpu_sh_forward_energy_backward_compact_rows<float, float, kSHProductBasicCache, 1>
+            <<<product_grid_size, kProductBlockSize>>>(
+            num_atoms, model, type.data(), moment_vals_float_.data(), moment_grads_float_.data(),
+            potential.data(), !use_parallel_back_rows_);
+        } else {
+          gpu_sh_forward_energy_backward_compact_rows<float, float, kSHProductBasicCache, 0>
+            <<<product_grid_size, kProductBlockSize>>>(
+            num_atoms, model, type.data(), moment_vals_float_.data(), moment_grads_float_.data(),
+            potential.data(), !use_parallel_back_rows_);
+        }
       } else {
-        gpu_sh_forward_energy_backward_compact_rows<float, float, 0>
-          <<<product_grid_size, kProductBlockSize>>>(
-          num_atoms, model, type.data(), moment_vals_float_.data(), moment_grads_float_.data(),
-          potential.data(), !use_parallel_back_rows_);
+        if (use_product_pattern_rows_) {
+          gpu_sh_forward_energy_backward_compact_rows<float, float, 0, 1>
+            <<<product_grid_size, kProductBlockSize>>>(
+            num_atoms, model, type.data(), moment_vals_float_.data(), moment_grads_float_.data(),
+            potential.data(), !use_parallel_back_rows_);
+        } else {
+          gpu_sh_forward_energy_backward_compact_rows<float, float, 0, 0>
+            <<<product_grid_size, kProductBlockSize>>>(
+            num_atoms, model, type.data(), moment_vals_float_.data(), moment_grads_float_.data(),
+            potential.data(), !use_parallel_back_rows_);
+        }
       }
       GPU_CHECK_KERNEL
       if (use_parallel_back_rows_) {
@@ -4975,7 +5177,7 @@ void SUS2_SH::compute(
         GPU_CHECK_KERNEL
       }
     } else if (use_compact_serial_product_) {
-      gpu_sh_forward_energy_backward_compact_rows<double, double, 0>
+      gpu_sh_forward_energy_backward_compact_rows<double, double, 0, 0>
         <<<product_grid_size, kProductBlockSize>>>(
         num_atoms, model, type.data(), moment_vals_.data(), moment_grads_.data(),
         potential.data(), !use_parallel_back_rows_);

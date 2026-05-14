@@ -43,6 +43,8 @@ private:
   int sh_cg_term_count_ = 0;
   int sh_cg_row_count_ = 0;
   int sh_cg_row_term_count_ = 0;
+  int sh_cg_row_pattern_count_ = 0;
+  int sh_cg_row_pattern_term_count_ = 0;
   int sh_cg_back_row_count_ = 0;
   int sh_cg_back_term_count_ = 0;
   int sh_cg_layer_count_ = 0;
@@ -60,6 +62,8 @@ private:
   bool use_tensor_product_parallel_ = false;
   bool use_compact_serial_product_ = false;
   bool use_const_forward_rows_ = false;
+  bool use_product_pattern_rows_ = false;
+  bool use_const_pattern_rows_ = false;
   bool use_static_basic_layout_ = false;
   bool use_static_force_layout_ = false;
   bool use_parallel_back_rows_ = false;
@@ -100,6 +104,7 @@ private:
   GPU_Vector<int> sh_cg_row_scalar_index_;
   GPU_Vector<int> sh_terminal_moment_flags_;
   GPU_Vector<unsigned int> sh_cg_row_dot_u32_;
+  GPU_Vector<unsigned int> sh_cg_row_pattern_u32_;
   GPU_Vector<int> sh_cg_back_rows_int_;
   GPU_Vector<int> sh_cg_back_terms_int_;
   GPU_Vector<double> sh_cg_back_terms_coeff_;

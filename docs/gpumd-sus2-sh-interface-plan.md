@@ -963,3 +963,73 @@ The constant-table boundary change is useful but small. For `l4k5_4422`, product
 time moved from about `60.78 ms` to about `60.60 ms`. The main optimization
 target remains product-v2: share forward-row CG term patterns across repeated
 `k`/block instances while keeping the current compact path as fallback.
+
+2026-05-14 A100 `sm_80` product-pattern update:
+
+- The server build must target A100 with `CUDA_ARCH=-arch=sm_80`. A previous
+  build command accidentally used the upstream makefile default `sm_60`; the
+  benchmark below is from a clean `sm_80` rebuild.
+- Added guarded forward product pattern rows. The row instances keep their own
+  `target` and base moment ids, while repeated relative `(left_offset,
+  right_offset, coeff)` term patterns are stored once. This changes metadata
+  packing and readout only; the compact tensor-product graph and reverse-mode
+  back rows are unchanged.
+- The option is controlled by `sus2_sh_product_pattern_rows=` or
+  `SUS2_SH_GPUMD_PRODUCT_PATTERN_ROWS`. Default heuristic: enable it when
+  `cg_row_terms >= 2500`; this keeps the smaller `l3322` model on the older
+  const-forward row path, where pattern decode was slightly slower.
+- Pattern packing statistics for the current models:
+
+```text
+model       rows  row_terms  patterns  pattern_terms  old_u32  pattern_u32
+l3333       1301  5475       165       811            14853    4554
+l3322       477   1416       48        180            4263     1410
+l4k4_4422   968   2996       48        180            8896     2392
+l4k5_4422   1730  5410       48        180            16010    3916
+```
+
+`sm_80` 1,024,000 atom Cu-Zr 200-step A/B profile matrix. Times are averages
+over the last three 50-step profile windows:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_sm80_pattern_ab_profile200_20260514
+
+model       mode     speed(atom*step/s)  neighbor  memset  basic   product  force   accumulate  total
+l3333       off      1.05156e7           5.156     2.836   7.714   59.507   18.727  0.147       94.087
+l3333       pattern  1.07244e7           5.128     2.808   7.623   57.844   18.578  0.148       92.128
+l3322       off      2.14351e7           4.857     0.931   7.110   14.891   16.880  0.147       44.816
+l3322       pattern  2.13570e7           4.848     0.934   7.107   15.043   16.870  0.148       44.949
+l4k4_4422   off      1.15164e7           5.443     1.645   14.953  32.663   31.131  0.148       85.984
+l4k4_4422   pattern  1.16588e7           5.446     1.645   14.967  31.555   31.160  0.147       84.921
+l4k5_4422   off      7.90063e6           5.170     2.418   16.026  61.435   41.518  0.150       126.718
+l4k5_4422   pattern  7.99383e6           5.171     2.418   16.032  59.849   41.510  0.149       125.130
+```
+
+Current default behavior after the heuristic is therefore:
+
+```text
+model       default path  speed(atom*step/s)  product  total
+l3333       pattern       1.07244e7           57.844   92.128
+l3322       const rows    2.14351e7           14.891   44.816
+l4k4_4422   pattern       1.16588e7           31.555   84.921
+l4k5_4422   pattern       7.99383e6           59.849   125.130
+```
+
+Correctness check: first 4096 Cu-Zr atoms, `l4k5_4422`, same LSF job and same
+GPU, `run 1`, comparing pattern off/on with dumped forces:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_sm80_pattern_correctness_20260514/l4k5
+
+force max abs diff = 4.613399506e-5
+```
+
+An off-vs-off repeat under the same conditions produced the same maximum force
+difference, so this is the current float GPUMD non-bitwise repeatability scale,
+not a pattern-row math regression:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_sm80_determinism_20260514/l4k5_off_off
+
+force max abs diff = 4.613399506e-5
+```
