@@ -732,6 +732,25 @@ bool parse_sh_terminal_dot_groups(const SHHostModel& model, int nopts, const cha
   return use_groups;
 }
 
+bool parse_sh_terminal_dot_premul(const SHHostModel& model, int nopts, const char** opts)
+{
+  bool use_premul = true;
+  const char* env = std::getenv("SUS2_SH_GPUMD_TERMINAL_DOT_PREMUL");
+  if (env != nullptr) {
+    use_premul = parse_bool_value(env, "SUS2_SH_GPUMD_TERMINAL_DOT_PREMUL");
+  }
+  const int begin = std::min(nopts, model.species_count);
+  for (int i = begin; i < nopts; ++i) {
+    const std::string option = opts[i] == nullptr ? "" : opts[i];
+    if (starts_with(option, "sus2_sh_terminal_dot_premul=") ||
+        starts_with(option, "sus2_terminal_dot_premul=")) {
+      const size_t eq = option.find('=');
+      use_premul = parse_bool_value(option.substr(eq + 1), option.substr(0, eq));
+    }
+  }
+  return use_premul;
+}
+
 bool parse_sh_terminal_dot_row_list(const SHHostModel& model, int nopts, const char** opts)
 {
   bool use_list = true;
@@ -1943,6 +1962,7 @@ struct SHDeviceModel {
   bool use_const_back_rows;
   bool use_terminal_dot_rows;
   bool use_terminal_dot_groups;
+  bool use_terminal_dot_premul;
   bool use_product_basic_cache;
 };
 
@@ -3190,11 +3210,13 @@ static __global__ void gpu_sh_forward_energy_backward_compact_rows(
             entry_offset + static_cast<size_t>(entry_begin + e) * 2;
           const unsigned int entry0 = model.sh_terminal_dot_group_u32[entry_base + 0];
           const int right0 = static_cast<int>(entry0 & 0xffffu);
-          const int scalar_index = static_cast<int>(entry0 >> 16);
           const RealT coeff =
             sh_const_forward_coeff<RealT>(model.sh_terminal_dot_group_u32[entry_base + 1]);
-          const RealT weighted =
-            coeff * center_coeff * sh_moment_coeff<RealT>(model, scalar_index);
+          RealT weighted = coeff * center_coeff;
+          if (!model.use_terminal_dot_premul) {
+            const int scalar_index = static_cast<int>(entry0 >> 16);
+            weighted *= sh_moment_coeff<RealT>(model, scalar_index);
+          }
           RealT dot = static_cast<RealT>(0.0);
           for (int c = 0; c < dot_count; ++c) {
             const int right = right0 + c;
@@ -4119,6 +4141,9 @@ SUS2_SH::SUS2_SH(
   use_terminal_dot_groups_ =
     parse_sh_terminal_dot_groups(host_model, num_potential_options, potential_options) &&
     use_terminal_dot_rows_;
+  use_terminal_dot_premul_ =
+    parse_sh_terminal_dot_premul(host_model, num_potential_options, potential_options) &&
+    use_terminal_dot_groups_ && use_float_moments_;
   use_terminal_dot_row_list_ =
     parse_sh_terminal_dot_row_list(host_model, num_potential_options, potential_options) &&
     use_terminal_dot_groups_;
@@ -4389,10 +4414,18 @@ SUS2_SH::SUS2_SH(
         valid_dot_groups = false;
         break;
       }
+      float entry_coeff = 0.0f;
+      std::memcpy(
+        &entry_coeff, &dot_rows[static_cast<size_t>(row) * 3 + 2], sizeof(entry_coeff));
+      if (use_terminal_dot_premul_) {
+        entry_coeff *= static_cast<float>(host_model.moment_coeffs[scalar_index]);
+      }
+      unsigned int entry_coeff_bits = 0u;
+      std::memcpy(&entry_coeff_bits, &entry_coeff, sizeof(entry_coeff_bits));
       std::array<unsigned int, 2> entry;
       entry[0] = static_cast<unsigned int>(right0) |
         (static_cast<unsigned int>(scalar_index) << 16);
-      entry[1] = dot_rows[static_cast<size_t>(row) * 3 + 2];
+      entry[1] = entry_coeff_bits;
       by_layer[static_cast<size_t>(layer)][DotGroupKey(left0, dot_count)].push_back(entry);
     }
 
@@ -4445,6 +4478,7 @@ SUS2_SH::SUS2_SH(
   }
   if (!use_terminal_dot_groups_) {
     use_terminal_dot_row_list_ = false;
+    use_terminal_dot_premul_ = false;
     sh_terminal_dot_group_count_ = 0;
     sh_terminal_dot_group_entry_count_ = 0;
     sh_terminal_dot_group_u32_.resize(0);
@@ -4944,7 +4978,7 @@ SUS2_SH::SUS2_SH(
     alpha_scalar_moments_,
     rc);
   printf(
-    "SUS2-SH GPUMD precision mode: %s; force self-buffer: %s; force basic-grad cache: %s; static basic: %s; static force: %s; terminal scalar fusion: %s; terminal dot rows: %s; terminal dot groups: %s; terminal dot row-list: %s; selective grad zero: %s; product basic cache: %s; row scalar fusion: %s; cg-block forward: %s; compact serial product: %s; product pattern rows: %s; const pattern rows: %s; parallel back rows: %s; packed back rows: %s; const forward rows: %s; const back rows: %s; tensor-product parallel: %s; tensor grid cap=%d.\n",
+    "SUS2-SH GPUMD precision mode: %s; force self-buffer: %s; force basic-grad cache: %s; static basic: %s; static force: %s; terminal scalar fusion: %s; terminal dot rows: %s; terminal dot groups: %s; terminal dot premul: %s; terminal dot row-list: %s; selective grad zero: %s; product basic cache: %s; row scalar fusion: %s; cg-block forward: %s; compact serial product: %s; product pattern rows: %s; const pattern rows: %s; parallel back rows: %s; packed back rows: %s; const forward rows: %s; const back rows: %s; tensor-product parallel: %s; tensor grid cap=%d.\n",
     use_float_moments_ ? "NEP-like float moments/gradients/local arithmetic" : "double moments/local arithmetic",
     use_force_self_buffer_ ? "on" : "off",
     use_force_grad_cache_ ? "on" : "off",
@@ -4953,6 +4987,7 @@ SUS2_SH::SUS2_SH(
     use_terminal_scalar_fusion_ ? "on" : "off",
     use_terminal_dot_rows_ ? "on" : "off",
     use_terminal_dot_groups_ ? "on" : "off",
+    use_terminal_dot_premul_ ? "on" : "off",
     use_terminal_dot_row_list_ ? "on" : "off",
     use_selective_grad_zero_ ? "on" : "off",
     use_product_basic_cache_ ? "on" : "off",
@@ -5272,6 +5307,7 @@ void SUS2_SH::compute(
     use_const_back_rows_,
     use_terminal_dot_rows_,
     use_terminal_dot_groups_,
+    use_terminal_dot_premul_,
     use_product_basic_cache_};
 
   float* force_self_tmp_ptr = use_force_self_buffer_ ? force_self_tmp_.data() : nullptr;

@@ -74,6 +74,7 @@ private:
   bool use_row_scalar_fusion_ = false;
   bool use_terminal_dot_rows_ = false;
   bool use_terminal_dot_groups_ = false;
+  bool use_terminal_dot_premul_ = false;
   bool use_terminal_dot_row_list_ = false;
   bool use_selective_grad_zero_ = false;
   bool use_product_basic_cache_ = false;

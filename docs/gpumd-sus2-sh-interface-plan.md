@@ -1295,3 +1295,61 @@ global read/write pass over intermediate moments and another kernel launch,
 which outweighs row-pattern reuse. Future product work should not split a
 forward layer out of the compact product path unless it also removes a larger
 global-memory pass or fuses more of the scalar/backward contraction.
+
+2026-05-14 terminal-dot coefficient premultiply:
+
+- Terminal dot groups evaluate the final scalar contractions as dot products
+  between a tensor product row and a scalar center coefficient. The row entry
+  previously stored the CG coefficient and loaded the scalar model coefficient
+  separately inside the device loop.
+- The new default path pre-multiplies `CG coeff * scalar coeff` when packing
+  terminal dot-group entries on the host, but only when terminal dot groups and
+  float moment coefficients are active. The device loop then uses the packed
+  coefficient directly. The mathematical contraction is unchanged; only the
+  local float multiply/load order changes.
+- The option is controlled by `sus2_sh_terminal_dot_premul=` or
+  `SUS2_SH_GPUMD_TERMINAL_DOT_PREMUL`. It defaults to on for eligible
+  terminal-dot group models and can be disabled with
+  `sus2_sh_terminal_dot_premul=0`.
+
+Correctness check: first 4096 Cu-Zr atoms, comparing premultiply off/on:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_terminal_dot_premul_correctness_20260514
+
+model   force max abs diff  thermo max abs diff
+l3333   1.79e-7             2.00e-12
+l3322   2.38e-7             2.00e-12
+l4k4    5.33e-6             1.00e-6
+l4k5    1.03e-5             2.50e-5
+```
+
+Formal A100 `sm_80` 1000-step A/B test, averages over the last five 100-step
+profile windows:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_terminal_dot_premul_100k_1m_profile1000_20260514
+
+model       atoms      mode  speed(atom*step/s)  product(ms)  total(ms)
+l3333       102400     off   1.02412e7           6.0826       9.6258
+l3333       102400     on    1.03220e7           6.0324       9.5854
+l3322       102400     off   1.84803e7           1.8756       5.2056
+l3322       102400     on    1.84497e7           1.8798       5.2098
+l4k4_4422   102400     off   1.09866e7           3.2244       8.9718
+l4k4_4422   102400     on    1.10084e7           3.1974       8.9474
+l4k5_4422   102400     off   7.72774e6           5.8702       12.8924
+l4k5_4422   102400     on    7.76727e6           5.7992       12.8364
+l3333       1024000    off   1.19037e7           51.8806      83.0278
+l3333       1024000    on    1.19272e7           51.7188      82.8768
+l3322       1024000    off   2.14960e7           15.1684      44.6866
+l3322       1024000    on    2.14960e7           15.1646      44.6902
+l4k4_4422   1024000    off   1.21513e7           28.7570      81.2318
+l4k4_4422   1024000    on    1.21537e7           28.7152      81.2088
+l4k5_4422   1024000    off   8.51795e6           52.5626      117.1796
+l4k5_4422   1024000    on    8.53195e6           52.3814      116.9844
+```
+
+The gain is intentionally small but consistent for terminal-dot group models:
+about `0.15% - 1.2%` product reduction and up to about `0.8%` full-step speedup
+in this benchmark. `l3322` is essentially unchanged because terminal-dot groups
+remain disabled for that model shape.
