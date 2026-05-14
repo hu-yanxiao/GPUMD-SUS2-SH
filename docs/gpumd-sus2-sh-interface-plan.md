@@ -1497,3 +1497,44 @@ Conclusion: nvcc appears to eliminate the derivative-only recurrence work when
 the caller passes a compile-time null derivative pointer in the static basic
 path. Keeping a separate value-only implementation adds code surface without a
 measurable benefit, so it was reverted.
+
+2026-05-14 rejected inline terminal recompute for product:
+
+- Tested a guarded product-graph change that identifies layer-1 non-scalar rows
+  used only by terminal dot scalar rows, skips materializing those rows, and
+  recomputes/backpropagates them directly inside the terminal dot group. This
+  was meant to reduce global intermediate writes and remove backward terms while
+  preserving the same CG contraction algebra.
+- First prototype routed every terminal dot group through the dynamic inline
+  handler. It was mathematically correct, but product got slower because the
+  fixed dot-count specializations were bypassed.
+- Second prototype precomputed dot-group inline flags so only groups that
+  actually contain inline sources used the dynamic handler. Correctness on the
+  first 4096 Cu-Zr atoms remained within float accumulation scale:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_inline_terminal_correctness_20260514
+
+model   inline rows  inline groups  removed back terms  force max abs diff  force RMS diff  thermo max abs diff
+l3333   265          20             2286                1.24e-6             2.11e-7         3.36e-9
+l3322   81           11             488                 8.94e-7             1.72e-7         1.53e-9
+l4k4    99           16             582                 1.16e-6             2.56e-7         1.05e-9
+l4k5    110          17             620                 7.21e-6             9.74e-7         5.83e-9
+```
+
+- The same 4096-atom profile showed product still worsened even after limiting
+  dynamic handling to flagged groups:
+
+```text
+model   product off(ms)  product on(ms)  forward off(ms)  forward on(ms)  backward off(ms)  backward on(ms)
+l3333   1.591            1.956           1.496            1.885           0.092             0.069
+l3322   0.434            0.550           0.387            0.509           0.045             0.038
+l4k4    0.799            1.015           0.742            0.965           0.054             0.047
+l4k5    1.371            1.693           1.303            1.629           0.065             0.060
+```
+
+Conclusion: this approach removes backward work but pays more in repeated
+forward recomputation and dynamic inline checks. It is not a 10% path and was
+reverted. Future substantial product work should avoid recomputing row values
+inside terminal groups and instead reduce row interpretation/global memory
+traffic through a topology-local contraction schedule.
