@@ -602,7 +602,7 @@ bool parse_sh_packed_back_rows(const SHHostModel& model, int nopts, const char**
 
 bool parse_sh_const_back_rows(const SHHostModel& model, int nopts, const char** opts)
 {
-  bool use_const = false;
+  bool use_const = true;
   const char* env = std::getenv("SUS2_SH_GPUMD_CONST_BACK");
   if (env != nullptr) {
     use_const = parse_bool_value(env, "SUS2_SH_GPUMD_CONST_BACK");
@@ -2043,6 +2043,18 @@ __device__ __forceinline__ RealT sh_cg_back_term_coeff(const SHDeviceModel& mode
                                       : static_cast<RealT>(model.sh_cg_back_terms_coeff[idx]);
 }
 
+__device__ __forceinline__ int sh_const_back_u32_offset(const SHDeviceModel& model)
+{
+  if (model.use_const_pattern_rows) {
+    return model.sh_cg_row_count * 2 + model.sh_cg_row_pattern_count * 2 +
+           model.sh_cg_row_pattern_term_count * 2;
+  }
+  if (model.use_const_forward_rows) {
+    return model.sh_cg_row_count * 3 + model.sh_cg_row_term_count * 2;
+  }
+  return 0;
+}
+
 template <typename RealT>
 __device__ __forceinline__ RealT sh_const_forward_coeff(unsigned int bits)
 {
@@ -2952,7 +2964,9 @@ static __global__ void gpu_sh_tensor_product_back_rows(
     int term_count;
     if (model.use_packed_back_rows) {
       const unsigned int* back_u32 =
-        model.use_const_back_rows ? c_sh_forward_u32 : model.sh_cg_back_packed_u32;
+        model.use_const_back_rows
+        ? c_sh_forward_u32 + sh_const_back_u32_offset(model)
+        : model.sh_cg_back_packed_u32;
       const unsigned int row0 = back_u32[static_cast<size_t>(row) * 2 + 0];
       source = static_cast<int>(row0 & 0xffffu);
       term_count = static_cast<int>(row0 >> 16);
@@ -2971,7 +2985,9 @@ static __global__ void gpu_sh_tensor_product_back_rows(
       RealT coeff;
       if (model.use_packed_back_rows) {
         const unsigned int* back_u32 =
-          model.use_const_back_rows ? c_sh_forward_u32 : model.sh_cg_back_packed_u32;
+          model.use_const_back_rows
+          ? c_sh_forward_u32 + sh_const_back_u32_offset(model)
+          : model.sh_cg_back_packed_u32;
         const size_t packed_base =
           static_cast<size_t>(model.sh_cg_back_row_count) * 2 +
           static_cast<size_t>(term) * 2;
@@ -3396,7 +3412,9 @@ static __global__ void gpu_sh_forward_energy_backward_compact_rows(
         int term_count;
         if (model.use_packed_back_rows) {
           const unsigned int* back_u32 =
-            model.use_const_back_rows ? c_sh_forward_u32 : model.sh_cg_back_packed_u32;
+            model.use_const_back_rows
+            ? c_sh_forward_u32 + sh_const_back_u32_offset(model)
+            : model.sh_cg_back_packed_u32;
           const unsigned int row0 = back_u32[static_cast<size_t>(row) * 2 + 0];
           source = static_cast<int>(row0 & 0xffffu);
           term_count = static_cast<int>(row0 >> 16);
@@ -3415,7 +3433,9 @@ static __global__ void gpu_sh_forward_energy_backward_compact_rows(
           RealT coeff;
           if (model.use_packed_back_rows) {
             const unsigned int* back_u32 =
-              model.use_const_back_rows ? c_sh_forward_u32 : model.sh_cg_back_packed_u32;
+              model.use_const_back_rows
+              ? c_sh_forward_u32 + sh_const_back_u32_offset(model)
+              : model.sh_cg_back_packed_u32;
             const size_t packed_base =
               static_cast<size_t>(model.sh_cg_back_row_count) * 2 +
               static_cast<size_t>(term) * 2;
@@ -4234,9 +4254,6 @@ SUS2_SH::SUS2_SH(
   use_const_back_rows_ =
     parse_sh_const_back_rows(host_model, num_potential_options, potential_options) &&
     use_packed_back_rows_;
-  if (use_const_back_rows_) {
-    use_const_forward_rows_ = false;
-  }
   if (use_tensor_product_parallel_) {
     use_cg_block_forward_ = false;
     use_compact_serial_product_ = false;
@@ -4474,6 +4491,8 @@ SUS2_SH::SUS2_SH(
 
   int terminal_dot_row_count = 0;
   int terminal_dot_term_count = 0;
+  bool terminal_dot_groups_swapped = false;
+  int terminal_dot_group_cached_components = 0;
   std::vector<unsigned int> dot_rows;
   if (use_terminal_dot_rows_) {
     dot_rows.assign(static_cast<size_t>(sh_cg_row_count_) * 3, 0u);
@@ -4527,7 +4546,11 @@ SUS2_SH::SUS2_SH(
     terminal_dot_row_count > 0;
   if (use_terminal_dot_groups_) {
     typedef std::pair<int, int> DotGroupKey;
-    std::vector<std::map<DotGroupKey, std::vector<std::array<unsigned int, 2>>>> by_layer(
+    typedef std::vector<std::map<DotGroupKey, std::vector<std::array<unsigned int, 2>>>>
+      DotGroupsByLayer;
+    DotGroupsByLayer by_left_layer(
+      static_cast<size_t>(sh_cg_layer_count_) + 1);
+    DotGroupsByLayer by_right_layer(
       static_cast<size_t>(sh_cg_layer_count_) + 1);
     bool valid_dot_groups = true;
     for (int row = 0; row < sh_cg_row_count_ && valid_dot_groups; ++row) {
@@ -4556,14 +4579,54 @@ SUS2_SH::SUS2_SH(
       }
       unsigned int entry_coeff_bits = 0u;
       std::memcpy(&entry_coeff_bits, &entry_coeff, sizeof(entry_coeff_bits));
-      std::array<unsigned int, 2> entry;
-      entry[0] = static_cast<unsigned int>(right0) |
+      std::array<unsigned int, 2> left_entry;
+      left_entry[0] = static_cast<unsigned int>(right0) |
         (static_cast<unsigned int>(scalar_index) << 16);
-      entry[1] = entry_coeff_bits;
-      by_layer[static_cast<size_t>(layer)][DotGroupKey(left0, dot_count)].push_back(entry);
+      left_entry[1] = entry_coeff_bits;
+      by_left_layer[static_cast<size_t>(layer)][DotGroupKey(left0, dot_count)].push_back(
+        left_entry);
+      std::array<unsigned int, 2> right_entry;
+      right_entry[0] = static_cast<unsigned int>(left0) |
+        (static_cast<unsigned int>(scalar_index) << 16);
+      right_entry[1] = entry_coeff_bits;
+      by_right_layer[static_cast<size_t>(layer)][DotGroupKey(right0, dot_count)].push_back(
+        right_entry);
     }
 
     if (valid_dot_groups) {
+      int left_group_count = 0;
+      int right_group_count = 0;
+      int left_cached_components = 0;
+      int right_cached_components = 0;
+      for (int layer = 1; layer <= sh_cg_layer_count_; ++layer) {
+        const std::map<DotGroupKey, std::vector<std::array<unsigned int, 2>>>& left_groups =
+          by_left_layer[static_cast<size_t>(layer)];
+        for (std::map<DotGroupKey, std::vector<std::array<unsigned int, 2>>>::const_iterator it =
+               left_groups.begin();
+             it != left_groups.end();
+             ++it) {
+          ++left_group_count;
+          left_cached_components += it->first.second;
+        }
+        const std::map<DotGroupKey, std::vector<std::array<unsigned int, 2>>>& right_groups =
+          by_right_layer[static_cast<size_t>(layer)];
+        for (std::map<DotGroupKey, std::vector<std::array<unsigned int, 2>>>::const_iterator it =
+               right_groups.begin();
+             it != right_groups.end();
+             ++it) {
+          ++right_group_count;
+          right_cached_components += it->first.second;
+        }
+      }
+      terminal_dot_groups_swapped =
+        right_cached_components < left_cached_components ||
+        (right_cached_components == left_cached_components &&
+         right_group_count < left_group_count);
+      terminal_dot_group_cached_components = terminal_dot_groups_swapped
+        ? right_cached_components
+        : left_cached_components;
+      const DotGroupsByLayer& by_layer =
+        terminal_dot_groups_swapped ? by_right_layer : by_left_layer;
       std::vector<int> layer_offsets(static_cast<size_t>(sh_cg_layer_count_) + 2, 0);
       std::vector<unsigned int> group_headers;
       std::vector<unsigned int> group_entries;
@@ -4777,8 +4840,7 @@ SUS2_SH::SUS2_SH(
       packed_pattern.insert(packed_pattern.end(), pattern_headers.begin(), pattern_headers.end());
       packed_pattern.insert(packed_pattern.end(), pattern_terms.begin(), pattern_terms.end());
       product_pattern_u32_count = static_cast<int>(packed_pattern.size());
-      use_const_pattern_rows_ =
-        !use_const_back_rows_ && packed_pattern.size() <= kSHMaxConstForwardU32;
+      use_const_pattern_rows_ = packed_pattern.size() <= kSHMaxConstForwardU32;
       if (use_const_pattern_rows_) {
         CHECK(cudaMemcpyToSymbol(
           c_sh_forward_u32,
@@ -4999,11 +5061,24 @@ SUS2_SH::SUS2_SH(
       packed_back[term_offset + static_cast<size_t>(term) * 2 + 1] = coeff_bits;
     }
     if (use_packed_back_rows_) {
-      if (use_const_back_rows_ && packed_back.size() <= kSHMaxConstForwardU32) {
+      size_t const_back_offset = 0;
+      if (use_const_pattern_rows_) {
+        const_back_offset =
+          static_cast<size_t>(sh_cg_row_count_) * 2 +
+          static_cast<size_t>(sh_cg_row_pattern_count_) * 2 +
+          static_cast<size_t>(sh_cg_row_pattern_term_count_) * 2;
+      } else if (use_const_forward_rows_) {
+        const_back_offset =
+          static_cast<size_t>(sh_cg_row_count_) * 3 +
+          static_cast<size_t>(sh_cg_row_term_count_) * 2;
+      }
+      if (use_const_back_rows_ &&
+          const_back_offset + packed_back.size() <= kSHMaxConstForwardU32) {
         CHECK(cudaMemcpyToSymbol(
           c_sh_forward_u32,
           packed_back.data(),
-          packed_back.size() * sizeof(unsigned int)));
+          packed_back.size() * sizeof(unsigned int),
+          const_back_offset * sizeof(unsigned int)));
         sh_cg_back_packed_u32_.resize(0);
       } else {
         use_const_back_rows_ = false;
@@ -5171,9 +5246,11 @@ SUS2_SH::SUS2_SH(
   }
   if (use_terminal_dot_groups_) {
     printf(
-      "SUS2-SH terminal dot groups: groups=%d, entries=%d, row_list=%s, nondot_rows=%d.\n",
+      "SUS2-SH terminal dot groups: groups=%d, entries=%d, orientation=%s, cached_components=%d, row_list=%s, nondot_rows=%d.\n",
       sh_terminal_dot_group_count_,
       sh_terminal_dot_group_entry_count_,
+      terminal_dot_groups_swapped ? "right" : "left",
+      terminal_dot_group_cached_components,
       use_terminal_dot_row_list_ ? "on" : "off",
       sh_terminal_dot_nondot_row_count_);
   }

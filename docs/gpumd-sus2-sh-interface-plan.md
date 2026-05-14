@@ -1836,3 +1836,92 @@ groups_forced  1.90443e7           1.708        5.039      57 groups / 240 entri
 The default terminal-dot group threshold was lowered from `2500` to `1000` so
 `l3322` gets this path automatically. This is a small but consistent
 optimization, not the main 10% product redesign.
+
+2026-05-14 rejected static-force shared-gradient cache:
+
+- Tested a generic static-force variant that staged each atom block's
+  `dE/dB[k,l,m]` basic gradients in dynamic shared memory, then read them with
+  a strided layout during the neighbor force loop. The goal was to reduce
+  per-thread register/local-memory pressure for larger `l<=4,k<=6` models.
+- Correctness against the stable binary on the first 4096 Cu-Zr atoms remained
+  at float atomic/reordering scale:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-exp-product-codex/codex_bench/shared_grad_force_correctness_20260514
+
+model   force max abs diff  force RMS diff  thermo max abs diff
+l3333   2.34e-6             4.53e-7         1.67e-9
+l3322   4.23e-6             8.61e-7         9.60e-9
+l4k4    5.50e-6             8.34e-7         4.67e-9
+l4k5    8.87e-6             1.22e-6         1.16e-8
+```
+
+- The 100k, 1000-step A100 A/B was negative for every model:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-exp-product-codex/codex_bench/shared_grad_force_ab100k_1000_20260514
+
+model   force(ms) off->on  force speedup  total speedup  run speed delta
+l3333   1.9060 -> 1.9500  -2.31%         -0.55%         -0.25%
+l3322   1.9046 -> 1.9506  -2.42%         -0.91%         -0.81%
+l4k4    3.4464 -> 3.6510  -5.94%         -2.25%         -2.15%
+l4k5    4.4870 -> 5.0952  -13.55%        -4.84%         -4.52%
+```
+
+Conclusion: shared memory is worse than the current static-force per-thread
+projection. Even when `l4k5` has more basic gradients, repeated shared-memory
+reads inside the neighbor loop dominate any register-pressure relief. Do not
+repeat this path unless the force algorithm is changed more fundamentally.
+
+2026-05-14 terminal-dot orientation and const-back packing:
+
+- Added a host-side terminal-dot packing check that compares caching the left
+  vector versus caching the right vector for each dot-product group. The dot
+  product and its gradients are symmetric in left/right, so this only changes
+  reuse orientation. Current benchmark models all choose the existing left
+  orientation, so this is a safe future-model guard rather than a current speed
+  source:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-exp-product-codex/codex_bench/terminal_dot_orientation_correctness_20260514
+
+model   orientation  cached components
+l3333   left         489
+l3322   left         211
+l4k4    left         389
+l4k5    left         578
+```
+
+- Reworked constant-memory packing so forward pattern rows and packed backward
+  rows can share the existing `16384 u32` constant table when their combined
+  size fits. This keeps forward pattern rows in constant memory while allowing
+  l4k4/l4k5 backward metadata to use constant memory too. `l3333` remains off
+  automatically because `pattern_u32 + back_u32 ~= 17202`, which exceeds the
+  table.
+- Correctness with `sus2_sh_const_back=1` stayed at float-order scale:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-exp-product-codex/codex_bench/const_back_correctness_20260514
+
+model   force max abs diff  force RMS diff  thermo max abs diff  const back
+l3333   1.19e-7             1.33e-8         0                    off
+l3322   2.38e-7             1.65e-8         0                    off
+l4k4    2.38e-7             2.76e-8         0                    on
+l4k5    2.98e-7             2.69e-8         0                    on
+```
+
+- The 100k and 1M A100 A/B tests show a small but consistent l4 benefit:
+
+```text
+100k, 1000 steps:
+l4k4 back 0.7056 -> 0.6844 ms, product 2.9000 -> 2.8758 ms, total +0.30%
+l4k5 back 1.1960 -> 1.1434 ms, product 5.3184 -> 5.2550 ms, total +0.47%
+
+1M, 1000 steps:
+l4k4 back 7.4812 -> 6.8348 ms, product 26.6302 -> 25.9938 ms, total +0.82%
+l4k5 back 12.4272 -> 11.5364 ms, product 49.4736 -> 48.5822 ms, total +0.71%
+```
+
+`sus2_sh_const_back` now defaults on, with automatic fallback when the combined
+constant table would exceed capacity. This is a retained micro-optimization,
+not the larger product-forward redesign still needed for a 10% gain.
