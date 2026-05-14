@@ -572,7 +572,7 @@ kernel was kept.
 ### 2026-05-13 Static SH Basic and Terminal Scalar Fusion
 
 Accepted change: the GPUMD basic-stage kernel now has a guarded static path for
-the SUS2-SH generator's full `(l,k,m)` layout with `l <= 4`, `k <= 4`, and
+the SUS2-SH generator's full `(l,k,m)` layout with `l <= 4`, `k <= 6`, and
 `radial_basis_size = 10`. The guard checks the actual `alpha_index_basic` order
 from the model: active `q=(k,l)` tensors are generated in the training order
 `l` descending, `k` descending, and `m=-l..l`. If the model does not match that
@@ -641,7 +641,7 @@ derivative path, while keeping the current cached-gradient force kernel as the
 correctness reference.
 
 Accepted change: the force kernel now has a static standard-layout path for
-full SUS2-SH `(l,k,m)` models with `l <= 4`, `k <= 4`, and
+full SUS2-SH `(l,k,m)` models with `l <= 4`, `k <= 6`, and
 `radial_basis_size = 10`. It keeps the same chain rule,
 `sum_m g_{klm} (R'_{kl} Y_lm rhat + R_{kl} dY_lm/dr)`, but contracts each
 fixed `(k,l)` group before applying the radial derivative. This removes the
@@ -928,3 +928,38 @@ arrays and avoid recursive terminal expansion. A generated or prepacked
 topology-local contraction plan, with coefficients in constant memory and only
 small per-group reusable component windows in registers, is the most plausible
 route to a larger product reduction.
+
+2026-05-14 `k <= 6` update:
+
+- The GPUMD backend now treats `l <= 4, k <= 6` as the supported static-layout
+  design range. Static basic and static force dispatch include `K=5` and `K=6`.
+  The maximum static force-gradient cache is extended to 256 basic channels,
+  which covers the largest intended `l=4,k=6` layout (`150` basics).
+- The forward-row constant-memory table limit was raised from `16000` to
+  `16384` `uint32` words, matching the 64 KiB CUDA constant-memory boundary.
+  This lets the `l4k5_4422` model use `const forward rows: on`; its packed
+  forward table needs just over the previous artificial limit.
+- Added benchmark models to the regular profile matrix:
+
+```text
+l4k4_4422 = /work/phy-weigw/20260321_Test/SUS2-SH-work-codex/l4k4_4422/p.mtp
+l4k5_4422 = /work/phy-weigw/20260321_Test/SUS2-SH-work-codex/l4k4_4422/k5/p.mtp
+```
+
+Current 1,024,000 atom Cu-Zr 200-step A100 profile matrix, using the average of
+the last three 50-step profile windows:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_k6_const16384_profile200_20260514
+
+model       speed(atom*step/s)  neighbor  memset  basic   product  force   accumulate  total
+l3333       1.06872e7           5.220     2.886   7.787   57.444   18.969  0.148       92.455
+l3322       2.07820e7           5.001     0.973   7.402   14.970   17.648  0.147       46.140
+l4k4_4422   1.15609e7           5.452     1.644   14.979  32.324   31.184  0.147       85.731
+l4k5_4422   7.95493e6           5.166     2.418   16.017  60.597   41.474  0.150       125.821
+```
+
+The constant-table boundary change is useful but small. For `l4k5_4422`, product
+time moved from about `60.78 ms` to about `60.60 ms`. The main optimization
+target remains product-v2: share forward-row CG term patterns across repeated
+`k`/block instances while keeping the current compact path as fallback.
