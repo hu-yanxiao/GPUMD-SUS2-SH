@@ -1099,3 +1099,72 @@ case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_
 
 force max abs diff = 4.613399506e-5
 ```
+
+2026-05-14 terminal-dot row-list update:
+
+- When terminal dot groups are enabled, the old compact row loop still scanned
+  every terminal dot row only to immediately skip it and run the grouped path
+  later. The new path builds a per-layer non-dot row list and makes the compact
+  product loop visit only those rows. Terminal dot groups are still evaluated in
+  the same grouped code as before.
+- The option is controlled by `sus2_sh_terminal_dot_row_list=` or
+  `SUS2_SH_GPUMD_TERMINAL_DOT_ROW_LIST`. The default is on, but it only has an
+  effect when terminal dot groups are on.
+- This is a metadata/control-flow reduction, not a mathematical change. It does
+  not alter CG coefficients, scalar coefficients, terminal dot grouping, or the
+  reverse-mode chain rule.
+
+Correctness check: first 4096 Cu-Zr atoms, `l4k5_4422`, comparing terminal dot
+groups with row-list off/on:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_nondot_rowlist_correctness_20260514
+
+force max abs diff = 1.203268766e-6
+thermo max abs diff = 3.600000159e-11
+```
+
+Sequential same-GPU A/B check on A100 `sm_80`, 1,024,000 Cu-Zr atoms, 200
+steps. Times are averages over the last three 50-step profile windows:
+
+```text
+case_l3333_l4k5 = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_nondot_rowlist_ab_20260514
+case_l4k4       = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_nondot_rowlist_l4k4_20260514
+
+model       row_list  speed(atom*step/s)  nondot_rows  product  total
+l3333       off       1.17492e7           0            52.380   83.917
+l3333       on        1.18210e7           756          51.852   83.416
+l4k4_4422   off       1.19504e7           0            29.260   82.797
+l4k4_4422   on        1.20354e7           408          28.757   82.185
+l4k5_4422   off       8.40697e6           0            53.573   118.897
+l4k5_4422   on        8.46227e6           625          52.658   118.088
+```
+
+Current default behavior after the row-list update:
+
+```text
+model       default path                        expected product effect
+l3333       pattern + dot groups + row-list     about -0.53 ms product
+l3322       const rows                          unchanged; dot groups stay off
+l4k4_4422   pattern + dot groups + row-list     about -0.50 ms product
+l4k5_4422   pattern + dot groups + row-list     about -0.92 ms product
+```
+
+Next memory-friendly product directions:
+
+- Do not transpose `moments[moment * N + atom]` to atom-major globally. The
+  current SoA layout is already coalesced for warp-contiguous atoms in product,
+  basic, and force kernels; a global transpose would likely move cost rather
+  than remove it.
+- The next high-confidence direction is a feature-gated tensor-block forward
+  path for non-terminal CG blocks: pack blocks by layer/topology, keep
+  terminal dot groups as-is, load the small left/right component vectors
+  (`l <= 4`, at most 9 components) into per-thread registers, and write all
+  target components for the block once. Backward should initially remain on the
+  current packed row path to avoid atomics and preserve the validated chain
+  rule.
+- Avoid large shared-memory tiles and atom-major scratch buffers until a small
+  block-forward prototype proves that component-vector reuse beats the extra
+  register/control-flow pressure. Previous right-cache grouping reduced loads
+  on paper but slowed product, so each structural optimization must be guarded
+  by an option and A/B tested before becoming default.
