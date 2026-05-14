@@ -1024,6 +1024,72 @@ case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_
 force max abs diff = 4.613399506e-5
 ```
 
+2026-05-14 terminal-dot-group update:
+
+- A large fraction of product rows are terminal scalar dot products, and many
+  rows share the same left-vector base. The new grouped path packs rows by
+  `(layer, left0, dot_count)`, loads the left vector once, loops over all right
+  entries in that group, and writes the left gradients once per group. This
+  keeps the same scalar value and reverse-mode chain rule as the terminal-dot
+  row path; only the local accumulation order changes.
+- The option is controlled by `sus2_sh_terminal_dot_groups=` or
+  `SUS2_SH_GPUMD_TERMINAL_DOT_GROUPS`. Default heuristic: enable it when
+  `cg_row_terms >= 2500`. The smaller `l3322` graph is deliberately left on
+  the previous path because grouped dots were slower there.
+- Terminal dot grouping statistics:
+
+```text
+model       terminal_dot_rows  dot_terms  groups  entries
+l3333       545                2235       103     545
+l3322       240                738        57      240
+l4k4_4422   560                1790       99      560
+l4k5_4422   1105               3525       148     1105
+```
+
+Sequential same-GPU A/B check on A100 `sm_80`, 1,024,000 Cu-Zr atoms, 200
+steps. Times are averages over the last three 50-step profile windows:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_tdot_group_seq_profile200_20260514
+case_l3322 = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_tdot_group_l3322_seq_20260514
+
+model       mode  speed(atom*step/s)  neighbor  memset  basic   product  force   accumulate  total
+l3333       off   1.11647e7           4.852     2.591   7.101   56.916   16.854  0.147       88.461
+l3333       on    1.17553e7           4.885     2.599   7.115   52.263   16.906  0.146       83.915
+l3322       off   2.14221e7           4.861     0.931   7.112   14.894   16.879  0.147       44.824
+l3322       on    2.10571e7           4.886     0.931   7.109   15.653   16.876  0.147       45.602
+l4k4_4422   off   1.16285e7           5.471     1.644   14.977  31.793   31.175  0.147       85.207
+l4k4_4422   on    1.19949e7           5.464     1.644   14.979  29.111   31.173  0.147       82.518
+l4k5_4422   off   7.99510e6           5.197     2.417   16.031  59.852   41.502  0.149       125.149
+l4k5_4422   on    8.43227e6           5.157     2.417   16.029  53.275   41.494  0.150       118.523
+```
+
+Current default behavior after the grouped-dot heuristic:
+
+```text
+case_default = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_default_tdotgrp_profile200_20260514
+
+model       default path             speed(atom*step/s)  neighbor  memset  basic   product  force   accumulate  total
+l3333       pattern + dot groups     1.17703e7           4.855     2.591   7.095   52.179   16.856  0.147       83.722
+l3322       const rows               2.14010e7           4.881     0.931   7.112   14.864   16.886  0.147       44.821
+l4k4_4422   pattern + dot groups     1.19878e7           5.445     1.644   14.982  29.101   31.182  0.147       82.502
+l4k5_4422   pattern + dot groups     8.42709e6           5.197     2.417   16.034  53.285   41.532  0.150       118.615
+```
+
+Correctness check: first 4096 Cu-Zr atoms, `l4k5_4422`, comparing grouped dots
+off/on with dumped forces:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_tdot_group_correctness_20260514/l4k5
+
+force max abs diff = 1.221001148e-4
+thermo max abs diff = 1.409000000e-3
+```
+
+This is larger than the pattern-row packing repeatability check because grouped
+dots intentionally change the local float accumulation order for terminal dot
+rows. The mathematical contraction and reverse chain are unchanged.
+
 An off-vs-off repeat under the same conditions produced the same maximum force
 difference, so this is the current float GPUMD non-bitwise repeatability scale,
 not a pattern-row math regression:
