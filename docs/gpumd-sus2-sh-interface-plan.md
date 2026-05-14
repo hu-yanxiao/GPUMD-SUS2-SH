@@ -1781,3 +1781,58 @@ forward time by about the same amount, and more for `l4`. The next product
 redesign should not serialize producer backpropagation in the main compact
 loop. It needs either a topology-local schedule that preserves parallelism or a
 forward-side reduction in global moment traffic.
+
+2026-05-14 rejected terminal-dot right-entry merge:
+
+- Tested a host-side terminal-dot entry merge for premultiplied terminal-dot
+  groups. The idea was to combine entries with the same `(left0, right0,
+  dot_count)` by summing their already-premultiplied scalar weights, so the
+  device would compute the same dot product and right-gradient update once.
+- Correctness against the stable binary on the first 4096 Cu-Zr atoms stayed
+  at float accumulation scale:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-exp-product-codex/codex_bench/terminal_dot_rightmerge_correctness_20260514
+
+model   force max abs diff  force RMS diff  thermo max abs diff
+l3333   1.34e-7             1.44e-8         0
+l3322   2.38e-7             1.54e-8         0
+l4k4    2.38e-7             2.73e-8         0
+l4k5    2.38e-7             2.64e-8         0
+```
+
+- The experiment produced no `merged duplicate right entries` log line for
+  the four current benchmark models. Their terminal-dot grouped entry counts
+  stayed identical to the row counts:
+
+```text
+l3333  rows=545   groups=103  entries=545
+l3322  terminal-dot groups off
+l4k4   rows=560   groups=99   entries=560
+l4k5   rows=1105  groups=148  entries=1105
+```
+
+Conclusion: this is mathematically safe, but current `l3/l4` Cu-Zr models do
+not contain duplicate right vectors inside terminal-dot groups. The code was
+reverted because it would add host-side complexity with zero runtime effect.
+
+2026-05-14 terminal-dot group threshold update:
+
+- Re-tested `l3322` with terminal-dot groups forced on for the 100k Cu-Zr
+  case over 1000 steps. The stable default kept groups off because the old
+  threshold was `cg_row_terms >= 2500`, while `l3322` has `1416` row terms.
+- The forced path uses the same terminal-dot grouping, coefficient premultiply,
+  and row-list logic already used by `l3333`, `l4k4`, and `l4k5`; it only
+  changes whether `l3322` enters that path by default.
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-exp-product-codex/codex_bench/l3322_force_tdot_groups_100k_1000_20260514
+
+mode           speed(atom*step/s)  product(ms)  total(ms)  terminal-dot groups
+default        1.86624e7           1.779        5.108      off
+groups_forced  1.90443e7           1.708        5.039      57 groups / 240 entries
+```
+
+The default terminal-dot group threshold was lowered from `2500` to `1000` so
+`l3322` gets this path automatically. This is a small but consistent
+optimization, not the main 10% product redesign.

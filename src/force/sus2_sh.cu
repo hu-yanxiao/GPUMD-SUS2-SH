@@ -35,7 +35,7 @@ constexpr int kSHForceGradCache64 = 64;
 constexpr int kSHForceGradCache128 = 128;
 constexpr int kSHForceGradCache256 = 256;
 constexpr int kSHMaxConstForwardU32 = 16384;
-constexpr int kSHTerminalDotGroupRowTermThreshold = 2500;
+constexpr int kSHTerminalDotGroupRowTermThreshold = 1000;
 constexpr int kSHTerminalDotGroupMaxCount = 17;
 constexpr double kPi = 3.141592653589793238462643383279502884;
 
