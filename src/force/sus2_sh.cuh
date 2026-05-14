@@ -83,10 +83,11 @@ private:
   bool use_merge_back_duplicates_ = true;
   bool use_cached_neighbor_displacements_ = false;
   bool profile_enabled_ = false;
+  bool profile_product_detail_ = false;
   int profile_interval_ = 50;
   int tensor_product_grid_cap_ = 8192;
   int profile_steps_ = 0;
-  double profile_ms_[6];
+  double profile_ms_[8];
 
   GPU_Vector<double> shift_coeffs_;
   GPU_Vector<double> species_coeffs_;

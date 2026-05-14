@@ -1353,3 +1353,67 @@ The gain is intentionally small but consistent for terminal-dot group models:
 about `0.15% - 1.2%` product reduction and up to about `0.8%` full-step speedup
 in this benchmark. `l3322` is essentially unchanged because terminal-dot groups
 remain disabled for that model shape.
+
+2026-05-14 terminal-dot dot-count specialization:
+
+- Product-detail profiling split the product stage into the compact
+  forward/terminal part and the packed backward part. On the 1,024,000-atom
+  Cu-Zr tests, forward/terminal work dominated the larger `l4` models:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_product_detail_1m_profile200_20260514
+
+model   product(ms)  forward(ms)  backward(ms)
+l3333   51.744       30.430       21.311
+l3322   14.849       14.848       0.000
+l4k4    28.708       20.580       8.125
+l4k5    52.409       39.022       13.384
+```
+
+For `l3322`, `parallel_back_rows` is off, so the forward column is the compact
+serial product kernel including its in-kernel backward work.
+
+- The accepted optimization specializes terminal-dot group evaluation by
+  compile-time dot count for the common odd component counts from 1 to 17. This
+  keeps the same group topology and accumulation order, but avoids the dynamic
+  small-dot loop and the always-17-slot local arrays for the terminal dot path.
+- The detailed profiler is off by default and can be enabled with
+  `sus2_sh_profile_product_detail=1` or
+  `SUS2_SH_GPUMD_PROFILE_PRODUCT_DETAIL=1`. Normal runs do not take the extra
+  intra-product synchronizations.
+
+Correctness check: first 4096 Cu-Zr atoms, comparing the premultiply version to
+the dot-count-specialized version:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_dotcount_fixed_correctness_20260514
+
+model   force max abs diff  thermo max abs diff
+l3333   1.34e-7             2.00e-12
+l3322   1.79e-7             1.00e-12
+l4k4    9.54e-7             4.00e-6
+l4k5    6.48e-6             2.00e-6
+```
+
+Formal A100 `sm_80` 1000-step benchmark, averages over the last five 100-step
+profile windows, compared with the terminal-dot premultiply version:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_dotcount_fixed_100k_1m_profile1000_20260514
+
+model       atoms      speed(atom*step/s)  speedup  product(ms)  product speedup  total(ms)
+l3333       102400     1.05087e7           1.018x   5.8362       1.034x           9.3868
+l3322       102400     1.87987e7           1.019x   1.7766       1.058x           5.1126
+l4k4_4422   102400     1.12769e7           1.024x   2.9832       1.072x           8.7306
+l4k5_4422   102400     7.98169e6           1.028x   5.4498       1.064x           12.4808
+l3333       1024000    1.19500e7           1.002x   51.6038      1.002x           82.7250
+l3322       1024000    2.16426e7           1.007x   14.8496      1.021x           44.3652
+l4k4_4422   1024000    1.23353e7           1.015x   27.4864      1.045x           79.9716
+l4k5_4422   1024000    8.65717e6           1.015x   50.6760      1.034x           115.2592
+```
+
+This optimization is kept because it improves the forward-dominated `l4`
+models without changing the graph definition. The `l3322` improvement is not
+attributed to terminal-dot specialization because terminal-dot groups are
+disabled for that shape; treat it as normal run-to-run or recompilation
+variation unless repeated A/B evidence shows otherwise.

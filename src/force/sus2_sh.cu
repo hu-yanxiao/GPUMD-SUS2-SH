@@ -48,7 +48,9 @@ enum SHProfileStage {
   sh_profile_product = 3,
   sh_profile_force = 4,
   sh_profile_accumulate = 5,
-  sh_profile_count = 6
+  sh_profile_product_forward = 6,
+  sh_profile_product_back = 7,
+  sh_profile_count = 8
 };
 
 struct SHProductHost {
@@ -860,6 +862,25 @@ bool parse_sh_profile_enabled(const SHHostModel& model, int nopts, const char** 
   for (int i = begin; i < nopts; ++i) {
     const std::string option = opts[i] == nullptr ? "" : opts[i];
     if (starts_with(option, "sus2_sh_profile=") || starts_with(option, "sus2_profile=")) {
+      const size_t eq = option.find('=');
+      enabled = parse_bool_value(option.substr(eq + 1), option.substr(0, eq));
+    }
+  }
+  return enabled;
+}
+
+bool parse_sh_profile_product_detail(const SHHostModel& model, int nopts, const char** opts)
+{
+  bool enabled = false;
+  const char* env = std::getenv("SUS2_SH_GPUMD_PROFILE_PRODUCT_DETAIL");
+  if (env != nullptr) {
+    enabled = parse_bool_value(env, "SUS2_SH_GPUMD_PROFILE_PRODUCT_DETAIL");
+  }
+  const int begin = std::min(nopts, model.species_count);
+  for (int i = begin; i < nopts; ++i) {
+    const std::string option = opts[i] == nullptr ? "" : opts[i];
+    if (starts_with(option, "sus2_sh_profile_product_detail=") ||
+        starts_with(option, "sus2_profile_product_detail=")) {
       const size_t eq = option.find('=');
       enabled = parse_bool_value(option.substr(eq + 1), option.substr(0, eq));
     }
@@ -2989,6 +3010,67 @@ static __global__ void gpu_sh_zero_selected_grads(
   }
 }
 
+template <typename RealT, typename GradT, int BasicCache, int DotCount>
+__device__ __forceinline__ void sh_process_terminal_dot_group_fixed(
+  int N,
+  int atom,
+  const SHDeviceModel& model,
+  const RealT* moments,
+  GradT* grads,
+  const RealT* basic_cache,
+  RealT center_coeff,
+  int left0,
+  int entry_begin,
+  int entry_count,
+  RealT& site_energy)
+{
+  RealT left_values[DotCount];
+  RealT left_grads[DotCount];
+#pragma unroll
+  for (int c = 0; c < DotCount; ++c) {
+    const int left = left0 + c;
+    left_values[c] =
+      (BasicCache > 0 && model.use_product_basic_cache && left < model.alpha_basic_count)
+      ? basic_cache[left]
+      : moments[static_cast<size_t>(left) * N + atom];
+    left_grads[c] = static_cast<RealT>(0.0);
+  }
+  const size_t entry_offset =
+    static_cast<size_t>(model.sh_terminal_dot_group_count) * 3;
+  for (int e = 0; e < entry_count; ++e) {
+    const size_t entry_base =
+      entry_offset + static_cast<size_t>(entry_begin + e) * 2;
+    const unsigned int entry0 = model.sh_terminal_dot_group_u32[entry_base + 0];
+    const int right0 = static_cast<int>(entry0 & 0xffffu);
+    const RealT coeff =
+      sh_const_forward_coeff<RealT>(model.sh_terminal_dot_group_u32[entry_base + 1]);
+    RealT weighted = coeff * center_coeff;
+    if (!model.use_terminal_dot_premul) {
+      const int scalar_index = static_cast<int>(entry0 >> 16);
+      weighted *= sh_moment_coeff<RealT>(model, scalar_index);
+    }
+    RealT dot = static_cast<RealT>(0.0);
+#pragma unroll
+    for (int c = 0; c < DotCount; ++c) {
+      const int right = right0 + c;
+      const RealT right_value =
+        (BasicCache > 0 && model.use_product_basic_cache && right < model.alpha_basic_count)
+        ? basic_cache[right]
+        : moments[static_cast<size_t>(right) * N + atom];
+      dot += left_values[c] * right_value;
+      left_grads[c] += weighted * right_value;
+      grads[static_cast<size_t>(right) * N + atom] +=
+        static_cast<GradT>(weighted * left_values[c]);
+    }
+    site_energy += weighted * dot;
+  }
+#pragma unroll
+  for (int c = 0; c < DotCount; ++c) {
+    grads[static_cast<size_t>(left0 + c) * N + atom] +=
+      static_cast<GradT>(left_grads[c]);
+  }
+}
+
 template <
   typename RealT,
   typename GradT,
@@ -3192,49 +3274,99 @@ static __global__ void gpu_sh_forward_energy_backward_compact_rows(
           static_cast<int>(model.sh_terminal_dot_group_u32[group_base + 1]);
         const int entry_count =
           static_cast<int>(model.sh_terminal_dot_group_u32[group_base + 2]);
-        RealT left_values[kSHTerminalDotGroupMaxCount];
-        RealT left_grads[kSHTerminalDotGroupMaxCount];
-        for (int c = 0; c < dot_count; ++c) {
-          const int left = left0 + c;
-          left_values[c] =
-            (BasicCache > 0 && model.use_product_basic_cache &&
-             left < model.alpha_basic_count)
-            ? basic_cache[left]
-            : moments[static_cast<size_t>(left) * N + atom];
-          left_grads[c] = static_cast<RealT>(0.0);
-        }
-        const size_t entry_offset =
-          static_cast<size_t>(model.sh_terminal_dot_group_count) * 3;
-        for (int e = 0; e < entry_count; ++e) {
-          const size_t entry_base =
-            entry_offset + static_cast<size_t>(entry_begin + e) * 2;
-          const unsigned int entry0 = model.sh_terminal_dot_group_u32[entry_base + 0];
-          const int right0 = static_cast<int>(entry0 & 0xffffu);
-          const RealT coeff =
-            sh_const_forward_coeff<RealT>(model.sh_terminal_dot_group_u32[entry_base + 1]);
-          RealT weighted = coeff * center_coeff;
-          if (!model.use_terminal_dot_premul) {
-            const int scalar_index = static_cast<int>(entry0 >> 16);
-            weighted *= sh_moment_coeff<RealT>(model, scalar_index);
-          }
-          RealT dot = static_cast<RealT>(0.0);
+        switch (dot_count) {
+        case 1:
+          sh_process_terminal_dot_group_fixed<RealT, GradT, BasicCache, 1>(
+            N, atom, model, moments, grads, basic_cache, center_coeff, left0,
+            entry_begin, entry_count, site_energy);
+          break;
+        case 3:
+          sh_process_terminal_dot_group_fixed<RealT, GradT, BasicCache, 3>(
+            N, atom, model, moments, grads, basic_cache, center_coeff, left0,
+            entry_begin, entry_count, site_energy);
+          break;
+        case 5:
+          sh_process_terminal_dot_group_fixed<RealT, GradT, BasicCache, 5>(
+            N, atom, model, moments, grads, basic_cache, center_coeff, left0,
+            entry_begin, entry_count, site_energy);
+          break;
+        case 7:
+          sh_process_terminal_dot_group_fixed<RealT, GradT, BasicCache, 7>(
+            N, atom, model, moments, grads, basic_cache, center_coeff, left0,
+            entry_begin, entry_count, site_energy);
+          break;
+        case 9:
+          sh_process_terminal_dot_group_fixed<RealT, GradT, BasicCache, 9>(
+            N, atom, model, moments, grads, basic_cache, center_coeff, left0,
+            entry_begin, entry_count, site_energy);
+          break;
+        case 11:
+          sh_process_terminal_dot_group_fixed<RealT, GradT, BasicCache, 11>(
+            N, atom, model, moments, grads, basic_cache, center_coeff, left0,
+            entry_begin, entry_count, site_energy);
+          break;
+        case 13:
+          sh_process_terminal_dot_group_fixed<RealT, GradT, BasicCache, 13>(
+            N, atom, model, moments, grads, basic_cache, center_coeff, left0,
+            entry_begin, entry_count, site_energy);
+          break;
+        case 15:
+          sh_process_terminal_dot_group_fixed<RealT, GradT, BasicCache, 15>(
+            N, atom, model, moments, grads, basic_cache, center_coeff, left0,
+            entry_begin, entry_count, site_energy);
+          break;
+        case 17:
+          sh_process_terminal_dot_group_fixed<RealT, GradT, BasicCache, 17>(
+            N, atom, model, moments, grads, basic_cache, center_coeff, left0,
+            entry_begin, entry_count, site_energy);
+          break;
+        default: {
+          RealT left_values[kSHTerminalDotGroupMaxCount];
+          RealT left_grads[kSHTerminalDotGroupMaxCount];
           for (int c = 0; c < dot_count; ++c) {
-            const int right = right0 + c;
-            const RealT right_value =
+            const int left = left0 + c;
+            left_values[c] =
               (BasicCache > 0 && model.use_product_basic_cache &&
-               right < model.alpha_basic_count)
-              ? basic_cache[right]
-              : moments[static_cast<size_t>(right) * N + atom];
-            dot += left_values[c] * right_value;
-            left_grads[c] += weighted * right_value;
-            grads[static_cast<size_t>(right) * N + atom] +=
-              static_cast<GradT>(weighted * left_values[c]);
+               left < model.alpha_basic_count)
+              ? basic_cache[left]
+              : moments[static_cast<size_t>(left) * N + atom];
+            left_grads[c] = static_cast<RealT>(0.0);
           }
-          site_energy += weighted * dot;
+          const size_t entry_offset =
+            static_cast<size_t>(model.sh_terminal_dot_group_count) * 3;
+          for (int e = 0; e < entry_count; ++e) {
+            const size_t entry_base =
+              entry_offset + static_cast<size_t>(entry_begin + e) * 2;
+            const unsigned int entry0 = model.sh_terminal_dot_group_u32[entry_base + 0];
+            const int right0 = static_cast<int>(entry0 & 0xffffu);
+            const RealT coeff =
+              sh_const_forward_coeff<RealT>(model.sh_terminal_dot_group_u32[entry_base + 1]);
+            RealT weighted = coeff * center_coeff;
+            if (!model.use_terminal_dot_premul) {
+              const int scalar_index = static_cast<int>(entry0 >> 16);
+              weighted *= sh_moment_coeff<RealT>(model, scalar_index);
+            }
+            RealT dot = static_cast<RealT>(0.0);
+            for (int c = 0; c < dot_count; ++c) {
+              const int right = right0 + c;
+              const RealT right_value =
+                (BasicCache > 0 && model.use_product_basic_cache &&
+                 right < model.alpha_basic_count)
+                ? basic_cache[right]
+                : moments[static_cast<size_t>(right) * N + atom];
+              dot += left_values[c] * right_value;
+              left_grads[c] += weighted * right_value;
+              grads[static_cast<size_t>(right) * N + atom] +=
+                static_cast<GradT>(weighted * left_values[c]);
+            }
+            site_energy += weighted * dot;
+          }
+          for (int c = 0; c < dot_count; ++c) {
+            grads[static_cast<size_t>(left0 + c) * N + atom] +=
+              static_cast<GradT>(left_grads[c]);
+          }
+          break;
         }
-        for (int c = 0; c < dot_count; ++c) {
-          grads[static_cast<size_t>(left0 + c) * N + atom] +=
-            static_cast<GradT>(left_grads[c]);
         }
       }
     }
@@ -4118,6 +4250,8 @@ SUS2_SH::SUS2_SH(
   tensor_product_grid_cap_ =
     parse_sh_tensor_product_grid_cap(host_model, num_potential_options, potential_options);
   profile_enabled_ = parse_sh_profile_enabled(host_model, num_potential_options, potential_options);
+  profile_product_detail_ =
+    parse_sh_profile_product_detail(host_model, num_potential_options, potential_options);
   profile_interval_ =
     parse_sh_profile_interval(host_model, num_potential_options, potential_options);
   if (!use_radial_direct_) {
@@ -5345,6 +5479,8 @@ void SUS2_SH::compute(
     GPU_CHECK_KERNEL
     profile_stop(sh_profile_basic, stage_start);
     stage_start = profile_start();
+    const bool product_detail = profile_enabled_ && profile_product_detail_;
+    const Clock::time_point product_forward_start = stage_start;
     if (use_tensor_product_parallel_) {
       for (int layer = 1; layer <= sh_cg_layer_count_; ++layer) {
         gpu_sh_tensor_product_rows_forward<float><<<tensor_grid_size, kBlockSize>>>(
@@ -5355,10 +5491,18 @@ void SUS2_SH::compute(
         num_atoms, model, type.data(), moment_vals_float_.data(), moment_grads_float_.data(),
         potential.data());
       GPU_CHECK_KERNEL
+      Clock::time_point product_back_start = product_forward_start;
+      if (product_detail) {
+        profile_stop(sh_profile_product_forward, product_forward_start);
+        product_back_start = profile_start();
+      }
       for (int layer = sh_cg_layer_count_; layer >= 1; --layer) {
         gpu_sh_tensor_product_back_rows<float, float><<<tensor_grid_size, kBlockSize>>>(
           num_atoms, layer, model, moment_vals_float_.data(), moment_grads_float_.data());
         GPU_CHECK_KERNEL
+      }
+      if (product_detail) {
+        profile_stop(sh_profile_product_back, product_back_start);
       }
     } else if (use_compact_serial_product_) {
       if (use_product_basic_cache_) {
@@ -5415,11 +5559,18 @@ void SUS2_SH::compute(
         }
       }
       GPU_CHECK_KERNEL
+      if (product_detail) {
+        profile_stop(sh_profile_product_forward, product_forward_start);
+      }
       if (use_parallel_back_rows_) {
+        const Clock::time_point product_back_start = product_detail ? profile_start() : stage_start;
         for (int layer = sh_cg_layer_count_; layer >= 1; --layer) {
           gpu_sh_tensor_product_back_rows<float, float><<<tensor_grid_size, kBlockSize>>>(
             num_atoms, layer, model, moment_vals_float_.data(), moment_grads_float_.data());
           GPU_CHECK_KERNEL
+        }
+        if (product_detail) {
+          profile_stop(sh_profile_product_back, product_back_start);
         }
       }
     } else if (use_cg_block_forward_) {
@@ -5427,11 +5578,17 @@ void SUS2_SH::compute(
         <<<product_grid_size, kProductBlockSize>>>(
         num_atoms, model, type.data(), moment_vals_float_.data(), moment_grads_float_.data(),
         potential.data());
+      if (product_detail) {
+        profile_stop(sh_profile_product_forward, product_forward_start);
+      }
     } else {
       gpu_sh_forward_energy_backward<float, float>
         <<<product_grid_size, kProductBlockSize>>>(
         num_atoms, model, type.data(), moment_vals_float_.data(), moment_grads_float_.data(),
         potential.data());
+      if (product_detail) {
+        profile_stop(sh_profile_product_forward, product_forward_start);
+      }
     }
     GPU_CHECK_KERNEL
     profile_stop(sh_profile_product, stage_start);
@@ -5520,6 +5677,8 @@ void SUS2_SH::compute(
     GPU_CHECK_KERNEL
     profile_stop(sh_profile_basic, stage_start);
     stage_start = profile_start();
+    const bool product_detail = profile_enabled_ && profile_product_detail_;
+    const Clock::time_point product_forward_start = stage_start;
     if (use_tensor_product_parallel_) {
       for (int layer = 1; layer <= sh_cg_layer_count_; ++layer) {
         gpu_sh_tensor_product_rows_forward<double><<<tensor_grid_size, kBlockSize>>>(
@@ -5530,10 +5689,18 @@ void SUS2_SH::compute(
         num_atoms, model, type.data(), moment_vals_.data(), moment_grads_.data(),
         potential.data());
       GPU_CHECK_KERNEL
+      Clock::time_point product_back_start = product_forward_start;
+      if (product_detail) {
+        profile_stop(sh_profile_product_forward, product_forward_start);
+        product_back_start = profile_start();
+      }
       for (int layer = sh_cg_layer_count_; layer >= 1; --layer) {
         gpu_sh_tensor_product_back_rows<double, double><<<tensor_grid_size, kBlockSize>>>(
           num_atoms, layer, model, moment_vals_.data(), moment_grads_.data());
         GPU_CHECK_KERNEL
+      }
+      if (product_detail) {
+        profile_stop(sh_profile_product_back, product_back_start);
       }
     } else if (use_compact_serial_product_) {
       launch_sh_forward_energy_backward_compact_rows<double, double, 0, 0, 0>(
@@ -5541,11 +5708,18 @@ void SUS2_SH::compute(
         num_atoms, model, type.data(), moment_vals_.data(), moment_grads_.data(),
         potential.data(), !use_parallel_back_rows_);
       GPU_CHECK_KERNEL
+      if (product_detail) {
+        profile_stop(sh_profile_product_forward, product_forward_start);
+      }
       if (use_parallel_back_rows_) {
+        const Clock::time_point product_back_start = product_detail ? profile_start() : stage_start;
         for (int layer = sh_cg_layer_count_; layer >= 1; --layer) {
           gpu_sh_tensor_product_back_rows<double, double><<<tensor_grid_size, kBlockSize>>>(
             num_atoms, layer, model, moment_vals_.data(), moment_grads_.data());
           GPU_CHECK_KERNEL
+        }
+        if (product_detail) {
+          profile_stop(sh_profile_product_back, product_back_start);
         }
       }
     } else if (use_cg_block_forward_) {
@@ -5553,11 +5727,17 @@ void SUS2_SH::compute(
         <<<product_grid_size, kProductBlockSize>>>(
         num_atoms, model, type.data(), moment_vals_.data(), moment_grads_.data(),
         potential.data());
+      if (product_detail) {
+        profile_stop(sh_profile_product_forward, product_forward_start);
+      }
     } else {
       gpu_sh_forward_energy_backward<double, double>
         <<<product_grid_size, kProductBlockSize>>>(
         num_atoms, model, type.data(), moment_vals_.data(), moment_grads_.data(),
         potential.data());
+      if (product_detail) {
+        profile_stop(sh_profile_product_forward, product_forward_start);
+      }
     }
     GPU_CHECK_KERNEL
     profile_stop(sh_profile_product, stage_start);
@@ -5642,6 +5822,15 @@ void SUS2_SH::compute(
         force_ms,
         accumulate_ms,
         total_ms);
+      if (profile_product_detail_) {
+        const double product_forward_ms = profile_ms_[sh_profile_product_forward] * inv;
+        const double product_back_ms = profile_ms_[sh_profile_product_back] * inv;
+        printf(
+          "SUS2-SH product detail avg over %d steps: forward=%.3f ms, backward=%.3f ms.\n",
+          profile_steps_,
+          product_forward_ms,
+          product_back_ms);
+      }
       profile_steps_ = 0;
       for (int i = 0; i < sh_profile_count; ++i) {
         profile_ms_[i] = 0.0;
