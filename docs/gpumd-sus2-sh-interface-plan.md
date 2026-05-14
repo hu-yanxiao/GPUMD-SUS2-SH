@@ -246,7 +246,8 @@ but correctness and comparable performance should come first.
 2. Single-structure parity against `SUS2-SH` CPU `calc-efs` for energy and force.
 3. Virial/stress parity using GPUMD `time_step 0`, `run 1`, and `dump_thermo`.
 4. Small Cu-Zr dynamic smoke.
-5. Million-atom Cu-Zr benchmark using the existing 1,024,000 atom `model.xyz`.
+5. Cu-Zr performance benchmark at two sizes: about 100,000 atoms and the
+   existing 1,024,000 atom `model.xyz`.
 
 The multi-image neighbor displacement fix from the old GPUMD-SUS2 project must
 be preserved. GPUMD-SUS2-SH must store and use the actual periodic image
@@ -254,7 +255,11 @@ displacement per neighbor edge, not only the neighbor atom id.
 
 ## Benchmark Baseline
 
-Initial large-system comparison should reuse the old run style:
+Initial large-system comparison should reuse the old run style, but formal
+optimization A/B tests after 2026-05-14 should run 1000 steps and report both
+the 100k-atom and 1,024,000-atom cases. Short 1-step or 200-step runs are still
+useful for correctness checks and quick smoke tests, but they should not be the
+final performance standard.
 
 ```text
 potential p.mtp Cu Zr sus2_float=1 sus2_radial_direct=1
@@ -262,13 +267,14 @@ velocity 200 seed 9174
 ensemble npt_mttk temp 200 200 aniso 0.0001 0.0001 tperiod 50 pperiod 500
 time_step 1
 dump_thermo 50
-run 200
+run 1000
 ```
 
 The benchmark directory should be under the new server project, for example:
 
 ```text
-/work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-work-codex/codex_bench/cuzr_sh_l3k3_1m_profile200_YYYYMMDD
+/work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-work-codex/codex_bench/cuzr_sh_l3k3_100k_profile1000_YYYYMMDD
+/work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-work-codex/codex_bench/cuzr_sh_l3k3_1m_profile1000_YYYYMMDD
 ```
 
 Do not mix new SH benchmark outputs into the old `GPUMD-SUS2-v1.1-work-codex`
@@ -1244,3 +1250,48 @@ substantial product improvement should not be another one-thread-per-atom
 block loop. The next candidate should exploit `k`-independent topology across
 many radial-channel instances with a generated/persistent contraction schedule,
 or reduce global `moment_vals`/`moment_grads` live ranges directly.
+
+2026-05-14 layer-1 product-v2 grouping experiment:
+
+- Tested a guarded forward-only path that groups ordinary layer-1 rows by
+  `pattern_id`. Each group reuses one relative CG pattern and loops over
+  `(left_base, right_base, target)` entries. Terminal dot rows and scalar rows
+  were left on the existing compact/dot-group paths, and backward propagation
+  stayed unchanged.
+- The path was mathematically correct on the 4096-atom Cu-Zr check, including
+  the requested `l3_3322` model:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_product_v2_correctness_20260514
+
+model   force max abs diff  thermo max abs diff  v2 groups/entries/fallback rows
+l3333   1.49e-7             1.00e-12             162 / 756 / 0
+l3322   2.38e-7             2.00e-13              46 / 237 / 240
+l4k4    1.43e-6             9.00e-6               46 / 408 / 0
+l4k5    2.38e-7             1.00e-12              46 / 625 / 0
+```
+
+- The million-atom A100 `sm_80` 200-step A/B test was slower for all four
+  models, so the code was reverted and no product-v2 option remains in the
+  stable source:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_product_v2_profile200_20260514
+
+model   mode  speed(atom*step/s)  neighbor  memset  basic   product  force   accumulate  total
+l3333   off   1.18274e7           4.560     2.590   7.102   51.831   16.873  0.147       83.103
+l3333   on    1.10060e7           4.593     2.590   7.101   58.182   16.873  0.146       89.486
+l3322   off   2.12725e7           3.738     0.931   7.117   15.207   16.897  0.147       44.037
+l3322   on    2.08682e7           3.736     0.931   7.116   16.093   16.895  0.147       44.918
+l4k4    off   1.20410e7           4.602     1.644   14.985  28.737   31.198  0.146       81.311
+l4k4    on    1.17920e7           4.611     1.644   14.985  30.507   31.191  0.147       83.084
+l4k5    off   8.48339e6           4.587     2.417   16.051  52.556   41.564  0.150       117.325
+l4k5    on    8.31378e6           4.606     2.417   16.087  54.940   41.572  0.149       119.772
+```
+
+Conclusion: splitting layer-1 rows into a separate grouped forward kernel helps
+only on tiny single-step checks. On the million-atom target it adds another
+global read/write pass over intermediate moments and another kernel launch,
+which outweighs row-pattern reuse. Future product work should not split a
+forward layer out of the compact product path unless it also removes a larger
+global-memory pass or fuses more of the scalar/backward contraction.
