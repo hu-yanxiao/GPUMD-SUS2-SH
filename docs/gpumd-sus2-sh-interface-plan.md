@@ -1538,3 +1538,49 @@ forward recomputation and dynamic inline checks. It is not a 10% path and was
 reverted. Future substantial product work should avoid recomputing row values
 inside terminal groups and instead reduce row interpretation/global memory
 traffic through a topology-local contraction schedule.
+
+2026-05-14 rejected block-output forward inside compact product:
+
+- Tested a guarded in-kernel block-output forward path. For eligible ordinary
+  non-terminal CG blocks, it accumulates all target components into a local
+  output vector and writes them once, then skips the corresponding row loop.
+  It does not cache left/right vectors and does not split out a new kernel;
+  backward remains the current source-row adjoint path.
+- Eligibility was restricted to blocks whose component rows exactly match the
+  standard CG block after converting block-relative components to absolute
+  moment ids. Terminal scalar rows, terminal dot rows, and scalar-fused rows are
+  excluded. This keeps the same forward values and the same reverse-mode chain
+  rule.
+- Correctness on first 4096 Cu-Zr atoms was within float accumulation scale:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_block_output_forward_correctness_20260514
+
+model   eligible blocks  force max abs diff  force RMS diff  thermo max abs diff
+l3333   126              1.19e-7             1.40e-8         0
+l3322   54               2.38e-7             1.71e-8         0
+l4k4    96               2.38e-7             2.78e-8         0
+l4k5    150              2.38e-7             2.66e-8         0
+```
+
+- The 100k A100 `sm_80` 200-step A/B test showed only sub-1% total movement,
+  far below the requested 10% bar:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_block_output_forward_100k_profile200_20260514
+
+model   mode  speed(atom*step/s)  total(ms)  product(ms)  forward(ms)  backward(ms)
+l3333   off   1.08173e7           9.4663     5.9237       3.8190       2.1017
+l3333   on    1.09064e7           9.3890     5.8447       3.7397       2.1023
+l3322   off   2.13764e7           4.7903     1.4613       1.0333       0.4250
+l3322   on    2.14810e7           4.7670     1.4373       1.0090       0.4260
+l4k4    off   1.15999e7           8.8277     3.0537       2.2590       0.7920
+l4k4    on    1.16456e7           8.7930     3.0193       2.2247       0.7920
+l4k5    off   8.11625e6           12.6167    5.5497       4.2327       1.3140
+l4k5    on    8.10704e6           12.6310    5.5640       4.2460       1.3150
+```
+
+Conclusion: the idea is mathematically clean and avoids the previous extra
+kernel/global-pass mistake, but it still does not remove enough global moment
+traffic. It only trims row interpretation and a few target writes. This is not
+a substantial optimization path and was reverted.
