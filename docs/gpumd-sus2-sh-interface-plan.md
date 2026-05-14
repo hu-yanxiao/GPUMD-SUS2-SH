@@ -1194,8 +1194,10 @@ Next memory-friendly product directions:
 - The next high-confidence direction is a feature-gated tensor-block forward
   path for non-terminal CG blocks: pack blocks by layer/topology, keep
   terminal dot groups as-is, load the small left/right component vectors
-  (`l <= 4`, at most 9 components) into per-thread registers, and write all
-  target components for the block once. Backward should initially remain on the
+  into per-thread registers, and write all target components for the block
+  once. Important correction from testing: although basic `l <= 4`, intermediate
+  CG ranks can be larger, so block-local storage must allow up to the current
+  17-component terminal-dot bound. Backward should initially remain on the
   current packed row path to avoid atomics and preserve the validated chain
   rule.
 - Avoid large shared-memory tiles and atom-major scratch buffers until a small
@@ -1203,3 +1205,42 @@ Next memory-friendly product directions:
   register/control-flow pressure. Previous right-cache grouping reduced loads
   on paper but slowed product, so each structural optimization must be guarded
   by an option and A/B tested before becoming default.
+
+2026-05-14 block-cached forward experiment:
+
+- Tested a guarded `L > 0` CG-block forward path that loaded left/right
+  component vectors into per-thread local arrays, computed the whole target
+  tensor, and skipped the corresponding compact rows while keeping terminal dot
+  groups and packed parallel backward unchanged.
+- The first prototype incorrectly assumed the basic `l <= 4` component limit
+  for intermediates; this was fixed to the 17-component bound before timing.
+  After the fix, 4096-atom correctness differences were float accumulation-order
+  scale, but not bitwise identical:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_blockcached_correctness_20260514
+
+l3333 force max = 5.66e-7, thermo max = 1.10e-5
+l4k5  force max = 1.12e-5, thermo max = 1.61e-4
+```
+
+- The million-atom A100 `sm_80` 200-step A/B test showed a clear slowdown, so
+  the code was reverted and no block-cached-forward option remains in the
+  stable source:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_blockcached_ab_profile200_20260514
+
+model   mode  speed(atom*step/s)  product(ms)  total(ms)
+l3333   off   1.18254e7           51.848       83.388
+l3333   on    1.08657e7           59.501       91.063
+l4k5    off   8.47886e6           52.515       117.822
+l4k5    on    8.17952e6           56.966       122.253
+```
+
+Conclusion: per-thread block-vector caching increases register/local-memory and
+control-flow pressure more than it saves row metadata and moment reads. A
+substantial product improvement should not be another one-thread-per-atom
+block loop. The next candidate should exploit `k`-independent topology across
+many radial-channel instances with a generated/persistent contraction schedule,
+or reduce global `moment_vals`/`moment_grads` live ranges directly.
