@@ -1948,3 +1948,45 @@ l4k5    -29.18%          -22.81%           -9.73%
 Conclusion: adding the single-entry branch and extra device helper changes the
 compiled terminal-dot kernel enough to hurt register/control-flow behavior.
 Do not repeat this specialization in the current compact product kernel.
+
+2026-05-15 rejected terminal-dot scalar fusion:
+
+- Tested a larger fusion path that tries to combine terminal-dot producer
+  construction and terminal scalar contraction. Correctness stayed at
+  float-accumulation scale, but runtime was strongly negative on the 4096-atom
+  four-model smoke test:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-exp-fusion-codex/codex_bench/combined_correctness_20260515
+
+model   mode    force max abs diff  force RMS diff  thermo max abs diff  result
+l3333   fusion  4.14e-6             7.51e-7         1.92e-3              slower
+l3322   fusion  2.38e-7             1.76e-8         0                    neutral path only
+l4k4    fusion  9.54e-6             1.53e-6         2.02e-3              slower
+l4k5    fusion  9.29e-5             1.10e-5         6.13e-3              slower
+```
+
+The fused implementation increases the amount of per-thread work and metadata
+traffic enough that it loses to the current compact product kernel. Do not
+promote this path into the formal line.
+
+2026-05-15 rejected product basic cache default:
+
+- Tested the existing `sus2_sh_product_basic_cache` switch, which copies basic
+  moments into a local product-stage cache when `alpha_basic_count` fits. This
+  is mathematically safe, but the 100k, 1000-step A100 A/B showed that it hurts
+  the smaller l3 models and gives only noise-level change for l4:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/product_basic_cache_ab_20260515
+
+model   product(ms)       total(ms)         speed change
+l3333   5.6474 -> 6.7670  9.1906 -> 10.3070  -10.27%
+l3322   1.8370 -> 2.4256  5.1664 -> 5.7564   -9.66%
+l4k4    2.8822 -> 2.8810  8.6284 -> 8.6284   +0.11%
+l4k5    5.2848 -> 5.2854 12.3224 -> 12.3136  +0.04%
+```
+
+Correctness was at float-order scale (`force_max <= 2.98e-7`,
+`thermo_max = 0`). Keep this option default-off; it is not a general SH
+product optimization.
