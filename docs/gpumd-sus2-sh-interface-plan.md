@@ -2100,3 +2100,31 @@ main pair/product/force execution model: GPUMD's SH implementation keeps the
 model-specific compact product and force pipeline in a tighter CUDA path,
 whereas the LAMMPS Kokkos pair style still pays a much heavier per-pair/product
 cost despite tabled radial functions.
+
+2026-05-16 10k LAMMPS GPU `_lmp` table path versus GPUMD:
+
+- Added a 10k-size point using the existing Cu-Zr LAMMPS smoke structure
+  (`10240` atoms). The LAMMPS data file was converted to GPUMD xyz so both
+  codes used the same coordinates and box.
+- Benchmark directory:
+
+```text
+/work/phy-weigw/20260321_Test/lammps-sus2-sh-work-codex/tests/cuzr_lammps_gpu_vs_gpumd_10k_20260516
+```
+
+- Same model set, one A100, 1000 NPT steps, GPUMD direct radial path and
+  LAMMPS `_lmp` radial-table path:
+
+```text
+size   model   GPUMD Matom/s  LAMMPS Matom/s  GPUMD/LAMMPS  LAMMPS Pair %
+10k    l3333   3.742          1.000           3.74x         96.95
+10k    l3322   6.382          1.530           4.17x         95.33
+10k    l4k4    4.528          0.746           6.07x         97.71
+10k    l4k5    3.333          0.481           6.93x         98.51
+```
+
+The 10k system still favors GPUMD, but the ratio is smaller than the 100k and
+1M cases because fixed GPU launch/framework overheads are more visible at this
+size. LAMMPS `Pair` still dominates the loop, so the conclusion is unchanged:
+the main remaining LAMMPS-SH gap is inside the pair/product/force kernel path,
+not radial table lookup, neighbor build, or MPI communication.
