@@ -2046,3 +2046,57 @@ that losing in-kernel locality costs more than the control-flow simplification.
 Future terminal-dot work should keep the operation inside the compact product
 kernel or reduce global moment traffic before splitting execution across
 kernels.
+
+2026-05-16 LAMMPS GPU `_lmp` table path versus GPUMD:
+
+- Ran the SH-specific LAMMPS Kokkos GPU interface with `_lmp` radial tables and
+  compared against the current formal GPUMD-SUS2-SH 1000-step A100 benchmark.
+- LAMMPS binary:
+
+```text
+/work/phy-weigw/20260321_Test/lammps-sus2-sh-work-codex/bin/lmp.sus2_sh_kk_sm80
+```
+
+- GPUMD reference binary:
+
+```text
+/work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/src/gpumd
+```
+
+- LAMMPS benchmark directory:
+
+```text
+/work/phy-weigw/20260321_Test/lammps-sus2-sh-work-codex/tests/cuzr_lammps_gpu_vs_gpumd_100k_1m_20260516
+```
+
+- GPUMD reference directory:
+
+```text
+/work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_dotcount_fixed_100k_1m_profile1000_20260514
+```
+
+- LAMMPS setup: one A100, one MPI rank, `-k on g 1 -sf kk -pk kokkos neigh
+  half newton on comm device`, pair style `sus2mtp/kk p_lmp.mtp chunksize
+  129600`, `RBChebyshev_sss_lmp`, table step `1.0e-4 A`, 1000 NPT steps.
+  The logs confirm Kokkos device neighbor lists and `_lmp` table allocation.
+
+```text
+size  model   GPUMD Matom/s  LAMMPS Matom/s  GPUMD/LAMMPS  LAMMPS Pair %
+100k  l3333   10.509         1.686           6.23x         99.28
+100k  l3322   18.799         2.076           9.06x         99.10
+100k  l4k4    11.277         0.921           12.24x        99.59
+100k  l4k5    7.982          0.711           11.23x        99.68
+1M    l3333   11.950         1.640           7.29x         99.79
+1M    l3322   21.643         2.013           10.75x        99.74
+1M    l4k4    12.335         0.896           13.77x        99.88
+1M    l4k5    8.657          0.691           12.54x        99.91
+```
+
+Conclusion: even with LAMMPS using the `_lmp` radial table path, GPUMD is
+roughly `6-14x` faster on one A100 for the current Cu-Zr SH models. LAMMPS
+spends about `99.1-99.9%` of loop time in `Pair`, so the gap is not mainly
+neighbor build, communication, or thermostat overhead. The difference is the
+main pair/product/force execution model: GPUMD's SH implementation keeps the
+model-specific compact product and force pipeline in a tighter CUDA path,
+whereas the LAMMPS Kokkos pair style still pays a much heavier per-pair/product
+cost despite tabled radial functions.
