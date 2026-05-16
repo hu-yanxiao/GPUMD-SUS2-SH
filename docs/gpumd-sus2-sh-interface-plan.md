@@ -1990,3 +1990,59 @@ l4k5    5.2848 -> 5.2854 12.3224 -> 12.3136  +0.04%
 Correctness was at float-order scale (`force_max <= 2.98e-7`,
 `thermo_max = 0`). Keep this option default-off; it is not a general SH
 product optimization.
+
+2026-05-16 rejected split terminal-dot kernel:
+
+- Tested a guarded experimental path `sus2_sh_split_terminal_dot=1` in a
+  separate server build tree, leaving the formal binary untouched:
+
+```text
+experiment build = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-exp-splitdot-codex
+formal build     = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex
+```
+
+- The idea was to skip terminal-dot groups inside the compact product kernel
+  and launch a second per-atom kernel for the grouped terminal-dot energy and
+  gradient accumulation. This removes one runtime path from the compact kernel,
+  but it also rereads the same moment vectors from global memory and adds a
+  kernel launch.
+- Correctness against the same experimental binary with the switch off stayed
+  at float accumulation order scale on the first 4096 Cu-Zr atoms:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-exp-splitdot-codex/codex_bench/split_terminal_dot_correctness_20260516
+
+model   force max abs diff  force RMS diff  thermo max abs diff
+l3333   4.89e-6             5.90e-7         3.20e-5
+l3322   2.38e-7             1.54e-8         1.00e-8
+l4k4    6.74e-6             8.03e-7         6.00e-5
+l4k5    4.46e-5             4.84e-6         4.44e-4
+```
+
+- The 100k and 1,024,000 atom A100 `sm_80` A/B tests used 1000 steps and
+  averages over the last five 100-step profile windows:
+
+```text
+case = /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-exp-splitdot-codex/codex_bench/split_terminal_dot_100k_1m_profile1000_20260516
+
+100k:
+model   speed delta  product off->on(ms)  total off->on(ms)
+l3333   +1.590%      5.7366 -> 5.6326    9.4028 -> 9.2746
+l3322   +0.000%      1.8376 -> 1.8366    5.1796 -> 5.1750
+l4k4    +0.130%      2.8972 -> 2.8816    8.7016 -> 8.6870
+l4k5    +0.166%      5.3436 -> 5.3412   12.5520 -> 12.5258
+
+1,024,000 atoms:
+model   speed delta  product off->on(ms)   total off->on(ms)
+l3333   -2.721%      51.6766 -> 54.6982   86.4754 -> 89.0140
+l3322   -0.038%      17.3246 -> 17.3208   48.1628 -> 48.1482
+l4k4    -0.911%      26.6242 -> 27.8162   81.9862 -> 82.7808
+l4k5    -0.683%      49.8376 -> 51.8252  119.3298 -> 120.1394
+```
+
+Conclusion: this split-kernel path is rejected. The 100k case can show small
+positive noise, but the million-atom benchmark is the relevant target and shows
+that losing in-kernel locality costs more than the control-flow simplification.
+Future terminal-dot work should keep the operation inside the compact product
+kernel or reduce global moment traffic before splitting execution across
+kernels.
