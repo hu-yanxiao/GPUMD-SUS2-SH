@@ -9,6 +9,20 @@ matrix-style kernels can evolve without destabilizing the older tensor backend.
 The active build is SH-only: moment-tensor SUS2 models remain supported by the
 separate `GPUMD-SUS2` repository.
 
+## Project Relationship
+
+| Repository | Role |
+| --- | --- |
+| `SUS2-SH` | Generates and trains SUS2-SH `.mtp` models on the CPU/reference path. |
+| `SUS2-SH-GPU` | Trains the same SUS2-SH model format with CUDA objective/gradient paths. |
+| `GPUMD-SUS2-SH` | This repository: GPUMD runtime backend for trained SUS2-SH models. |
+| `GPUMD-SUS2` | Separate GPUMD backend for SUS2 v1.1 moment-tensor models. |
+| `PySUS2SH` | Python/ASE/phonon workflow package for SUS2-SH models. |
+
+Use this repository for MD production in GPUMD after training a SUS2-SH model.
+Do not use it for moment-tensor SUS2-MLIP models; that path belongs to
+`GPUMD-SUS2`.
+
 Initial design and implementation notes are tracked in
 [docs/gpumd-sus2-sh-interface-plan.md](docs/gpumd-sus2-sh-interface-plan.md).
 
