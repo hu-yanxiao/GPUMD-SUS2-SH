@@ -51,6 +51,11 @@ private:
   int sh_terminal_dot_group_count_ = 0;
   int sh_terminal_dot_group_entry_count_ = 0;
   int sh_terminal_dot_nondot_row_count_ = 0;
+  int sh_fused_terminal_dot_group_count_ = 0;
+  int sh_fused_terminal_dot_group_entry_count_ = 0;
+  int sh_fused_terminal_dot_producer_count_ = 0;
+  int sh_fused_terminal_dot_component_count_ = 0;
+  int sh_fused_terminal_dot_term_count_ = 0;
   int sh_grad_zero_count_ = 0;
   int alpha_moments_count_ = 0;
   int alpha_scalar_moments_ = 0;
@@ -76,6 +81,7 @@ private:
   bool use_terminal_dot_groups_ = false;
   bool use_terminal_dot_premul_ = false;
   bool use_terminal_dot_row_list_ = false;
+  bool use_fused_terminal_dot_ = false;
   bool use_selective_grad_zero_ = false;
   bool use_product_basic_cache_ = false;
   bool use_packed_back_rows_ = false;
@@ -116,6 +122,7 @@ private:
   GPU_Vector<int> sh_terminal_dot_group_layer_offsets_;
   GPU_Vector<int> sh_terminal_dot_nondot_rows_;
   GPU_Vector<int> sh_terminal_dot_nondot_layer_offsets_;
+  GPU_Vector<unsigned int> sh_fused_terminal_dot_u32_;
   GPU_Vector<int> sh_cg_back_rows_int_;
   GPU_Vector<int> sh_cg_back_terms_int_;
   GPU_Vector<double> sh_cg_back_terms_coeff_;

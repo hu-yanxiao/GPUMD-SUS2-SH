@@ -25,11 +25,11 @@ namespace
 {
 constexpr int kBlockSize = 128;
 constexpr int kProductBlockSize = 128;
-constexpr int kMaxSHL = 4;
+constexpr int kMaxSHL = 6;
 constexpr int kMaxSHComponents = (kMaxSHL + 1) * (kMaxSHL + 1);
-constexpr int kMaxSHRadialFuncs = 32;
+constexpr int kMaxSHRadialFuncs = 48;
 constexpr int kMaxSHRbSize = 16;
-constexpr int kMaxSHBasics = 256;
+constexpr int kMaxSHBasics = 320;
 constexpr int kSHProductBasicCache = 64;
 constexpr int kSHForceGradCache64 = 64;
 constexpr int kSHForceGradCache128 = 128;
@@ -180,6 +180,7 @@ struct SHHostModel {
   int sh_standard_cg_blocks = 0;
   int sh_standard_cg_terms = 0;
   int sh_standard_cg_layers = 0;
+  bool sh_standard_graph_matched = false;
   int radial_funcs_count = 0;
   int rb_size = 0;
   int alpha_basic_count = 0;
@@ -770,6 +771,25 @@ bool parse_sh_terminal_dot_row_list(const SHHostModel& model, int nopts, const c
     }
   }
   return use_list;
+}
+
+bool parse_sh_fused_terminal_dot(const SHHostModel& model, int nopts, const char** opts)
+{
+  bool use_fused = false;
+  const char* env = std::getenv("SUS2_SH_GPUMD_FUSED_TERMINAL_DOT");
+  if (env != nullptr) {
+    use_fused = parse_bool_value(env, "SUS2_SH_GPUMD_FUSED_TERMINAL_DOT");
+  }
+  const int begin = std::min(nopts, model.species_count);
+  for (int i = begin; i < nopts; ++i) {
+    const std::string option = opts[i] == nullptr ? "" : opts[i];
+    if (starts_with(option, "sus2_sh_fused_terminal_dot=") ||
+        starts_with(option, "sus2_fused_terminal_dot=")) {
+      const size_t eq = option.find('=');
+      use_fused = parse_bool_value(option.substr(eq + 1), option.substr(0, eq));
+    }
+  }
+  return use_fused;
 }
 
 bool parse_sh_selective_grad_zero(const SHHostModel& model, int nopts, const char** opts)
@@ -1692,6 +1712,239 @@ void validate_standard_sh_graph(SHHostModel& model)
     static_cast<int>(model.cg_back_rows.size());
 }
 
+bool standard_sh_graph_matches(const SHHostModel& model, SHStandardGraphHost& graph)
+{
+  SHStandardGraphBuilderHost builder(model.sh_l_max, model.sh_k_max);
+  graph = builder.BuildGraph(model.sh_body_order, model.sh_body_l_max);
+
+  if (graph.node_count != model.alpha_moments_count ||
+      static_cast<int>(graph.basic.size()) != model.alpha_basic_count ||
+      graph.products.size() != model.products.size() ||
+      graph.scalars.size() != model.alpha_moment_mapping.size()) {
+    return false;
+  }
+
+  for (int i = 0; i < model.alpha_basic_count; ++i) {
+    const SHBasicIndexHost& basic = graph.basic[i];
+    const int mu = basic.k * (model.sh_l_max + 1) + basic.l;
+    if (model.alpha_basic[i * 3 + 0] != mu ||
+        model.alpha_basic[i * 3 + 1] != basic.l ||
+        model.alpha_basic[i * 3 + 2] != basic.m) {
+      return false;
+    }
+  }
+
+  const double coeff_tol = 2.0e-10;
+  for (size_t p = 0; p < model.products.size(); ++p) {
+    const SHProductHost& expected = graph.products[p];
+    const SHProductHost& actual = model.products[p];
+    const double tol = coeff_tol * (1.0 + std::abs(expected.coeff));
+    if (actual.left != expected.left || actual.right != expected.right ||
+        actual.target != expected.target || std::abs(actual.coeff - expected.coeff) > tol) {
+      return false;
+    }
+  }
+
+  for (size_t i = 0; i < graph.scalars.size(); ++i) {
+    if (graph.scalars[i] != model.alpha_moment_mapping[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void build_explicit_sh_graph_metadata(
+  SHHostModel& model,
+  const SHStandardGraphHost* standard_graph)
+{
+  const int node_count = model.alpha_moments_count;
+  if (node_count <= 0 || model.alpha_basic_count <= 0 ||
+      model.alpha_basic_count > node_count) {
+    sh_input_error("SUS2_SH invalid explicit product graph dimensions.");
+  }
+
+  model.cg_blocks.clear();
+  model.cg_terms.clear();
+  model.cg_rows.clear();
+  model.cg_row_terms.clear();
+  model.cg_layer_offsets.clear();
+  model.cg_back_rows.clear();
+  model.cg_back_terms.clear();
+  model.cg_back_layer_offsets.clear();
+
+  if (standard_graph != nullptr) {
+    model.sh_standard_tensor_blocks =
+      static_cast<int>(standard_graph->tensor_blocks.size());
+    model.sh_standard_cg_blocks = static_cast<int>(standard_graph->cg_blocks.size());
+    model.sh_standard_cg_terms = static_cast<int>(standard_graph->cg_terms.size());
+    model.cg_blocks = standard_graph->cg_blocks;
+    model.cg_terms = standard_graph->cg_terms;
+    model.sh_standard_graph_matched = true;
+  } else {
+    model.sh_standard_tensor_blocks = 0;
+    model.sh_standard_cg_blocks = 0;
+    model.sh_standard_cg_terms = 0;
+    model.sh_standard_graph_matched = false;
+  }
+
+  std::vector<int> last_definition(node_count, -1);
+  std::vector<std::vector<SHCGRowTermHost>> terms_by_target(node_count);
+  for (size_t p = 0; p < model.products.size(); ++p) {
+    const SHProductHost& product = model.products[p];
+    if (product.left < 0 || product.left >= node_count ||
+        product.right < 0 || product.right >= node_count ||
+        product.target < 0 || product.target >= node_count) {
+      sh_input_error("SUS2_SH explicit product graph index out of range.");
+    }
+    if (product.target < model.alpha_basic_count) {
+      sh_input_error("SUS2_SH explicit product graph writes into a basic moment.");
+    }
+    SHCGRowTermHost term;
+    term.left_component = product.left;
+    term.right_component = product.right;
+    term.coeff = product.coeff;
+    terms_by_target[product.target].push_back(term);
+    last_definition[product.target] = static_cast<int>(p);
+  }
+  for (size_t p = 0; p < model.products.size(); ++p) {
+    const SHProductHost& product = model.products[p];
+    if ((product.left >= model.alpha_basic_count &&
+         last_definition[product.left] < 0) ||
+        (product.right >= model.alpha_basic_count &&
+         last_definition[product.right] < 0)) {
+      sh_input_error("SUS2_SH explicit product graph references an undefined moment.");
+    }
+    if ((product.left >= model.alpha_basic_count &&
+         last_definition[product.left] >= static_cast<int>(p)) ||
+        (product.right >= model.alpha_basic_count &&
+         last_definition[product.right] >= static_cast<int>(p))) {
+      sh_input_error("SUS2_SH explicit product graph is not topologically ordered.");
+    }
+  }
+
+  std::vector<int> targets;
+  targets.reserve(model.products.size());
+  std::vector<unsigned char> defined(node_count, 0);
+  for (int i = 0; i < model.alpha_basic_count; ++i) {
+    defined[i] = 1;
+  }
+  for (int target = model.alpha_basic_count; target < node_count; ++target) {
+    if (!terms_by_target[target].empty()) {
+      targets.push_back(target);
+      defined[target] = 1;
+    }
+  }
+  std::sort(targets.begin(), targets.end(), [&](int a, int b) {
+    if (last_definition[a] != last_definition[b]) {
+      return last_definition[a] < last_definition[b];
+    }
+    return a < b;
+  });
+
+  for (int scalar = 0; scalar < model.alpha_scalar_moments; ++scalar) {
+    const int moment = model.alpha_moment_mapping[scalar];
+    if (moment < 0 || moment >= node_count || !defined[moment]) {
+      sh_input_error("SUS2_SH alpha_moment_mapping references an undefined moment.");
+    }
+  }
+
+  std::vector<int> node_layer(node_count, 0);
+  std::vector<int> target_layer(node_count, 0);
+  int max_layer = 0;
+  for (int target : targets) {
+    int source_layer = 0;
+    const std::vector<SHCGRowTermHost>& terms = terms_by_target[target];
+    for (size_t t = 0; t < terms.size(); ++t) {
+      source_layer = std::max(source_layer, node_layer[terms[t].left_component]);
+      source_layer = std::max(source_layer, node_layer[terms[t].right_component]);
+    }
+    const int layer = source_layer + 1;
+    node_layer[target] = layer;
+    target_layer[target] = layer;
+    max_layer = std::max(max_layer, layer);
+  }
+
+  model.sh_standard_cg_layers = max_layer;
+  std::vector<std::vector<int>> targets_by_layer(max_layer + 1);
+  for (int target : targets) {
+    targets_by_layer[target_layer[target]].push_back(target);
+  }
+  model.cg_layer_offsets.assign(max_layer + 2, 0);
+  for (int layer = 1; layer <= max_layer; ++layer) {
+    model.cg_layer_offsets[layer] = static_cast<int>(model.cg_rows.size());
+    std::sort(targets_by_layer[layer].begin(), targets_by_layer[layer].end());
+    for (int target : targets_by_layer[layer]) {
+      SHCGRowHost row;
+      row.layer = layer;
+      row.left_base = 0;
+      row.right_base = 0;
+      row.target = target;
+      row.term_begin = static_cast<int>(model.cg_row_terms.size());
+      row.term_count = static_cast<int>(terms_by_target[target].size());
+      model.cg_rows.push_back(row);
+      model.cg_row_terms.insert(
+        model.cg_row_terms.end(),
+        terms_by_target[target].begin(),
+        terms_by_target[target].end());
+    }
+  }
+  model.cg_layer_offsets[max_layer + 1] = static_cast<int>(model.cg_rows.size());
+
+  std::vector<std::map<int, std::vector<SHCGBackTermHost>>> back_by_layer(max_layer + 1);
+  for (size_t row_index = 0; row_index < model.cg_rows.size(); ++row_index) {
+    const SHCGRowHost& row = model.cg_rows[row_index];
+    for (int t = 0; t < row.term_count; ++t) {
+      const SHCGRowTermHost& term = model.cg_row_terms[row.term_begin + t];
+      const int left = row.left_base + term.left_component;
+      const int right = row.right_base + term.right_component;
+
+      SHCGBackTermHost left_term;
+      left_term.target = row.target;
+      left_term.other = right;
+      left_term.coeff = term.coeff;
+      back_by_layer[row.layer][left].push_back(left_term);
+
+      SHCGBackTermHost right_term;
+      right_term.target = row.target;
+      right_term.other = left;
+      right_term.coeff = term.coeff;
+      back_by_layer[row.layer][right].push_back(right_term);
+    }
+  }
+
+  model.cg_back_layer_offsets.assign(max_layer + 2, 0);
+  for (int layer = 1; layer <= max_layer; ++layer) {
+    model.cg_back_layer_offsets[layer] = static_cast<int>(model.cg_back_rows.size());
+    for (std::map<int, std::vector<SHCGBackTermHost>>::const_iterator it =
+           back_by_layer[layer].begin();
+         it != back_by_layer[layer].end();
+         ++it) {
+      SHCGBackRowHost row;
+      row.layer = layer;
+      row.source = it->first;
+      row.term_begin = static_cast<int>(model.cg_back_terms.size());
+      row.term_count = static_cast<int>(it->second.size());
+      model.cg_back_rows.push_back(row);
+      model.cg_back_terms.insert(
+        model.cg_back_terms.end(),
+        it->second.begin(),
+        it->second.end());
+    }
+  }
+  model.cg_back_layer_offsets[max_layer + 1] =
+    static_cast<int>(model.cg_back_rows.size());
+}
+
+void prepare_sh_graph_metadata(SHHostModel& model)
+{
+  SHStandardGraphHost standard_graph;
+  if (standard_sh_graph_matches(model, standard_graph)) {
+    build_explicit_sh_graph_metadata(model, &standard_graph);
+  } else {
+    build_explicit_sh_graph_metadata(model, nullptr);
+  }
+}
+
 SHHostModel load_sh_model(const std::string& path)
 {
   const std::string text = read_text_file(path);
@@ -1731,7 +1984,7 @@ SHHostModel load_sh_model(const std::string& path)
     sh_input_error("SUS2_SH first GPUMD backend currently supports RBChebyshev_sss only.");
   }
   if (model.sh_l_max < 0 || model.sh_l_max > kMaxSHL) {
-    sh_input_error("SUS2_SH supports sh_l_max in [0,4].");
+    sh_input_error("SUS2_SH supports sh_l_max in [0,6].");
   }
   if (model.sh_body_order < 2 || model.sh_body_order > 6) {
     sh_input_error("SUS2_SH supports sh_body_order in [2,6].");
@@ -1741,10 +1994,10 @@ SHHostModel load_sh_model(const std::string& path)
   }
   if (model.rb_size <= 0 || model.rb_size > kMaxSHRbSize ||
       model.radial_funcs_count > kMaxSHRadialFuncs) {
-    sh_input_error("SUS2_SH GPU scratch limit exceeded: rb_size<=16, radial_funcs_count<=32.");
+    sh_input_error("SUS2_SH GPU scratch limit exceeded: rb_size<=16, radial_funcs_count<=48.");
   }
   if (model.alpha_basic_count <= 0 || model.alpha_basic_count > kMaxSHBasics) {
-    sh_input_error("SUS2_SH GPU scratch limit exceeded: alpha_index_basic_count<=256.");
+    sh_input_error("SUS2_SH GPU scratch limit exceeded: alpha_index_basic_count<=320.");
   }
   model.sh_body_l_max.assign(7, model.sh_l_max);
   if (has_token(text, "sh_body_l_max =")) {
@@ -1843,7 +2096,7 @@ SHHostModel load_sh_model(const std::string& path)
       static_cast<int>(model.moment_coeffs.size()) != model.alpha_scalar_moments) {
     sh_input_error("Unexpected SUS2_SH coefficient dimensions.");
   }
-  validate_standard_sh_graph(model);
+  prepare_sh_graph_metadata(model);
   return model;
 }
 
@@ -1930,6 +2183,11 @@ struct SHDeviceModel {
   int sh_terminal_dot_group_count;
   int sh_terminal_dot_group_entry_count;
   int sh_terminal_dot_nondot_row_count;
+  int sh_fused_terminal_dot_group_count;
+  int sh_fused_terminal_dot_group_entry_count;
+  int sh_fused_terminal_dot_producer_count;
+  int sh_fused_terminal_dot_component_count;
+  int sh_fused_terminal_dot_term_count;
   int alpha_moments_count;
   int alpha_scalar_moments;
   int active_scalar_moments;
@@ -1961,6 +2219,7 @@ struct SHDeviceModel {
   const int* sh_terminal_dot_group_layer_offsets;
   const int* sh_terminal_dot_nondot_rows;
   const int* sh_terminal_dot_nondot_layer_offsets;
+  const unsigned int* sh_fused_terminal_dot_u32;
   const int* sh_cg_back_rows_int;
   const int* sh_cg_back_terms_int;
   const double* sh_cg_back_terms_coeff;
@@ -2083,7 +2342,14 @@ __device__ __forceinline__ RealT sh_inv_power(int l, RealT r)
   if (l == 3) {
     return inv_r2 * inv_r;
   }
-  return inv_r2 * inv_r2;
+  const RealT inv_r4 = inv_r2 * inv_r2;
+  if (l == 4) {
+    return inv_r4;
+  }
+  if (l == 5) {
+    return inv_r4 * inv_r;
+  }
+  return inv_r4 * inv_r2;
 }
 
 template <typename RealT>
@@ -2116,6 +2382,228 @@ __device__ __forceinline__ void sh_add_real(
 }
 
 template <typename RealT>
+struct SHDeviceComplex {
+  RealT re;
+  RealT im;
+};
+
+template <typename RealT>
+__device__ __forceinline__ SHDeviceComplex<RealT> sh_cmake(RealT re, RealT im)
+{
+  SHDeviceComplex<RealT> value;
+  value.re = re;
+  value.im = im;
+  return value;
+}
+
+template <typename RealT>
+__device__ __forceinline__ SHDeviceComplex<RealT> sh_cadd(
+  SHDeviceComplex<RealT> a,
+  SHDeviceComplex<RealT> b)
+{
+  return sh_cmake(a.re + b.re, a.im + b.im);
+}
+
+template <typename RealT>
+__device__ __forceinline__ SHDeviceComplex<RealT> sh_csub(
+  SHDeviceComplex<RealT> a,
+  SHDeviceComplex<RealT> b)
+{
+  return sh_cmake(a.re - b.re, a.im - b.im);
+}
+
+template <typename RealT>
+__device__ __forceinline__ SHDeviceComplex<RealT> sh_cmul(
+  SHDeviceComplex<RealT> a,
+  SHDeviceComplex<RealT> b)
+{
+  return sh_cmake(a.re * b.re - a.im * b.im, a.re * b.im + a.im * b.re);
+}
+
+template <typename RealT>
+__device__ __forceinline__ SHDeviceComplex<RealT> sh_cscale(
+  SHDeviceComplex<RealT> a,
+  RealT scale)
+{
+  return sh_cmake(a.re * scale, a.im * scale);
+}
+
+template <typename RealT>
+__device__ __forceinline__ RealT sh_factorial(int n)
+{
+  RealT value = static_cast<RealT>(1.0);
+  for (int i = 2; i <= n; ++i) {
+    value *= static_cast<RealT>(i);
+  }
+  return value;
+}
+
+template <typename RealT>
+__device__ __forceinline__ RealT sh_complex_norm(int l, int m)
+{
+  return sqrt(
+    (static_cast<RealT>(2 * l + 1) / static_cast<RealT>(4.0 * kPi)) *
+    sh_factorial<RealT>(l - m) / sh_factorial<RealT>(l + m));
+}
+
+__device__ __forceinline__ int sh_parity_sign_int(int m)
+{
+  return (m & 1) == 0 ? 1 : -1;
+}
+
+template <typename RealT>
+__device__ __forceinline__ void eval_real_sh_from_solid(
+  RealT x,
+  RealT y,
+  RealT z,
+  RealT r,
+  int lmax,
+  RealT* vals,
+  RealT* ders)
+{
+  const int count = (lmax + 1) * (lmax + 1);
+  for (int i = 0; i < count; ++i) {
+    vals[i] = static_cast<RealT>(0.0);
+    if (ders != nullptr) {
+      ders[3 * i + 0] = ders[3 * i + 1] = ders[3 * i + 2] = static_cast<RealT>(0.0);
+    }
+  }
+
+  SHDeviceComplex<RealT> solid[kMaxSHComponents];
+  SHDeviceComplex<RealT> solid_ders[3 * kMaxSHComponents];
+  for (int i = 0; i < kMaxSHComponents; ++i) {
+    solid[i] = sh_cmake<RealT>(static_cast<RealT>(0.0), static_cast<RealT>(0.0));
+    if (ders != nullptr) {
+      solid_ders[3 * i + 0] = solid[i];
+      solid_ders[3 * i + 1] = solid[i];
+      solid_ders[3 * i + 2] = solid[i];
+    }
+  }
+
+  const RealT r2 = r * r;
+  const SHDeviceComplex<RealT> u = sh_cmake(x, y);
+  const SHDeviceComplex<RealT> zero =
+    sh_cmake<RealT>(static_cast<RealT>(0.0), static_cast<RealT>(0.0));
+  const SHDeviceComplex<RealT> du[3] = {
+    sh_cmake<RealT>(static_cast<RealT>(1.0), static_cast<RealT>(0.0)),
+    sh_cmake<RealT>(static_cast<RealT>(0.0), static_cast<RealT>(1.0)),
+    zero
+  };
+
+  solid[sh_flat_index(0, 0)] =
+    sh_cmake<RealT>(static_cast<RealT>(1.0), static_cast<RealT>(0.0));
+  for (int m = 1; m <= lmax; ++m) {
+    const int prev = sh_flat_index(m - 1, m - 1);
+    const int idx = sh_flat_index(m, m);
+    const RealT coeff = -static_cast<RealT>(2 * m - 1);
+    solid[idx] = sh_cscale(sh_cmul(u, solid[prev]), coeff);
+    if (ders != nullptr) {
+      for (int a = 0; a < 3; ++a) {
+        solid_ders[3 * idx + a] =
+          sh_cscale(
+            sh_cadd(sh_cmul(du[a], solid[prev]), sh_cmul(u, solid_ders[3 * prev + a])),
+            coeff);
+      }
+    }
+  }
+
+  for (int m = 0; m <= lmax; ++m) {
+    const int diag = sh_flat_index(m, m);
+    if (m + 1 <= lmax) {
+      const int idx = sh_flat_index(m + 1, m);
+      const RealT coeff = static_cast<RealT>(2 * m + 1);
+      solid[idx] = sh_cscale(solid[diag], coeff * z);
+      if (ders != nullptr) {
+        for (int a = 0; a < 3; ++a) {
+          const SHDeviceComplex<RealT> dz_term = (a == 2) ? solid[diag] : zero;
+          solid_ders[3 * idx + a] =
+            sh_cscale(
+              sh_cadd(dz_term, sh_cscale(solid_ders[3 * diag + a], z)),
+              coeff);
+        }
+      }
+    }
+    for (int l = m + 2; l <= lmax; ++l) {
+      const int idx = sh_flat_index(l, m);
+      const int prev1 = sh_flat_index(l - 1, m);
+      const int prev2 = sh_flat_index(l - 2, m);
+      const RealT acoef = static_cast<RealT>(2 * l - 1);
+      const RealT bcoef = static_cast<RealT>(l + m - 1);
+      const RealT inv_denom = static_cast<RealT>(1.0) / static_cast<RealT>(l - m);
+      solid[idx] =
+        sh_cscale(
+          sh_csub(sh_cscale(solid[prev1], acoef * z),
+                  sh_cscale(solid[prev2], bcoef * r2)),
+          inv_denom);
+      if (ders != nullptr) {
+        for (int a = 0; a < 3; ++a) {
+          const RealT dr2 = static_cast<RealT>(2.0) *
+            (a == 0 ? x : (a == 1 ? y : z));
+          const SHDeviceComplex<RealT> dz_term = (a == 2) ? solid[prev1] : zero;
+          const SHDeviceComplex<RealT> first =
+            sh_cscale(
+              sh_cadd(dz_term, sh_cscale(solid_ders[3 * prev1 + a], z)),
+              acoef);
+          const SHDeviceComplex<RealT> second =
+            sh_cscale(
+              sh_cadd(sh_cscale(solid[prev2], dr2),
+                      sh_cscale(solid_ders[3 * prev2 + a], r2)),
+              bcoef);
+          solid_ders[3 * idx + a] = sh_cscale(sh_csub(first, second), inv_denom);
+        }
+      }
+    }
+  }
+
+  const RealT sqrt2 = sqrt(static_cast<RealT>(2.0));
+  for (int l = 0; l <= lmax; ++l) {
+    const RealT inv_pow = sh_inv_power(l, r);
+    const RealT inv_pow_der =
+      l == 0 ? static_cast<RealT>(0.0)
+             : -static_cast<RealT>(l) * inv_pow / (r * r);
+    for (int m = 0; m <= l; ++m) {
+      const int cidx = sh_flat_index(l, m);
+      const RealT norm = sh_complex_norm<RealT>(l, m);
+      const SHDeviceComplex<RealT> y_complex =
+        sh_cscale(solid[cidx], norm * inv_pow);
+      if (m == 0) {
+        const int ridx = sh_flat_index(l, 0);
+        vals[ridx] = y_complex.re;
+        if (ders != nullptr) {
+          for (int a = 0; a < 3; ++a) {
+            const RealT coord = a == 0 ? x : (a == 1 ? y : z);
+            const SHDeviceComplex<RealT> dy_complex =
+              sh_cscale(
+                sh_cadd(sh_cscale(solid_ders[3 * cidx + a], inv_pow),
+                        sh_cscale(solid[cidx], inv_pow_der * coord)),
+                norm);
+            ders[3 * ridx + a] = dy_complex.re;
+          }
+        }
+      } else {
+        const RealT factor = sqrt2 * static_cast<RealT>(sh_parity_sign_int(m));
+        const int pidx = sh_flat_index(l, m);
+        const int nidx = sh_flat_index(l, -m);
+        vals[pidx] = factor * y_complex.re;
+        vals[nidx] = factor * y_complex.im;
+        if (ders != nullptr) {
+          for (int a = 0; a < 3; ++a) {
+            const RealT coord = a == 0 ? x : (a == 1 ? y : z);
+            const SHDeviceComplex<RealT> dy_complex =
+              sh_cscale(
+                sh_cadd(sh_cscale(solid_ders[3 * cidx + a], inv_pow),
+                        sh_cscale(solid[cidx], inv_pow_der * coord)),
+                norm);
+            ders[3 * pidx + a] = factor * dy_complex.re;
+            ders[3 * nidx + a] = factor * dy_complex.im;
+          }
+        }
+      }
+    }
+  }
+}
+
+template <typename RealT>
 __device__ __forceinline__ void eval_real_sh(
   RealT x,
   RealT y,
@@ -2125,6 +2613,10 @@ __device__ __forceinline__ void eval_real_sh(
   RealT* vals,
   RealT* ders)
 {
+  if (lmax > 4) {
+    eval_real_sh_from_solid(x, y, z, r, lmax, vals, ders);
+    return;
+  }
   const int clear_count = ders == nullptr ? (lmax + 1) * (lmax + 1) : kMaxSHComponents;
   for (int i = 0; i < clear_count; ++i) {
     vals[i] = static_cast<RealT>(0.0);
@@ -2467,6 +2959,10 @@ __device__ __forceinline__ void eval_real_sh_static_values(
   RealT r,
   RealT* sh)
 {
+  if (L > 4) {
+    eval_real_sh_from_solid(x, y, z, r, L, sh, static_cast<RealT*>(nullptr));
+    return;
+  }
   const RealT inv_r = static_cast<RealT>(1.0) / r;
   const RealT inv_r2 = inv_r * inv_r;
   const RealT inv_r3 = inv_r2 * inv_r;
@@ -2706,6 +3202,12 @@ bool launch_sh_compute_basic_static(
       break;
     case 4:
       SUS2_SH_LAUNCH_STATIC_BASIC_FOR_L(4);
+      break;
+    case 5:
+      SUS2_SH_LAUNCH_STATIC_BASIC_FOR_L(5);
+      break;
+    case 6:
+      SUS2_SH_LAUNCH_STATIC_BASIC_FOR_L(6);
       break;
   }
 
@@ -3085,6 +3587,279 @@ __device__ __forceinline__ void sh_process_terminal_dot_group_fixed(
     grads[static_cast<size_t>(left0 + c) * N + atom] +=
       static_cast<GradT>(left_grads[c]);
   }
+}
+
+__device__ __forceinline__ size_t sh_fused_entry_u32_offset(const SHDeviceModel& model)
+{
+  return static_cast<size_t>(model.sh_fused_terminal_dot_group_count) * 3;
+}
+
+__device__ __forceinline__ size_t sh_fused_producer_u32_offset(const SHDeviceModel& model)
+{
+  return sh_fused_entry_u32_offset(model) +
+         static_cast<size_t>(model.sh_fused_terminal_dot_group_entry_count) * 3;
+}
+
+__device__ __forceinline__ size_t sh_fused_component_u32_offset(const SHDeviceModel& model)
+{
+  return sh_fused_producer_u32_offset(model) +
+         static_cast<size_t>(model.sh_fused_terminal_dot_producer_count) * 3;
+}
+
+__device__ __forceinline__ size_t sh_fused_term_u32_offset(const SHDeviceModel& model)
+{
+  return sh_fused_component_u32_offset(model) +
+         static_cast<size_t>(model.sh_fused_terminal_dot_component_count) * 2;
+}
+
+template <typename RealT, int BasicCache>
+__device__ __forceinline__ RealT sh_load_product_moment(
+  int N,
+  int atom,
+  const SHDeviceModel& model,
+  const RealT* moments,
+  const RealT* basic_cache,
+  int moment)
+{
+  return (BasicCache > 0 && model.use_product_basic_cache &&
+          moment < model.alpha_basic_count)
+    ? basic_cache[moment]
+    : moments[static_cast<size_t>(moment) * N + atom];
+}
+
+template <typename RealT, int BasicCache>
+__device__ __forceinline__ void sh_compute_fused_producer_values(
+  int N,
+  int atom,
+  const SHDeviceModel& model,
+  const RealT* moments,
+  const RealT* basic_cache,
+  int producer_id,
+  int dot_count,
+  RealT* values)
+{
+  const unsigned int* packed = model.sh_fused_terminal_dot_u32;
+  const size_t producer_base =
+    sh_fused_producer_u32_offset(model) + static_cast<size_t>(producer_id) * 3;
+  const int component_begin = static_cast<int>(packed[producer_base + 1]);
+  const size_t component_offset = sh_fused_component_u32_offset(model);
+  const size_t term_offset = sh_fused_term_u32_offset(model);
+  for (int c = 0; c < dot_count; ++c) {
+    const size_t component_base =
+      component_offset + static_cast<size_t>(component_begin + c) * 2;
+    const int term_begin = static_cast<int>(packed[component_base + 0]);
+    const int term_count = static_cast<int>(packed[component_base + 1]);
+    RealT sum = static_cast<RealT>(0.0);
+    for (int t = 0; t < term_count; ++t) {
+      const size_t term_base = term_offset + static_cast<size_t>(term_begin + t) * 2;
+      const unsigned int term0 = packed[term_base + 0];
+      const int left = static_cast<int>(term0 & 0xffffu);
+      const int right = static_cast<int>(term0 >> 16);
+      const RealT coeff = sh_const_forward_coeff<RealT>(packed[term_base + 1]);
+      const RealT left_value =
+        sh_load_product_moment<RealT, BasicCache>(N, atom, model, moments, basic_cache, left);
+      const RealT right_value =
+        sh_load_product_moment<RealT, BasicCache>(N, atom, model, moments, basic_cache, right);
+      sum += coeff * left_value * right_value;
+    }
+    values[c] = sum;
+  }
+}
+
+template <typename RealT, typename GradT, int BasicCache>
+__device__ __forceinline__ void sh_backprop_fused_producer_values(
+  int N,
+  int atom,
+  const SHDeviceModel& model,
+  const RealT* moments,
+  GradT* grads,
+  const RealT* basic_cache,
+  int producer_id,
+  int dot_count,
+  const RealT* value_grads)
+{
+  const unsigned int* packed = model.sh_fused_terminal_dot_u32;
+  const size_t producer_base =
+    sh_fused_producer_u32_offset(model) + static_cast<size_t>(producer_id) * 3;
+  const int component_begin = static_cast<int>(packed[producer_base + 1]);
+  const size_t component_offset = sh_fused_component_u32_offset(model);
+  const size_t term_offset = sh_fused_term_u32_offset(model);
+  for (int c = 0; c < dot_count; ++c) {
+    const RealT g = value_grads[c];
+    if (g == static_cast<RealT>(0.0)) {
+      continue;
+    }
+    const size_t component_base =
+      component_offset + static_cast<size_t>(component_begin + c) * 2;
+    const int term_begin = static_cast<int>(packed[component_base + 0]);
+    const int term_count = static_cast<int>(packed[component_base + 1]);
+    for (int t = 0; t < term_count; ++t) {
+      const size_t term_base = term_offset + static_cast<size_t>(term_begin + t) * 2;
+      const unsigned int term0 = packed[term_base + 0];
+      const int left = static_cast<int>(term0 & 0xffffu);
+      const int right = static_cast<int>(term0 >> 16);
+      const RealT coeff = sh_const_forward_coeff<RealT>(packed[term_base + 1]);
+      const RealT left_value =
+        sh_load_product_moment<RealT, BasicCache>(N, atom, model, moments, basic_cache, left);
+      const RealT right_value =
+        sh_load_product_moment<RealT, BasicCache>(N, atom, model, moments, basic_cache, right);
+      const RealT weighted = coeff * g;
+      grads[static_cast<size_t>(left) * N + atom] += static_cast<GradT>(weighted * right_value);
+      grads[static_cast<size_t>(right) * N + atom] += static_cast<GradT>(weighted * left_value);
+    }
+  }
+}
+
+template <typename RealT, typename GradT, int BasicCache>
+__device__ __forceinline__ void sh_backprop_fused_producer_scaled(
+  int N,
+  int atom,
+  const SHDeviceModel& model,
+  const RealT* moments,
+  GradT* grads,
+  const RealT* basic_cache,
+  int producer_id,
+  int dot_count,
+  const RealT* scale_values,
+  RealT scale)
+{
+  const unsigned int* packed = model.sh_fused_terminal_dot_u32;
+  const size_t producer_base =
+    sh_fused_producer_u32_offset(model) + static_cast<size_t>(producer_id) * 3;
+  const int component_begin = static_cast<int>(packed[producer_base + 1]);
+  const size_t component_offset = sh_fused_component_u32_offset(model);
+  const size_t term_offset = sh_fused_term_u32_offset(model);
+  for (int c = 0; c < dot_count; ++c) {
+    const RealT g = scale * scale_values[c];
+    if (g == static_cast<RealT>(0.0)) {
+      continue;
+    }
+    const size_t component_base =
+      component_offset + static_cast<size_t>(component_begin + c) * 2;
+    const int term_begin = static_cast<int>(packed[component_base + 0]);
+    const int term_count = static_cast<int>(packed[component_base + 1]);
+    for (int t = 0; t < term_count; ++t) {
+      const size_t term_base = term_offset + static_cast<size_t>(term_begin + t) * 2;
+      const unsigned int term0 = packed[term_base + 0];
+      const int left = static_cast<int>(term0 & 0xffffu);
+      const int right = static_cast<int>(term0 >> 16);
+      const RealT coeff = sh_const_forward_coeff<RealT>(packed[term_base + 1]);
+      const RealT left_value =
+        sh_load_product_moment<RealT, BasicCache>(N, atom, model, moments, basic_cache, left);
+      const RealT right_value =
+        sh_load_product_moment<RealT, BasicCache>(N, atom, model, moments, basic_cache, right);
+      const RealT weighted = coeff * g;
+      grads[static_cast<size_t>(left) * N + atom] += static_cast<GradT>(weighted * right_value);
+      grads[static_cast<size_t>(right) * N + atom] += static_cast<GradT>(weighted * left_value);
+    }
+  }
+}
+
+template <typename RealT, typename GradT, int BasicCache>
+static __global__ void gpu_sh_fused_terminal_dot_groups_energy(
+  int N,
+  SHDeviceModel model,
+  const int* type,
+  const RealT* moments,
+  GradT* grads,
+  double* potential)
+{
+  const int atom = blockIdx.x * blockDim.x + threadIdx.x;
+  if (atom >= N || model.sh_fused_terminal_dot_group_count <= 0 ||
+      model.sh_fused_terminal_dot_u32 == nullptr) {
+    return;
+  }
+
+  const int type_i = type[atom];
+  const RealT center_coeff = sh_species_coeff<RealT>(model, type_i);
+  RealT site_energy = static_cast<RealT>(0.0);
+  RealT basic_cache[BasicCache > 0 ? BasicCache : 1];
+  if (BasicCache > 0 && model.use_product_basic_cache) {
+    for (int b = 0; b < model.alpha_basic_count; ++b) {
+      basic_cache[b] = moments[static_cast<size_t>(b) * N + atom];
+    }
+  }
+
+  const unsigned int* packed = model.sh_fused_terminal_dot_u32;
+  const size_t entry_offset = sh_fused_entry_u32_offset(model);
+  for (int group = 0; group < model.sh_fused_terminal_dot_group_count; ++group) {
+    const size_t group_base = static_cast<size_t>(group) * 3;
+    const unsigned int group0 = packed[group_base + 0];
+    const int producer_id = static_cast<int>(group0 & 0xffffu);
+    const int dot_count = static_cast<int>(group0 >> 16);
+    if (dot_count <= 0 || dot_count > kSHTerminalDotGroupMaxCount) {
+      continue;
+    }
+    RealT producer_values[kSHTerminalDotGroupMaxCount];
+    RealT producer_grads[kSHTerminalDotGroupMaxCount];
+    sh_compute_fused_producer_values<RealT, BasicCache>(
+      N, atom, model, moments, basic_cache, producer_id, dot_count, producer_values);
+    for (int c = 0; c < dot_count; ++c) {
+      producer_grads[c] = static_cast<RealT>(0.0);
+    }
+
+    const int entry_begin = static_cast<int>(packed[group_base + 1]);
+    const int entry_count = static_cast<int>(packed[group_base + 2]);
+    for (int e = 0; e < entry_count; ++e) {
+      const size_t entry_base = entry_offset + static_cast<size_t>(entry_begin + e) * 3;
+      const unsigned int entry0 = packed[entry_base + 0];
+      const int other0 = static_cast<int>(entry0 & 0xffffu);
+      const int scalar_index = static_cast<int>(entry0 >> 16);
+      RealT weighted =
+        sh_const_forward_coeff<RealT>(packed[entry_base + 1]) * center_coeff;
+      if (!model.use_terminal_dot_premul) {
+        weighted *= sh_moment_coeff<RealT>(model, scalar_index);
+      }
+      const unsigned int other_producer_u32 = packed[entry_base + 2];
+      const bool other_is_producer = other_producer_u32 != 0xffffffffu;
+      RealT other_values[kSHTerminalDotGroupMaxCount];
+      if (other_is_producer) {
+        sh_compute_fused_producer_values<RealT, BasicCache>(
+          N, atom, model, moments, basic_cache,
+          static_cast<int>(other_producer_u32), dot_count, other_values);
+      }
+      RealT dot = static_cast<RealT>(0.0);
+      for (int c = 0; c < dot_count; ++c) {
+        const RealT other_value = other_is_producer
+          ? other_values[c]
+          : sh_load_product_moment<RealT, BasicCache>(
+              N, atom, model, moments, basic_cache, other0 + c);
+        dot += producer_values[c] * other_value;
+        producer_grads[c] += weighted * other_value;
+        if (other_is_producer) {
+          continue;
+        } else {
+          grads[static_cast<size_t>(other0 + c) * N + atom] +=
+            static_cast<GradT>(weighted * producer_values[c]);
+        }
+      }
+      site_energy += weighted * dot;
+      if (other_is_producer) {
+        sh_backprop_fused_producer_scaled<RealT, GradT, BasicCache>(
+          N, atom, model, moments, grads, basic_cache,
+          static_cast<int>(other_producer_u32), dot_count, producer_values, weighted);
+      }
+    }
+    sh_backprop_fused_producer_values<RealT, GradT, BasicCache>(
+      N, atom, model, moments, grads, basic_cache, producer_id, dot_count, producer_grads);
+  }
+  potential[atom] += static_cast<double>(site_energy);
+}
+
+template <typename RealT, typename GradT, int BasicCache>
+void launch_sh_fused_terminal_dot_groups_energy(
+  int grid_size,
+  int block_size,
+  int N,
+  SHDeviceModel model,
+  const int* type,
+  const RealT* moments,
+  GradT* grads,
+  double* potential)
+{
+  gpu_sh_fused_terminal_dot_groups_energy<RealT, GradT, BasicCache>
+    <<<grid_size, block_size>>>(
+      N, model, type, moments, grads, potential);
 }
 
 template <
@@ -4042,6 +4817,12 @@ bool launch_sh_compute_forces_static(
     case 4:
       SUS2_SH_LAUNCH_STATIC_FORCE_FOR_L(4);
       break;
+    case 5:
+      SUS2_SH_LAUNCH_STATIC_FORCE_FOR_L(5);
+      break;
+    case 6:
+      SUS2_SH_LAUNCH_STATIC_FORCE_FOR_L(6);
+      break;
   }
 
 #undef SUS2_SH_LAUNCH_STATIC_FORCE_FOR_L
@@ -4258,6 +5039,10 @@ SUS2_SH::SUS2_SH(
     use_cg_block_forward_ = false;
     use_compact_serial_product_ = false;
   }
+  if (!host_model.sh_standard_graph_matched) {
+    use_cg_block_forward_ = false;
+    use_tensor_product_parallel_ = false;
+  }
   if (use_cg_block_forward_) {
     use_compact_serial_product_ = false;
   }
@@ -4279,7 +5064,7 @@ SUS2_SH::SUS2_SH(
     has_static_full_sh_basic_layout(host_model);
   use_static_force_layout_ =
     parse_sh_static_force(host_model, num_potential_options, potential_options) &&
-    has_static_full_sh_basic_layout(host_model) && alpha_basic_count_ <= kSHForceGradCache256;
+    has_static_full_sh_basic_layout(host_model) && alpha_basic_count_ <= kMaxSHBasics;
   use_terminal_scalar_fusion_ =
     parse_sh_terminal_scalar_fusion(host_model, num_potential_options, potential_options) &&
     use_compact_serial_product_;
@@ -4298,6 +5083,9 @@ SUS2_SH::SUS2_SH(
   use_terminal_dot_row_list_ =
     parse_sh_terminal_dot_row_list(host_model, num_potential_options, potential_options) &&
     use_terminal_dot_groups_;
+  use_fused_terminal_dot_ =
+    parse_sh_fused_terminal_dot(host_model, num_potential_options, potential_options) &&
+    use_terminal_dot_groups_ && use_parallel_back_rows_ && use_float_moments_;
   use_selective_grad_zero_ =
     parse_sh_selective_grad_zero(host_model, num_potential_options, potential_options) &&
     use_compact_serial_product_;
@@ -4434,15 +5222,15 @@ SUS2_SH::SUS2_SH(
   std::vector<int> terminal_moment_flags(alpha_moments_count_, 0);
   std::vector<int> row_scalar_moment_flags(alpha_moments_count_, 0);
   std::vector<int> cg_row_scalar_index(sh_cg_row_count_, -1);
+  std::vector<int> scalar_index_by_moment(alpha_moments_count_, -1);
+  for (int s = 0; s < alpha_scalar_moments_; ++s) {
+    const int moment = host_model.alpha_moment_mapping[s];
+    if (moment >= 0 && moment < alpha_moments_count_) {
+      scalar_index_by_moment[moment] = s;
+    }
+  }
   int terminal_scalar_count = 0;
   if (use_terminal_scalar_fusion_) {
-    std::vector<int> scalar_index_by_moment(alpha_moments_count_, -1);
-    for (int s = 0; s < alpha_scalar_moments_; ++s) {
-      const int moment = host_model.alpha_moment_mapping[s];
-      if (moment >= 0 && moment < alpha_moments_count_) {
-        scalar_index_by_moment[moment] = s;
-      }
-    }
     std::vector<unsigned char> used_as_source(alpha_moments_count_, 0);
     for (int row = 0; row < sh_cg_row_count_; ++row) {
       const SHCGRowHost& cg_row = host_model.cg_rows[row];
@@ -4544,6 +5332,295 @@ SUS2_SH::SUS2_SH(
   use_terminal_dot_groups_ =
     use_terminal_dot_groups_ && use_terminal_dot_rows_ &&
     terminal_dot_row_count > 0;
+  std::vector<unsigned char> fused_terminal_dot_row_flags(sh_cg_row_count_, 0);
+  std::vector<unsigned char> fused_producer_moment_flags(alpha_moments_count_, 0);
+  use_fused_terminal_dot_ = use_fused_terminal_dot_ && use_terminal_dot_groups_;
+  if (use_fused_terminal_dot_) {
+    std::vector<int> row_by_target(alpha_moments_count_, -1);
+    std::vector<std::vector<int>> consumers_by_moment(alpha_moments_count_);
+    for (int row = 0; row < sh_cg_row_count_; ++row) {
+      const SHCGRowHost& cg_row = host_model.cg_rows[row];
+      if (cg_row.target >= 0 && cg_row.target < alpha_moments_count_) {
+        row_by_target[cg_row.target] = row;
+      }
+      for (int t = 0; t < cg_row.term_count; ++t) {
+        const SHCGRowTermHost& term = host_model.cg_row_terms[cg_row.term_begin + t];
+        const int left = cg_row.left_base + term.left_component;
+        const int right = cg_row.right_base + term.right_component;
+        if (left >= 0 && left < alpha_moments_count_) {
+          consumers_by_moment[left].push_back(row);
+        }
+        if (right >= 0 && right < alpha_moments_count_) {
+          consumers_by_moment[right].push_back(row);
+        }
+      }
+    }
+
+    std::vector<unsigned char> candidate_producer(alpha_moments_count_, 0);
+    for (int row = 0; row < sh_cg_row_count_; ++row) {
+      const SHCGRowHost& cg_row = host_model.cg_rows[row];
+      const int target = cg_row.target;
+      if (target < 0 || target >= alpha_moments_count_ ||
+          scalar_index_by_moment[target] >= 0 ||
+          terminal_moment_flags[target] != 0 ||
+          consumers_by_moment[target].empty()) {
+        continue;
+      }
+      bool only_terminal_dot = true;
+      for (size_t c = 0; c < consumers_by_moment[target].size(); ++c) {
+        const int consumer = consumers_by_moment[target][c];
+        if (consumer < 0 || consumer >= sh_cg_row_count_ ||
+            dot_rows[static_cast<size_t>(consumer) * 3 + 1] == 0u) {
+          only_terminal_dot = false;
+          break;
+        }
+      }
+      if (only_terminal_dot) {
+        candidate_producer[target] = 1;
+      }
+    }
+
+    auto full_candidate_vector = [&](int base, int count) {
+      if (base < 0 || count <= 0 || base + count > alpha_moments_count_) {
+        return false;
+      }
+      for (int c = 0; c < count; ++c) {
+        if (candidate_producer[base + c] == 0 ||
+            row_by_target[base + c] < 0) {
+          return false;
+        }
+      }
+      return true;
+    };
+
+    struct FusedEntryHost {
+      int other0 = 0;
+      int scalar_index = 0;
+      float coeff = 0.0f;
+      int other_producer = -1;
+    };
+    typedef std::pair<int, int> ProducerKey;
+    typedef std::pair<int, int> FusedGroupKey;
+    std::map<ProducerKey, int> producer_lookup;
+    std::vector<ProducerKey> producers;
+    std::vector<std::vector<std::pair<int, float>>> producer_component_terms;
+    auto producer_id_for = [&](int base, int dot_count) {
+      const ProducerKey key(base, dot_count);
+      std::map<ProducerKey, int>::const_iterator found = producer_lookup.find(key);
+      if (found != producer_lookup.end()) {
+        return found->second;
+      }
+      const int producer_id = static_cast<int>(producers.size());
+      producer_lookup[key] = producer_id;
+      producers.push_back(key);
+      for (int c = 0; c < dot_count; ++c) {
+        fused_producer_moment_flags[base + c] = 1;
+        const int row = row_by_target[base + c];
+        std::vector<std::pair<int, float>> terms;
+        const SHCGRowHost& cg_row = host_model.cg_rows[row];
+        terms.reserve(cg_row.term_count);
+        for (int t = 0; t < cg_row.term_count; ++t) {
+          const SHCGRowTermHost& term =
+            host_model.cg_row_terms[cg_row.term_begin + t];
+          const int left = cg_row.left_base + term.left_component;
+          const int right = cg_row.right_base + term.right_component;
+          if (left < 0 || left > 0xffff || right < 0 || right > 0xffff) {
+            use_fused_terminal_dot_ = false;
+            break;
+          }
+          const int packed_lr = left | (right << 16);
+          terms.push_back(std::make_pair(packed_lr, static_cast<float>(term.coeff)));
+        }
+        producer_component_terms.push_back(terms);
+      }
+      return producer_id;
+    };
+
+    std::vector<std::map<FusedGroupKey, std::vector<FusedEntryHost>>> fused_by_layer(
+      static_cast<size_t>(sh_cg_layer_count_) + 1);
+    for (int row = 0; row < sh_cg_row_count_ && use_fused_terminal_dot_; ++row) {
+      const unsigned int dot_count_u32 = dot_rows[static_cast<size_t>(row) * 3 + 1];
+      if (dot_count_u32 == 0u) {
+        continue;
+      }
+      const int dot_count = static_cast<int>(dot_count_u32);
+      const int layer = host_model.cg_rows[row].layer;
+      const int scalar_index = cg_row_scalar_index[row];
+      const unsigned int dot0 = dot_rows[static_cast<size_t>(row) * 3 + 0];
+      const int left0 = static_cast<int>(dot0 & 0xffffu);
+      const int right0 = static_cast<int>(dot0 >> 16);
+      if (layer <= 0 || layer > sh_cg_layer_count_ ||
+          dot_count <= 0 || dot_count > kSHTerminalDotGroupMaxCount ||
+          scalar_index < 0 || scalar_index > 0xffff) {
+        use_fused_terminal_dot_ = false;
+        break;
+      }
+      const bool left_full = full_candidate_vector(left0, dot_count);
+      const bool right_full = full_candidate_vector(right0, dot_count);
+      if (!left_full && !right_full) {
+        continue;
+      }
+      const bool choose_left = left_full;
+      const int producer0 = choose_left ? left0 : right0;
+      const int other0 = choose_left ? right0 : left0;
+      const bool other_full = choose_left ? right_full : left_full;
+      const int producer_id = producer_id_for(producer0, dot_count);
+      const int other_producer_id = other_full ? producer_id_for(other0, dot_count) : -1;
+      FusedEntryHost entry;
+      entry.other0 = other0;
+      entry.scalar_index = scalar_index;
+      float entry_coeff = 0.0f;
+      std::memcpy(&entry_coeff, &dot_rows[static_cast<size_t>(row) * 3 + 2],
+                  sizeof(entry_coeff));
+      if (use_terminal_dot_premul_) {
+        entry_coeff *= static_cast<float>(host_model.moment_coeffs[scalar_index]);
+      }
+      entry.coeff = entry_coeff;
+      entry.other_producer = other_producer_id;
+      fused_by_layer[static_cast<size_t>(layer)][FusedGroupKey(producer_id, dot_count)].push_back(
+        entry);
+      fused_terminal_dot_row_flags[row] = 1;
+    }
+
+    if (use_fused_terminal_dot_) {
+      bool valid_fused = !producers.empty();
+      for (int moment = 0; moment < alpha_moments_count_ && valid_fused; ++moment) {
+        if (fused_producer_moment_flags[moment] == 0) {
+          continue;
+        }
+        for (size_t c = 0; c < consumers_by_moment[moment].size(); ++c) {
+          const int consumer = consumers_by_moment[moment][c];
+          if (consumer < 0 || consumer >= sh_cg_row_count_ ||
+              fused_terminal_dot_row_flags[consumer] == 0) {
+            valid_fused = false;
+            break;
+          }
+        }
+      }
+      if (valid_fused) {
+        std::vector<unsigned int> group_headers;
+        std::vector<unsigned int> entries;
+        for (int layer = 1; layer <= sh_cg_layer_count_; ++layer) {
+          const std::map<FusedGroupKey, std::vector<FusedEntryHost>>& groups =
+            fused_by_layer[static_cast<size_t>(layer)];
+          for (std::map<FusedGroupKey, std::vector<FusedEntryHost>>::const_iterator it =
+                 groups.begin();
+               it != groups.end();
+               ++it) {
+            const int producer_id = it->first.first;
+            const int dot_count = it->first.second;
+            const int entry_begin = static_cast<int>(entries.size() / 3);
+            const int entry_count = static_cast<int>(it->second.size());
+            if (producer_id < 0 || producer_id > 0xffff || dot_count <= 0 ||
+                dot_count > 0xffff || entry_count <= 0) {
+              valid_fused = false;
+              break;
+            }
+            group_headers.push_back(
+              static_cast<unsigned int>(producer_id) |
+              (static_cast<unsigned int>(dot_count) << 16));
+            group_headers.push_back(static_cast<unsigned int>(entry_begin));
+            group_headers.push_back(static_cast<unsigned int>(entry_count));
+            for (size_t e = 0; e < it->second.size(); ++e) {
+              const FusedEntryHost& entry = it->second[e];
+              if (entry.other0 < 0 || entry.other0 > 0xffff ||
+                  entry.scalar_index < 0 || entry.scalar_index > 0xffff) {
+                valid_fused = false;
+                break;
+              }
+              unsigned int coeff_bits = 0u;
+              std::memcpy(&coeff_bits, &entry.coeff, sizeof(coeff_bits));
+              entries.push_back(
+                static_cast<unsigned int>(entry.other0) |
+                (static_cast<unsigned int>(entry.scalar_index) << 16));
+              entries.push_back(coeff_bits);
+              entries.push_back(
+                entry.other_producer >= 0
+                ? static_cast<unsigned int>(entry.other_producer)
+                : 0xffffffffu);
+            }
+            if (!valid_fused) {
+              break;
+            }
+          }
+          if (!valid_fused) {
+            break;
+          }
+        }
+        std::vector<unsigned int> producer_headers;
+        std::vector<unsigned int> component_headers;
+        std::vector<unsigned int> producer_terms;
+        int component_cursor = 0;
+        int term_cursor = 0;
+        for (size_t p = 0; p < producers.size() && valid_fused; ++p) {
+          const int base = producers[p].first;
+          const int dot_count = producers[p].second;
+          if (base < 0 || base > 0xffff || dot_count <= 0 || dot_count > 0xffff) {
+            valid_fused = false;
+            break;
+          }
+          producer_headers.push_back(
+            static_cast<unsigned int>(base) |
+            (static_cast<unsigned int>(dot_count) << 16));
+          producer_headers.push_back(static_cast<unsigned int>(component_cursor));
+          producer_headers.push_back(0u);
+          for (int c = 0; c < dot_count; ++c) {
+            const std::vector<std::pair<int, float>>& terms =
+              producer_component_terms[static_cast<size_t>(component_cursor)];
+            component_headers.push_back(static_cast<unsigned int>(term_cursor));
+            component_headers.push_back(static_cast<unsigned int>(terms.size()));
+            for (size_t t = 0; t < terms.size(); ++t) {
+              unsigned int coeff_bits = 0u;
+              std::memcpy(&coeff_bits, &terms[t].second, sizeof(coeff_bits));
+              producer_terms.push_back(static_cast<unsigned int>(terms[t].first));
+              producer_terms.push_back(coeff_bits);
+              ++term_cursor;
+            }
+            ++component_cursor;
+          }
+        }
+        if (valid_fused) {
+          sh_fused_terminal_dot_group_count_ =
+            static_cast<int>(group_headers.size() / 3);
+          sh_fused_terminal_dot_group_entry_count_ =
+            static_cast<int>(entries.size() / 3);
+          sh_fused_terminal_dot_producer_count_ =
+            static_cast<int>(producer_headers.size() / 3);
+          sh_fused_terminal_dot_component_count_ =
+            static_cast<int>(component_headers.size() / 2);
+          sh_fused_terminal_dot_term_count_ =
+            static_cast<int>(producer_terms.size() / 2);
+          std::vector<unsigned int> packed_fused;
+          packed_fused.reserve(
+            group_headers.size() + entries.size() + producer_headers.size() +
+            component_headers.size() + producer_terms.size());
+          packed_fused.insert(packed_fused.end(), group_headers.begin(), group_headers.end());
+          packed_fused.insert(packed_fused.end(), entries.begin(), entries.end());
+          packed_fused.insert(
+            packed_fused.end(), producer_headers.begin(), producer_headers.end());
+          packed_fused.insert(
+            packed_fused.end(), component_headers.begin(), component_headers.end());
+          packed_fused.insert(packed_fused.end(), producer_terms.begin(), producer_terms.end());
+          sh_fused_terminal_dot_u32_.resize(packed_fused.size());
+          if (!packed_fused.empty()) {
+            sh_fused_terminal_dot_u32_.copy_from_host(packed_fused.data());
+          }
+        }
+      } else {
+        use_fused_terminal_dot_ = false;
+      }
+    }
+  }
+  if (!use_fused_terminal_dot_) {
+    sh_fused_terminal_dot_group_count_ = 0;
+    sh_fused_terminal_dot_group_entry_count_ = 0;
+    sh_fused_terminal_dot_producer_count_ = 0;
+    sh_fused_terminal_dot_component_count_ = 0;
+    sh_fused_terminal_dot_term_count_ = 0;
+    sh_fused_terminal_dot_u32_.resize(0);
+    std::fill(fused_terminal_dot_row_flags.begin(), fused_terminal_dot_row_flags.end(), 0);
+    std::fill(fused_producer_moment_flags.begin(), fused_producer_moment_flags.end(), 0);
+  }
   if (use_terminal_dot_groups_) {
     typedef std::pair<int, int> DotGroupKey;
     typedef std::vector<std::map<DotGroupKey, std::vector<std::array<unsigned int, 2>>>>
@@ -4554,6 +5631,9 @@ SUS2_SH::SUS2_SH(
       static_cast<size_t>(sh_cg_layer_count_) + 1);
     bool valid_dot_groups = true;
     for (int row = 0; row < sh_cg_row_count_ && valid_dot_groups; ++row) {
+      if (use_fused_terminal_dot_ && fused_terminal_dot_row_flags[row] != 0) {
+        continue;
+      }
       const unsigned int dot_count_u32 = dot_rows[static_cast<size_t>(row) * 3 + 1];
       if (dot_count_u32 == 0u) {
         continue;
@@ -4676,6 +5756,7 @@ SUS2_SH::SUS2_SH(
   if (!use_terminal_dot_groups_) {
     use_terminal_dot_row_list_ = false;
     use_terminal_dot_premul_ = false;
+    use_fused_terminal_dot_ = false;
     sh_terminal_dot_group_count_ = 0;
     sh_terminal_dot_group_entry_count_ = 0;
     sh_terminal_dot_group_u32_.resize(0);
@@ -4683,6 +5764,14 @@ SUS2_SH::SUS2_SH(
     sh_terminal_dot_nondot_row_count_ = 0;
     sh_terminal_dot_nondot_rows_.resize(0);
     sh_terminal_dot_nondot_layer_offsets_.resize(0);
+    sh_fused_terminal_dot_group_count_ = 0;
+    sh_fused_terminal_dot_group_entry_count_ = 0;
+    sh_fused_terminal_dot_producer_count_ = 0;
+    sh_fused_terminal_dot_component_count_ = 0;
+    sh_fused_terminal_dot_term_count_ = 0;
+    sh_fused_terminal_dot_u32_.resize(0);
+    std::fill(fused_terminal_dot_row_flags.begin(), fused_terminal_dot_row_flags.end(), 0);
+    std::fill(fused_producer_moment_flags.begin(), fused_producer_moment_flags.end(), 0);
   } else if (use_terminal_dot_row_list_) {
     std::vector<int> nondot_layer_offsets(static_cast<size_t>(sh_cg_layer_count_) + 2, 0);
     std::vector<int> nondot_rows;
@@ -4692,7 +5781,11 @@ SUS2_SH::SUS2_SH(
       const int row_begin = host_model.cg_layer_offsets[layer];
       const int row_end = host_model.cg_layer_offsets[layer + 1];
       for (int row = row_begin; row < row_end; ++row) {
-        if (dot_rows[static_cast<size_t>(row) * 3 + 1] == 0u) {
+        const int target = host_model.cg_rows[row].target;
+        const bool fused_producer =
+          use_fused_terminal_dot_ && target >= 0 && target < alpha_moments_count_ &&
+          fused_producer_moment_flags[target] != 0;
+        if (dot_rows[static_cast<size_t>(row) * 3 + 1] == 0u && !fused_producer) {
           nondot_rows.push_back(row);
         }
       }
@@ -4947,7 +6040,10 @@ SUS2_SH::SUS2_SH(
         const bool skip_terminal =
           use_terminal_scalar_fusion_ && term.target >= 0 &&
           term.target < alpha_moments_count_ && terminal_moment_flags[term.target];
-        if (skip_terminal) {
+        const bool skip_fused_producer =
+          use_fused_terminal_dot_ && term.target >= 0 &&
+          term.target < alpha_moments_count_ && fused_producer_moment_flags[term.target] != 0;
+        if (skip_terminal || skip_fused_producer) {
           ++removed_terminal_back_terms;
           continue;
         }
@@ -5187,7 +6283,7 @@ SUS2_SH::SUS2_SH(
     alpha_scalar_moments_,
     rc);
   printf(
-    "SUS2-SH GPUMD precision mode: %s; force self-buffer: %s; force basic-grad cache: %s; static basic: %s; static force: %s; terminal scalar fusion: %s; terminal dot rows: %s; terminal dot groups: %s; terminal dot premul: %s; terminal dot row-list: %s; selective grad zero: %s; product basic cache: %s; row scalar fusion: %s; cg-block forward: %s; compact serial product: %s; product pattern rows: %s; const pattern rows: %s; parallel back rows: %s; packed back rows: %s; const forward rows: %s; const back rows: %s; tensor-product parallel: %s; tensor grid cap=%d.\n",
+    "SUS2-SH GPUMD precision mode: %s; force self-buffer: %s; force basic-grad cache: %s; static basic: %s; static force: %s; terminal scalar fusion: %s; terminal dot rows: %s; terminal dot groups: %s; terminal dot premul: %s; terminal dot row-list: %s; fused terminal dot: %s; selective grad zero: %s; product basic cache: %s; row scalar fusion: %s; cg-block forward: %s; compact serial product: %s; product pattern rows: %s; const pattern rows: %s; parallel back rows: %s; packed back rows: %s; const forward rows: %s; const back rows: %s; tensor-product parallel: %s; tensor grid cap=%d.\n",
     use_float_moments_ ? "NEP-like float moments/gradients/local arithmetic" : "double moments/local arithmetic",
     use_force_self_buffer_ ? "on" : "off",
     use_force_grad_cache_ ? "on" : "off",
@@ -5198,6 +6294,7 @@ SUS2_SH::SUS2_SH(
     use_terminal_dot_groups_ ? "on" : "off",
     use_terminal_dot_premul_ ? "on" : "off",
     use_terminal_dot_row_list_ ? "on" : "off",
+    use_fused_terminal_dot_ ? "on" : "off",
     use_selective_grad_zero_ ? "on" : "off",
     use_product_basic_cache_ ? "on" : "off",
     use_row_scalar_fusion_ ? "on" : "off",
@@ -5212,7 +6309,8 @@ SUS2_SH::SUS2_SH(
     use_tensor_product_parallel_ ? "on" : "off",
     tensor_product_grid_cap_);
   printf(
-    "SUS2-SH standard CG graph verified: tensor_blocks=%d, cg_blocks=%d, cg_terms=%d, cg_rows=%d, cg_row_terms=%d, cg_back_rows=%d, cg_back_terms=%d, layers=%d.\n",
+    "SUS2-SH graph metadata: mode=%s, tensor_blocks=%d, cg_blocks=%d, cg_terms=%d, cg_rows=%d, cg_row_terms=%d, cg_back_rows=%d, cg_back_terms=%d, layers=%d.\n",
+    host_model.sh_standard_graph_matched ? "standard" : "explicit",
     host_model.sh_standard_tensor_blocks,
     host_model.sh_standard_cg_blocks,
     host_model.sh_standard_cg_terms,
@@ -5253,6 +6351,15 @@ SUS2_SH::SUS2_SH(
       terminal_dot_group_cached_components,
       use_terminal_dot_row_list_ ? "on" : "off",
       sh_terminal_dot_nondot_row_count_);
+  }
+  if (use_fused_terminal_dot_) {
+    printf(
+      "SUS2-SH fused terminal dot: groups=%d, entries=%d, producers=%d, components=%d, producer_terms=%d.\n",
+      sh_fused_terminal_dot_group_count_,
+      sh_fused_terminal_dot_group_entry_count_,
+      sh_fused_terminal_dot_producer_count_,
+      sh_fused_terminal_dot_component_count_,
+      sh_fused_terminal_dot_term_count_);
   }
   if (use_selective_grad_zero_) {
     printf(
@@ -5465,6 +6572,11 @@ void SUS2_SH::compute(
     sh_terminal_dot_group_count_,
     sh_terminal_dot_group_entry_count_,
     sh_terminal_dot_nondot_row_count_,
+    sh_fused_terminal_dot_group_count_,
+    sh_fused_terminal_dot_group_entry_count_,
+    sh_fused_terminal_dot_producer_count_,
+    sh_fused_terminal_dot_component_count_,
+    sh_fused_terminal_dot_term_count_,
     alpha_moments_count_,
     alpha_scalar_moments_,
     active_scalar_moments_,
@@ -5496,6 +6608,7 @@ void SUS2_SH::compute(
     use_terminal_dot_groups_ ? sh_terminal_dot_group_layer_offsets_.data() : nullptr,
     use_terminal_dot_row_list_ ? sh_terminal_dot_nondot_rows_.data() : nullptr,
     use_terminal_dot_row_list_ ? sh_terminal_dot_nondot_layer_offsets_.data() : nullptr,
+    use_fused_terminal_dot_ ? sh_fused_terminal_dot_u32_.data() : nullptr,
     sh_cg_back_rows_int_.data(),
     sh_cg_back_terms_int_.data(),
     sh_cg_back_terms_coeff_.data(),
@@ -5636,6 +6749,20 @@ void SUS2_SH::compute(
         }
       }
       GPU_CHECK_KERNEL
+      if (use_fused_terminal_dot_) {
+        if (use_product_basic_cache_) {
+          launch_sh_fused_terminal_dot_groups_energy<float, float, kSHProductBasicCache>(
+            product_grid_size, kProductBlockSize,
+            num_atoms, model, type.data(), moment_vals_float_.data(), moment_grads_float_.data(),
+            potential.data());
+        } else {
+          launch_sh_fused_terminal_dot_groups_energy<float, float, 0>(
+            product_grid_size, kProductBlockSize,
+            num_atoms, model, type.data(), moment_vals_float_.data(), moment_grads_float_.data(),
+            potential.data());
+        }
+        GPU_CHECK_KERNEL
+      }
       if (product_detail) {
         profile_stop(sh_profile_product_forward, product_forward_start);
       }
