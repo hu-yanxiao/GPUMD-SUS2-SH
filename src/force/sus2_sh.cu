@@ -1,5 +1,6 @@
 #include "sus2_sh.cuh"
 
+#include "sus2_zbl_common.cuh"
 #include "utilities/error.cuh"
 #include "utilities/gpu_macro.cuh"
 #include <thrust/execution_policy.h>
@@ -188,6 +189,11 @@ struct SHHostModel {
   int alpha_scalar_moments = 0;
   double scaling = 1.0;
   double max_dist = 0.0;
+  bool zbl_enabled = false;
+  double zbl_inner = 0.7;
+  double zbl_outer = 1.4;
+  bool zbl_typewise_cutoff_enabled = false;
+  double zbl_typewise_cutoff_factor = 0.7;
   std::string potential_tag;
   std::string radial_basis_type;
   std::string scaling_map;
@@ -197,6 +203,10 @@ struct SHHostModel {
   std::vector<double> radial_type_coeffs;
   std::vector<double> species_coeffs;
   std::vector<double> moment_coeffs;
+  std::vector<int> zbl_atomic_numbers;
+  std::vector<double> zbl_pair_inner_cutoffs;
+  std::vector<double> zbl_pair_outer_cutoffs;
+  std::vector<double> zbl_pair_outer_sq;
   std::vector<int> sh_body_l_max;
   std::vector<int> alpha_basic;
   std::vector<SHProductHost> products;
@@ -270,6 +280,19 @@ int parse_int_after(const std::string& text, const std::string& token)
 double parse_double_after(const std::string& text, const std::string& token)
 {
   return std::stod(parse_string_after(text, token));
+}
+
+int parse_optional_int_after(const std::string& text, const std::string& token, int default_value)
+{
+  return has_token(text, token) ? parse_int_after(text, token) : default_value;
+}
+
+double parse_optional_double_after(
+  const std::string& text,
+  const std::string& token,
+  double default_value)
+{
+  return has_token(text, token) ? parse_double_after(text, token) : default_value;
 }
 
 std::string extract_braced_after(const std::string& text, const std::string& token)
@@ -1971,6 +1994,20 @@ SHHostModel load_sh_model(const std::string& path)
   }
   model.radial_basis_type = parse_string_after(text, "radial_basis_type =");
   model.max_dist = parse_double_after(text, "max_dist =");
+  model.zbl_enabled = parse_optional_int_after(text, "zbl_enabled =", 0) != 0;
+  if (model.zbl_enabled) {
+    model.zbl_inner = parse_optional_double_after(
+      text, "zbl_inner =", sus2_zbl_default_inner_cutoff());
+    model.zbl_outer = parse_optional_double_after(
+      text, "zbl_outer =", sus2_zbl_default_outer_cutoff());
+    model.zbl_typewise_cutoff_enabled = has_token(text, "zbl_typewise_cutoff_factor =");
+    model.zbl_typewise_cutoff_factor = parse_optional_double_after(
+      text, "zbl_typewise_cutoff_factor =", sus2_zbl_default_typewise_cutoff_factor());
+    if (has_token(text, "zbl_atomic_numbers =")) {
+      model.zbl_atomic_numbers =
+        parse_numbers<int>(extract_braced_after(text, "zbl_atomic_numbers ="));
+    }
+  }
   model.rb_size = parse_int_after(text, "radial_basis_size =");
   model.radial_funcs_count = parse_int_after(text, "radial_funcs_count =");
   model.alpha_moments_count = parse_int_after(text, "alpha_moments_count =");
@@ -2233,6 +2270,11 @@ struct SHDeviceModel {
   const int* alpha_moment_mapping;
   const float* radial_direct_coeffs;
   const float* radial_direct_scal_s;
+  bool zbl_enabled;
+  const int* zbl_atomic_numbers;
+  const double* zbl_pair_inner_cutoffs;
+  const double* zbl_pair_outer_cutoffs;
+  const double* zbl_pair_outer_sq;
   bool use_float_model_params;
   bool use_const_forward_rows;
   bool use_product_pattern_rows;
@@ -4829,6 +4871,113 @@ bool launch_sh_compute_forces_static(
   return false;
 }
 
+static __global__ void gpu_sh_apply_zbl(
+  int N,
+  Box box,
+  bool use_cached_displacements,
+  SHDeviceModel model,
+  const int* type,
+  const int* neighbor_count,
+  const int* neighbor_atoms,
+  const double* neighbor_dx,
+  const double* neighbor_dy,
+  const double* neighbor_dz,
+  const double* x,
+  const double* y,
+  const double* z,
+  double* potential,
+  float* force_tmp,
+  float* virial_tmp)
+{
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= N || !model.zbl_enabled) {
+    return;
+  }
+
+  const int type_i = type[i];
+  if (type_i < 0 || type_i >= model.species_count) {
+    return;
+  }
+  const int Zi = model.zbl_atomic_numbers[type_i];
+  const int count = neighbor_count[i];
+  double zbl_energy = 0.0;
+  double fx_self = 0.0;
+  double fy_self = 0.0;
+  double fz_self = 0.0;
+  double s_xx = 0.0;
+  double s_yy = 0.0;
+  double s_zz = 0.0;
+  double s_xy = 0.0;
+  double s_xz = 0.0;
+  double s_yz = 0.0;
+  double s_yx = 0.0;
+  double s_zx = 0.0;
+  double s_zy = 0.0;
+
+  for (int nbr = 0; nbr < count; ++nbr) {
+    const size_t edge = static_cast<size_t>(nbr) * N + i;
+    const int j = neighbor_atoms[edge];
+    const int type_j = type[j];
+    if (type_j < 0 || type_j >= model.species_count) {
+      continue;
+    }
+    double dx;
+    double dy;
+    double dz;
+    load_sh_edge_displacement(
+      use_cached_displacements, N, box, edge, i, j, neighbor_dx, neighbor_dy, neighbor_dz,
+      x, y, z, dx, dy, dz);
+    const double r2 = dx * dx + dy * dy + dz * dz;
+    const int pair = type_i * model.species_count + type_j;
+    if (r2 <= 0.0 || r2 >= model.zbl_pair_outer_sq[pair]) {
+      continue;
+    }
+    const double r = sqrt(r2);
+    const int Zj = model.zbl_atomic_numbers[type_j];
+    const SUS2ZBLPairValue zbl = sus2_zbl_pair(
+      Zi, Zj, r, model.zbl_pair_inner_cutoffs[pair], model.zbl_pair_outer_cutoffs[pair]);
+    if (zbl.energy == 0.0 && zbl.dEdr == 0.0) {
+      continue;
+    }
+
+    const double scale = 0.5 * zbl.dEdr / r;
+    const double dEx = scale * dx;
+    const double dEy = scale * dy;
+    const double dEz = scale * dz;
+    zbl_energy += 0.5 * zbl.energy;
+    fx_self += dEx;
+    fy_self += dEy;
+    fz_self += dEz;
+    atomicAdd(force_tmp + j, static_cast<float>(-dEx));
+    atomicAdd(force_tmp + j + N, static_cast<float>(-dEy));
+    atomicAdd(force_tmp + j + 2 * N, static_cast<float>(-dEz));
+
+    s_xx -= dEx * dx;
+    s_yy -= dEy * dy;
+    s_zz -= dEz * dz;
+    s_xy -= dx * dEy;
+    s_xz -= dx * dEz;
+    s_yz -= dy * dEz;
+    s_yx -= dy * dEx;
+    s_zx -= dz * dEx;
+    s_zy -= dz * dEy;
+  }
+
+  potential[i] += zbl_energy;
+  atomicAdd(force_tmp + i, static_cast<float>(fx_self));
+  atomicAdd(force_tmp + i + N, static_cast<float>(fy_self));
+  atomicAdd(force_tmp + i + 2 * N, static_cast<float>(fz_self));
+  virial_tmp[i + 0 * N] += static_cast<float>(s_xx);
+  virial_tmp[i + 1 * N] += static_cast<float>(s_yy);
+  virial_tmp[i + 2 * N] += static_cast<float>(s_zz);
+  virial_tmp[i + 3 * N] += static_cast<float>(s_xy);
+  virial_tmp[i + 4 * N] += static_cast<float>(s_xz);
+  virial_tmp[i + 5 * N] += static_cast<float>(s_yz);
+  virial_tmp[i + 6 * N] += static_cast<float>(s_yx);
+  virial_tmp[i + 7 * N] += static_cast<float>(s_zx);
+  virial_tmp[i + 8 * N] += static_cast<float>(s_zy);
+}
+
 static __global__ void gpu_accumulate_float_to_double(
   int N,
   const float* force_tmp,
@@ -4991,7 +5140,7 @@ SUS2_SH::SUS2_SH(
   for (int i = 0; i < sh_profile_count; ++i) {
     profile_ms_[i] = 0.0;
   }
-  const SHHostModel host_model = load_sh_model(file_potential);
+  SHHostModel host_model = load_sh_model(file_potential);
   species_count_ = host_model.species_count;
   sh_l_max_ = host_model.sh_l_max;
   sh_k_max_ = host_model.sh_k_max;
@@ -5009,6 +5158,44 @@ SUS2_SH::SUS2_SH(
   alpha_moments_count_ = host_model.alpha_moments_count;
   alpha_scalar_moments_ = host_model.alpha_scalar_moments;
   rc = host_model.max_dist;
+  neighbor_cutoff_ = rc;
+  if (host_model.zbl_enabled) {
+    if (host_model.zbl_atomic_numbers.empty()) {
+      if (num_potential_options < host_model.species_count) {
+        sh_input_error(
+          "SUS2_SH ZBL model requires zbl_atomic_numbers metadata or element symbols after the model file.");
+      }
+      host_model.zbl_atomic_numbers.resize(host_model.species_count);
+      for (int t = 0; t < host_model.species_count; ++t) {
+        const std::string symbol = potential_options[t] == nullptr ? "" : potential_options[t];
+        const int atomic_number = sus2_zbl_atomic_number_from_symbol(symbol);
+        if (atomic_number <= 0) {
+          sh_input_error("SUS2_SH ZBL cannot map element symbol to an atomic number: " + symbol);
+        }
+        host_model.zbl_atomic_numbers[t] = atomic_number;
+      }
+    }
+    if (static_cast<int>(host_model.zbl_atomic_numbers.size()) != host_model.species_count) {
+      sh_input_error("SUS2_SH ZBL metadata should provide one atomic number per species.");
+    }
+    std::string zbl_error;
+    if (!sus2_zbl_fill_pair_cutoff_tables(
+          host_model.zbl_atomic_numbers,
+          host_model.zbl_inner,
+          host_model.zbl_outer,
+          host_model.zbl_typewise_cutoff_enabled,
+          host_model.zbl_typewise_cutoff_enabled ? host_model.zbl_typewise_cutoff_factor : 0.0,
+          host_model.zbl_pair_inner_cutoffs,
+          host_model.zbl_pair_outer_cutoffs,
+          host_model.zbl_pair_outer_sq,
+          &zbl_error)) {
+      sh_input_error("SUS2_SH ZBL metadata error: " + zbl_error);
+    }
+    zbl_outer_max_ = *std::max_element(
+      host_model.zbl_pair_outer_cutoffs.begin(), host_model.zbl_pair_outer_cutoffs.end());
+    zbl_enabled_ = true;
+    neighbor_cutoff_ = std::max(rc, zbl_outer_max_);
+  }
   use_float_moments_ = parse_sh_float(host_model, num_potential_options, potential_options);
   use_radial_direct_ =
     parse_sh_radial_direct(host_model, num_potential_options, potential_options);
@@ -6265,10 +6452,20 @@ SUS2_SH::SUS2_SH(
   radial_direct_scal_s_.resize(radial_scal_s.size());
   radial_direct_coeffs_.copy_from_host(radial_coeffs.data());
   radial_direct_scal_s_.copy_from_host(radial_scal_s.data());
+  if (zbl_enabled_) {
+    zbl_atomic_numbers_.resize(host_model.zbl_atomic_numbers.size());
+    zbl_pair_inner_cutoffs_.resize(host_model.zbl_pair_inner_cutoffs.size());
+    zbl_pair_outer_cutoffs_.resize(host_model.zbl_pair_outer_cutoffs.size());
+    zbl_pair_outer_sq_.resize(host_model.zbl_pair_outer_sq.size());
+    zbl_atomic_numbers_.copy_from_host(host_model.zbl_atomic_numbers.data());
+    zbl_pair_inner_cutoffs_.copy_from_host(host_model.zbl_pair_inner_cutoffs.data());
+    zbl_pair_outer_cutoffs_.copy_from_host(host_model.zbl_pair_outer_cutoffs.data());
+    zbl_pair_outer_sq_.copy_from_host(host_model.zbl_pair_outer_sq.data());
+  }
 
   neighbor_count_.resize(num_atoms);
   cell_contents_.resize(num_atoms);
-  neighbor_cache_.initialize(rc, num_atoms, 512);
+  neighbor_cache_.initialize(neighbor_cutoff_, num_atoms, 512);
   resize_work_buffers(num_atoms);
 
   printf(
@@ -6282,6 +6479,15 @@ SUS2_SH::SUS2_SH(
     alpha_moments_count_,
     alpha_scalar_moments_,
     rc);
+  if (zbl_enabled_) {
+    printf(
+      "SUS2-SH GPUMD ZBL enabled: inner=%g A, outer=%g A, typewise_cutoff=%s, typewise_factor=%g, neighbor_cutoff=%g A.\n",
+      host_model.zbl_typewise_cutoff_enabled ? 0.0 : host_model.zbl_inner,
+      host_model.zbl_outer,
+      host_model.zbl_typewise_cutoff_enabled ? "on" : "off",
+      host_model.zbl_typewise_cutoff_factor,
+      neighbor_cutoff_);
+  }
   printf(
     "SUS2-SH GPUMD precision mode: %s; force self-buffer: %s; force basic-grad cache: %s; static basic: %s; static force: %s; terminal scalar fusion: %s; terminal dot rows: %s; terminal dot groups: %s; terminal dot premul: %s; terminal dot row-list: %s; fused terminal dot: %s; selective grad zero: %s; product basic cache: %s; row scalar fusion: %s; cg-block forward: %s; compact serial product: %s; product pattern rows: %s; const pattern rows: %s; parallel back rows: %s; packed back rows: %s; const forward rows: %s; const back rows: %s; tensor-product parallel: %s; tensor grid cap=%d.\n",
     use_float_moments_ ? "NEP-like float moments/gradients/local arithmetic" : "double moments/local arithmetic",
@@ -6422,17 +6628,18 @@ void SUS2_SH::build_neighbor_list(
   const double* x = position.data();
   const double* y = position.data() + num_atoms;
   const double* z = position.data() + num_atoms * 2;
-  const double cutoff_square = rc * rc;
+  const double cutoff_square = neighbor_cutoff_ * neighbor_cutoff_;
   const double volume = box.get_volume();
   box.thickness_x = volume / box.get_area(0);
   box.thickness_y = volume / box.get_area(1);
   box.thickness_z = volume / box.get_area(2);
-  const int sx_range = periodic_image_range(box.pbc_x, rc, box.thickness_x);
-  const int sy_range = periodic_image_range(box.pbc_y, rc, box.thickness_y);
-  const int sz_range = periodic_image_range(box.pbc_z, rc, box.thickness_z);
+  const int sx_range = periodic_image_range(box.pbc_x, neighbor_cutoff_, box.thickness_x);
+  const int sy_range = periodic_image_range(box.pbc_y, neighbor_cutoff_, box.thickness_y);
+  const int sz_range = periodic_image_range(box.pbc_z, neighbor_cutoff_, box.thickness_z);
   const bool needs_multi_image =
-    (box.pbc_x && box.thickness_x < 2.0 * rc) || (box.pbc_y && box.thickness_y < 2.0 * rc) ||
-    (box.pbc_z && box.thickness_z < 2.0 * rc);
+    (box.pbc_x && box.thickness_x < 2.0 * neighbor_cutoff_) ||
+    (box.pbc_y && box.thickness_y < 2.0 * neighbor_cutoff_) ||
+    (box.pbc_z && box.thickness_z < 2.0 * neighbor_cutoff_);
 
   if (!needs_multi_image) {
     use_cached_neighbor_displacements_ = false;
@@ -6440,8 +6647,9 @@ void SUS2_SH::build_neighbor_list(
     if (neighbor_atom_.size() != edge_capacity) {
       neighbor_atom_.resize(edge_capacity);
     }
-    neighbor_cache_.find_neighbor_global(rc, box, type, position);
-    neighbor_cache_.find_local_neighbor_from_global(rc, box, position, neighbor_count_, neighbor_atom_);
+    neighbor_cache_.find_neighbor_global(neighbor_cutoff_, box, type, position);
+    neighbor_cache_.find_local_neighbor_from_global(
+      neighbor_cutoff_, box, position, neighbor_count_, neighbor_atom_);
     return;
   }
 
@@ -6622,6 +6830,11 @@ void SUS2_SH::compute(
     alpha_moment_mapping_.data(),
     radial_direct_coeffs_.data(),
     radial_direct_scal_s_.data(),
+    zbl_enabled_,
+    zbl_enabled_ ? zbl_atomic_numbers_.data() : nullptr,
+    zbl_enabled_ ? zbl_pair_inner_cutoffs_.data() : nullptr,
+    zbl_enabled_ ? zbl_pair_outer_cutoffs_.data() : nullptr,
+    zbl_enabled_ ? zbl_pair_outer_sq_.data() : nullptr,
     use_float_moments_,
     use_const_forward_rows_,
     use_product_pattern_rows_,
@@ -6994,6 +7207,17 @@ void SUS2_SH::compute(
         position.data() + 2 * num_atoms, moment_grads_.data(), force_tmp_.data(),
         force_self_tmp_ptr, virial_tmp_.data());
     }
+    GPU_CHECK_KERNEL
+    profile_stop(sh_profile_force, stage_start);
+  }
+
+  if (zbl_enabled_) {
+    stage_start = profile_start();
+    gpu_sh_apply_zbl<<<grid_size, kBlockSize>>>(
+      num_atoms, box, use_cached_neighbor_displacements_, model, type.data(),
+      neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(),
+      neighbor_dz_.data(), position.data(), position.data() + num_atoms,
+      position.data() + 2 * num_atoms, potential.data(), force_tmp_.data(), virial_tmp_.data());
     GPU_CHECK_KERNEL
     profile_stop(sh_profile_force, stage_start);
   }

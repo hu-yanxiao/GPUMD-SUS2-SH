@@ -62,6 +62,9 @@ private:
   int active_scalar_moments_ = 0;
   int neighbor_capacity_ = 512;
   double rc = 0.0;
+  double neighbor_cutoff_ = 0.0;
+  bool zbl_enabled_ = false;
+  double zbl_outer_max_ = 0.0;
   bool use_float_moments_ = true;
   bool use_radial_direct_ = true;
   bool use_force_self_buffer_ = true;
@@ -137,6 +140,10 @@ private:
   GPU_Vector<int> alpha_moment_mapping_;
   GPU_Vector<float> radial_direct_coeffs_;
   GPU_Vector<float> radial_direct_scal_s_;
+  GPU_Vector<int> zbl_atomic_numbers_;
+  GPU_Vector<double> zbl_pair_inner_cutoffs_;
+  GPU_Vector<double> zbl_pair_outer_cutoffs_;
+  GPU_Vector<double> zbl_pair_outer_sq_;
 
   GPU_Vector<int> neighbor_count_;
   GPU_Vector<int> neighbor_atom_;

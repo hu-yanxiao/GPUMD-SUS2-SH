@@ -44,12 +44,17 @@ The first SH path prioritizes correctness:
 - Default radial evaluation: direct basis recurrence
 - Default precision path: NEP-like float moments/gradients/local arithmetic
 - Default force path: self-force buffer enabled
+- ZBL: disabled unless the model file contains `zbl_enabled = 1`; when present,
+  GPUMD-SUS2-SH reads `zbl_inner`, `zbl_outer`, `zbl_atomic_numbers`, and
+  optional `zbl_typewise_cutoff_factor` from the model and adds the same
+  NEP-style cosine-tapered ZBL contribution used by SUS2-SH/LAMMPS-SH.
 
 ## Core Files
 
 ```text
 src/force/sus2_sh.cu
 src/force/sus2_sh.cuh
+src/force/sus2_zbl_common.cuh
 src/force/force.cu
 src/model/read_xyz.cu
 ```
