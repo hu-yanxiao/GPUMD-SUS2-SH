@@ -2196,7 +2196,9 @@ bool has_static_full_sh_basic_layout(const SHHostModel& model)
   }
   const int expected_count =
     model.sh_k_max * (model.sh_l_max + 1) * (model.sh_l_max + 1);
+  const int expected_radial_funcs = model.sh_k_max * (model.sh_l_max + 1);
   if (model.alpha_basic_count != expected_count ||
+      model.radial_funcs_count != expected_radial_funcs ||
       static_cast<int>(model.alpha_basic.size()) != expected_count * 3) {
     return false;
   }
@@ -2853,6 +2855,14 @@ __device__ __forceinline__ void sh_direct_radial_vals_ders_dynamic(
 }
 
 template <typename RealT, int RadialFuncs, int RbSize>
+__device__ __forceinline__ void sh_laguerre_log1p_radial_vals_ders_static(
+  const SHDeviceModel& model,
+  int pair,
+  RealT r,
+  RealT* vals,
+  RealT* ders);
+
+template <typename RealT, int RadialFuncs, int RbSize>
 __device__ __forceinline__ void sh_direct_radial_vals_ders_static(
   const SHDeviceModel& model,
   int pair,
@@ -2860,6 +2870,12 @@ __device__ __forceinline__ void sh_direct_radial_vals_ders_static(
   RealT* vals,
   RealT* ders)
 {
+  if (model.radial_basis_kind == static_cast<int>(SHRadialBasisKind::LaguerreLog1p)) {
+    sh_laguerre_log1p_radial_vals_ders_static<RealT, RadialFuncs, RbSize>(
+      model, pair, r, vals, ders);
+    return;
+  }
+
   const RealT dr = r - static_cast<RealT>(model.max_dist);
   const RealT cutoff_f = dr * dr;
   const RealT cutoff_der = static_cast<RealT>(2.0) * dr;
@@ -3022,6 +3038,10 @@ __device__ __forceinline__ void sh_direct_radial_vals_ders(
   RealT* ders)
 {
   if (model.radial_basis_kind == static_cast<int>(SHRadialBasisKind::LaguerreLog1p)) {
+    if (model.radial_funcs_count == 12 && model.rb_size == 10) {
+      sh_laguerre_log1p_radial_vals_ders_static<RealT, 12, 10>(model, pair, r, vals, ders);
+      return;
+    }
     if (model.radial_funcs_count == 20 && model.rb_size == 10) {
       sh_laguerre_log1p_radial_vals_ders_static<RealT, 20, 10>(model, pair, r, vals, ders);
       return;
