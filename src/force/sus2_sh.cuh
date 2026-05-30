@@ -35,6 +35,7 @@ private:
   int species_count_ = 0;
   int sh_l_max_ = 0;
   int sh_k_max_ = 0;
+  int radial_basis_kind_ = 0;
   int radial_funcs_count_ = 0;
   int rb_size_ = 0;
   int alpha_basic_count_ = 0;

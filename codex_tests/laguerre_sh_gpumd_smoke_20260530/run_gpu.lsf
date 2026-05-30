@@ -1,0 +1,27 @@
+#!/bin/bash
+#BSUB -J gpumd_sh_lag_smoke
+#BSUB -q gpu-phy-zhangwq
+#BSUB -n 1
+#BSUB -R "span[hosts=1]"
+#BSUB -gpu "num=1"
+#BSUB -o job.%J.out
+#BSUB -e job.%J.err
+
+set +u
+source /etc/profile 2>/dev/null || true
+module purge
+module load gcc/11.2.0 cuda/12.4
+
+cd /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_tests/laguerre_sh_gpumd_smoke_20260530
+rm -f gpumd.log thermo.out force.out movie.xyz restart.xyz preflight.log exit.code
+date > preflight.log 2>&1
+hostname >> preflight.log 2>&1
+echo "cuda=$(command -v nvcc || true)" >> preflight.log 2>&1
+echo "gpumd=/work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/src/gpumd" >> preflight.log 2>&1
+ls -lh /work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/src/gpumd >> preflight.log 2>&1
+grep -n "radial_basis_type" /work/phy-weigw/hyx/5.28-mof-cl-h2o/lag/current.mtp >> preflight.log 2>&1
+
+/work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/src/gpumd > gpumd.log 2>&1
+status=$?
+echo "$status" > exit.code
+exit "$status"

@@ -39,8 +39,14 @@ constexpr int kSHMaxConstForwardU32 = 16384;
 constexpr int kSHTerminalDotGroupRowTermThreshold = 1000;
 constexpr int kSHTerminalDotGroupMaxCount = 17;
 constexpr double kPi = 3.141592653589793238462643383279502884;
+constexpr double kLaguerreMinRho = 1.0e-8;
 
 __constant__ unsigned int c_sh_forward_u32[kSHMaxConstForwardU32];
+
+enum class SHRadialBasisKind {
+  ChebyshevSSS = 0,
+  LaguerreLog1p = 1
+};
 
 enum SHProfileStage {
   sh_profile_neighbor = 0,
@@ -194,6 +200,7 @@ struct SHHostModel {
   double zbl_outer = 1.4;
   bool zbl_typewise_cutoff_enabled = false;
   double zbl_typewise_cutoff_factor = 0.7;
+  SHRadialBasisKind radial_basis_kind = SHRadialBasisKind::ChebyshevSSS;
   std::string potential_tag;
   std::string radial_basis_type;
   std::string scaling_map;
@@ -293,6 +300,19 @@ double parse_optional_double_after(
   double default_value)
 {
   return has_token(text, token) ? parse_double_after(text, token) : default_value;
+}
+
+SHRadialBasisKind sh_radial_basis_kind_from_string(const std::string& type)
+{
+  if (type == "RBChebyshev_sss" || type == "RBChebyshev_sss_lmp") {
+    return SHRadialBasisKind::ChebyshevSSS;
+  }
+  if (type == "RBLaguerre_log1p" || type == "RBLaguerre_log1p_lmp") {
+    return SHRadialBasisKind::LaguerreLog1p;
+  }
+  sh_input_error(
+    "Unsupported SUS2_SH radial_basis_type in GPUMD: " + type +
+    ". Supported now: RBChebyshev_sss[_lmp], RBLaguerre_log1p[_lmp].");
 }
 
 std::string extract_braced_after(const std::string& text, const std::string& token)
@@ -1993,6 +2013,7 @@ SHHostModel load_sh_model(const std::string& path)
     }
   }
   model.radial_basis_type = parse_string_after(text, "radial_basis_type =");
+  model.radial_basis_kind = sh_radial_basis_kind_from_string(model.radial_basis_type);
   model.max_dist = parse_double_after(text, "max_dist =");
   model.zbl_enabled = parse_optional_int_after(text, "zbl_enabled =", 0) != 0;
   if (model.zbl_enabled) {
@@ -2016,9 +2037,6 @@ SHHostModel load_sh_model(const std::string& path)
 
   if (model.scaling_map != "LK") {
     sh_input_error("SUS2_SH requires scaling_map = LK.");
-  }
-  if (model.radial_basis_type != "RBChebyshev_sss") {
-    sh_input_error("SUS2_SH first GPUMD backend currently supports RBChebyshev_sss only.");
   }
   if (model.sh_l_max < 0 || model.sh_l_max > kMaxSHL) {
     sh_input_error("SUS2_SH supports sh_l_max in [0,6].");
@@ -2204,6 +2222,7 @@ bool has_static_full_sh_basic_layout(const SHHostModel& model)
 struct SHDeviceModel {
   int species_count;
   int sh_l_max;
+  int radial_basis_kind;
   int radial_funcs_count;
   int rb_size;
   int alpha_basic_count;
@@ -2883,6 +2902,118 @@ __device__ __forceinline__ void sh_direct_radial_vals_ders_static(
 }
 
 template <typename RealT>
+__device__ __forceinline__ void sh_laguerre_log1p_radial_vals_ders_dynamic(
+  const SHDeviceModel& model,
+  int pair,
+  RealT r,
+  RealT* vals,
+  RealT* ders)
+{
+  const RealT dr = r - static_cast<RealT>(model.max_dist);
+  const RealT cutoff_f = dr * dr;
+  const RealT cutoff_der = static_cast<RealT>(2.0) * dr;
+  for (int mu = 0; mu < model.radial_funcs_count; ++mu) {
+    const size_t scal_base = (static_cast<size_t>(pair) * model.radial_funcs_count + mu) * 2;
+    const RealT scal = static_cast<RealT>(model.radial_direct_scal_s[scal_base + 0]);
+    RealT rho = static_cast<RealT>(model.radial_direct_scal_s[scal_base + 1]);
+    rho = rho > static_cast<RealT>(kLaguerreMinRho) ? rho : static_cast<RealT>(kLaguerreMinRho);
+
+    const RealT log_term = log1p(r / rho);
+    const RealT u = scal * log_term;
+    const RealT u_r = scal / (rho + r);
+    const RealT exp_factor = exp(static_cast<RealT>(-0.5) * u);
+    const size_t coeff_base = (static_cast<size_t>(pair) * model.radial_funcs_count + mu) * model.rb_size;
+
+    RealT phi_prev = static_cast<RealT>(0.0);
+    RealT dphi_prev = static_cast<RealT>(0.0);
+    RealT phi_curr = cutoff_f * exp_factor;
+    RealT dphi_curr = cutoff_der * exp_factor - static_cast<RealT>(0.5) * u_r * phi_curr;
+    RealT acc_s = static_cast<RealT>(model.radial_direct_coeffs[coeff_base]) * phi_curr;
+    RealT acc_sr = static_cast<RealT>(model.radial_direct_coeffs[coeff_base]) * dphi_curr;
+
+    for (int n = 0; n < model.rb_size - 1; ++n) {
+      const RealT inv_np1 =
+        static_cast<RealT>(1.0) / (static_cast<RealT>(n) + static_cast<RealT>(1.0));
+      const RealT recurrence_coeff =
+        (static_cast<RealT>(2.0 * n + 1.0) - u) * inv_np1;
+      const RealT prev_coeff = static_cast<RealT>(n) * inv_np1;
+      const RealT phi_next = recurrence_coeff * phi_curr - prev_coeff * phi_prev;
+      const RealT dphi_next =
+        -u_r * inv_np1 * phi_curr + recurrence_coeff * dphi_curr - prev_coeff * dphi_prev;
+      const RealT radial_coeff = static_cast<RealT>(model.radial_direct_coeffs[coeff_base + n + 1]);
+      acc_s += radial_coeff * phi_next;
+      acc_sr += radial_coeff * dphi_next;
+      phi_prev = phi_curr;
+      dphi_prev = dphi_curr;
+      phi_curr = phi_next;
+      dphi_curr = dphi_next;
+    }
+
+    vals[mu] = acc_s;
+    if (ders != nullptr) {
+      ders[mu] = acc_sr;
+    }
+  }
+}
+
+template <typename RealT, int RadialFuncs, int RbSize>
+__device__ __forceinline__ void sh_laguerre_log1p_radial_vals_ders_static(
+  const SHDeviceModel& model,
+  int pair,
+  RealT r,
+  RealT* vals,
+  RealT* ders)
+{
+  const RealT dr = r - static_cast<RealT>(model.max_dist);
+  const RealT cutoff_f = dr * dr;
+  const RealT cutoff_der = static_cast<RealT>(2.0) * dr;
+#pragma unroll
+  for (int mu = 0; mu < RadialFuncs; ++mu) {
+    const size_t scal_base = (static_cast<size_t>(pair) * RadialFuncs + mu) * 2;
+    const RealT scal = static_cast<RealT>(model.radial_direct_scal_s[scal_base + 0]);
+    RealT rho = static_cast<RealT>(model.radial_direct_scal_s[scal_base + 1]);
+    rho = rho > static_cast<RealT>(kLaguerreMinRho) ? rho : static_cast<RealT>(kLaguerreMinRho);
+
+    const RealT log_term = log1p(r / rho);
+    const RealT u = scal * log_term;
+    const RealT u_r = scal / (rho + r);
+    const RealT exp_factor = exp(static_cast<RealT>(-0.5) * u);
+    const size_t coeff_base = (static_cast<size_t>(pair) * RadialFuncs + mu) * RbSize;
+
+    RealT phi_prev = static_cast<RealT>(0.0);
+    RealT dphi_prev = static_cast<RealT>(0.0);
+    RealT phi_curr = cutoff_f * exp_factor;
+    RealT dphi_curr = cutoff_der * exp_factor - static_cast<RealT>(0.5) * u_r * phi_curr;
+    RealT acc_s = static_cast<RealT>(model.radial_direct_coeffs[coeff_base]) * phi_curr;
+    RealT acc_sr = static_cast<RealT>(model.radial_direct_coeffs[coeff_base]) * dphi_curr;
+
+#pragma unroll
+    for (int n = 0; n < RbSize - 1; ++n) {
+      const RealT inv_np1 =
+        static_cast<RealT>(1.0) / (static_cast<RealT>(n) + static_cast<RealT>(1.0));
+      const RealT recurrence_coeff =
+        (static_cast<RealT>(2.0 * n + 1.0) - u) * inv_np1;
+      const RealT prev_coeff = static_cast<RealT>(n) * inv_np1;
+      const RealT phi_next = recurrence_coeff * phi_curr - prev_coeff * phi_prev;
+      const RealT dphi_next =
+        -u_r * inv_np1 * phi_curr + recurrence_coeff * dphi_curr - prev_coeff * dphi_prev;
+      const RealT radial_coeff = static_cast<RealT>(model.radial_direct_coeffs[coeff_base + n + 1]);
+      acc_s += radial_coeff * phi_next;
+      acc_sr += radial_coeff * dphi_next;
+      phi_prev = phi_curr;
+      dphi_prev = dphi_curr;
+      phi_curr = phi_next;
+      dphi_curr = dphi_next;
+    }
+
+    vals[mu] = acc_s;
+    if (ders != nullptr) {
+      ders[mu] = acc_sr;
+    }
+  }
+}
+
+template <typename RealT>
 __device__ __forceinline__ void sh_direct_radial_vals_ders(
   const SHDeviceModel& model,
   int pair,
@@ -2890,6 +3021,14 @@ __device__ __forceinline__ void sh_direct_radial_vals_ders(
   RealT* vals,
   RealT* ders)
 {
+  if (model.radial_basis_kind == static_cast<int>(SHRadialBasisKind::LaguerreLog1p)) {
+    if (model.radial_funcs_count == 20 && model.rb_size == 10) {
+      sh_laguerre_log1p_radial_vals_ders_static<RealT, 20, 10>(model, pair, r, vals, ders);
+      return;
+    }
+    sh_laguerre_log1p_radial_vals_ders_dynamic(model, pair, r, vals, ders);
+    return;
+  }
   if (model.radial_funcs_count == 12 && model.rb_size == 10) {
     sh_direct_radial_vals_ders_static<RealT, 12, 10>(model, pair, r, vals, ders);
     return;
@@ -5144,6 +5283,7 @@ SUS2_SH::SUS2_SH(
   species_count_ = host_model.species_count;
   sh_l_max_ = host_model.sh_l_max;
   sh_k_max_ = host_model.sh_k_max;
+  radial_basis_kind_ = static_cast<int>(host_model.radial_basis_kind);
   radial_funcs_count_ = host_model.radial_funcs_count;
   rb_size_ = host_model.rb_size;
   alpha_basic_count_ = host_model.alpha_basic_count;
@@ -6764,6 +6904,7 @@ void SUS2_SH::compute(
   SHDeviceModel model{
     species_count_,
     sh_l_max_,
+    radial_basis_kind_,
     radial_funcs_count_,
     rb_size_,
     alpha_basic_count_,
