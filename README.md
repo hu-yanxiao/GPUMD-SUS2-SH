@@ -9,6 +9,20 @@ matrix-style kernels can evolve without destabilizing the older tensor backend.
 The active build is SH-only: moment-tensor SUS2 models remain supported by the
 separate `GPUMD-SUS2` repository.
 
+## Project Relationship
+
+| Repository | Role |
+| --- | --- |
+| `SUS2-SH` | Generates and trains SUS2-SH `.mtp` models on the CPU/reference path. |
+| `SUS2-SH-GPU` | Trains the same SUS2-SH model format with CUDA objective/gradient paths. |
+| `GPUMD-SUS2-SH` | This repository: GPUMD runtime backend for trained SUS2-SH models. |
+| `GPUMD-SUS2` | Separate GPUMD backend for SUS2 v1.1 moment-tensor models. |
+| `PySUS2SH` | Python/ASE/phonon workflow package for SUS2-SH models. |
+
+Use this repository for MD production in GPUMD after training a SUS2-SH model.
+Do not use it for moment-tensor SUS2-MLIP models; that path belongs to
+`GPUMD-SUS2`.
+
 Initial design and implementation notes are tracked in
 [docs/gpumd-sus2-sh-interface-plan.md](docs/gpumd-sus2-sh-interface-plan.md).
 
@@ -28,8 +42,8 @@ The first SH path prioritizes correctness:
   order and reversed for forces;
 - the standard SUS2-SH real-CG graph is reconstructed on load and validated
   against the saved flat products;
-- `RBChebyshev_sss`, `scaling_map = LK`, float moments, and direct radial
-  recurrence are the default supported path.
+- `RBChebyshev_sss` and `RBChebyshev_sss_rational`, `scaling_map = LK`, float
+  moments, and direct radial recurrence are the default supported path.
 - basic metadata is packed as `(mu,yidx)` for the current low-risk fast path;
   experimental tensor-product execution is available for profiling, but is not
   the default production path yet.
@@ -38,23 +52,19 @@ The first SH path prioritizes correctness:
 
 - SUS2-SH model format: `version = 1.1.0`, `potential_tag = SUS2-SH`
 - GPUMD potential token: model files beginning with `MTP`
-- Supported first radial path: `RBChebyshev_sss`
+- Supported first radial path: `RBChebyshev_sss`; `RBChebyshev_sss_rational`
+  uses the same recurrence with the rational map `x / sqrt(1 + x*x)`.
 - Supported scaling map: `LK`
 - Supported angular cutoff: `sh_l_max <= 4`
 - Default radial evaluation: direct basis recurrence
 - Default precision path: NEP-like float moments/gradients/local arithmetic
 - Default force path: self-force buffer enabled
-- ZBL: disabled unless the model file contains `zbl_enabled = 1`; when present,
-  GPUMD-SUS2-SH reads `zbl_inner`, `zbl_outer`, `zbl_atomic_numbers`, and
-  optional `zbl_typewise_cutoff_factor` from the model and adds the same
-  NEP-style cosine-tapered ZBL contribution used by SUS2-SH/LAMMPS-SH.
 
 ## Core Files
 
 ```text
 src/force/sus2_sh.cu
 src/force/sus2_sh.cuh
-src/force/sus2_zbl_common.cuh
 src/force/force.cu
 src/model/read_xyz.cu
 ```
