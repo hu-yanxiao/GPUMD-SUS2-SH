@@ -1,0 +1,7 @@
+potential /work/phy-weigw/hyx/5.28-mof-cl-h2o/lag/current.mtp H C N O Cl K Co Ni sus2_float=1 sus2_radial_direct=1
+velocity 1
+ensemble nve
+time_step 0
+dump_thermo 1
+dump_force 1
+run 1

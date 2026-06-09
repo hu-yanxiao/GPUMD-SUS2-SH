@@ -42,8 +42,8 @@ The first SH path prioritizes correctness:
   order and reversed for forces;
 - the standard SUS2-SH real-CG graph is reconstructed on load and validated
   against the saved flat products;
-- `RBChebyshev_sss`, `scaling_map = LK`, float moments, and direct radial
-  recurrence are the default supported path.
+- `RBChebyshev_sss` and `RBChebyshev_sss_rational`, `scaling_map = LK`, float
+  moments, and direct radial recurrence are the default supported path.
 - basic metadata is packed as `(mu,yidx)` for the current low-risk fast path;
   experimental tensor-product execution is available for profiling, but is not
   the default production path yet.
@@ -52,7 +52,8 @@ The first SH path prioritizes correctness:
 
 - SUS2-SH model format: `version = 1.1.0`, `potential_tag = SUS2-SH`
 - GPUMD potential token: model files beginning with `MTP`
-- Supported first radial path: `RBChebyshev_sss`
+- Supported first radial path: `RBChebyshev_sss`; `RBChebyshev_sss_rational`
+  uses the same recurrence with the rational map `x / sqrt(1 + x*x)`.
 - Supported scaling map: `LK`
 - Supported angular cutoff: `sh_l_max <= 4`
 - Default radial evaluation: direct basis recurrence

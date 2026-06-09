@@ -35,6 +35,7 @@ private:
   int species_count_ = 0;
   int sh_l_max_ = 0;
   int sh_k_max_ = 0;
+  int radial_basis_kind_ = 0;
   int radial_funcs_count_ = 0;
   int rb_size_ = 0;
   int alpha_basic_count_ = 0;
@@ -51,12 +52,24 @@ private:
   int sh_terminal_dot_group_count_ = 0;
   int sh_terminal_dot_group_entry_count_ = 0;
   int sh_terminal_dot_nondot_row_count_ = 0;
+  int sh_fused_terminal_dot_group_count_ = 0;
+  int sh_fused_terminal_dot_group_entry_count_ = 0;
+  int sh_fused_terminal_dot_producer_count_ = 0;
+  int sh_fused_terminal_dot_component_count_ = 0;
+  int sh_fused_terminal_dot_term_count_ = 0;
   int sh_grad_zero_count_ = 0;
   int alpha_moments_count_ = 0;
   int alpha_scalar_moments_ = 0;
   int active_scalar_moments_ = 0;
   int neighbor_capacity_ = 512;
   double rc = 0.0;
+  double neighbor_cutoff_ = 0.0;
+  bool zbl_enabled_ = false;
+  double zbl_outer_max_ = 0.0;
+  bool two_layer_gate_enabled_ = false;
+  double two_layer_gate_tanh_amplitude_ = 0.8;
+  int two_layer_gate_weight_count_ = 0;
+  int two_layer_gate_product_limit_ = 0;
   bool use_float_moments_ = true;
   bool use_radial_direct_ = true;
   bool use_force_self_buffer_ = true;
@@ -76,6 +89,7 @@ private:
   bool use_terminal_dot_groups_ = false;
   bool use_terminal_dot_premul_ = false;
   bool use_terminal_dot_row_list_ = false;
+  bool use_fused_terminal_dot_ = false;
   bool use_selective_grad_zero_ = false;
   bool use_product_basic_cache_ = false;
   bool use_packed_back_rows_ = false;
@@ -116,6 +130,7 @@ private:
   GPU_Vector<int> sh_terminal_dot_group_layer_offsets_;
   GPU_Vector<int> sh_terminal_dot_nondot_rows_;
   GPU_Vector<int> sh_terminal_dot_nondot_layer_offsets_;
+  GPU_Vector<unsigned int> sh_fused_terminal_dot_u32_;
   GPU_Vector<int> sh_cg_back_rows_int_;
   GPU_Vector<int> sh_cg_back_terms_int_;
   GPU_Vector<double> sh_cg_back_terms_coeff_;
@@ -130,6 +145,16 @@ private:
   GPU_Vector<int> alpha_moment_mapping_;
   GPU_Vector<float> radial_direct_coeffs_;
   GPU_Vector<float> radial_direct_scal_s_;
+  GPU_Vector<float> two_layer_gate_radial_direct_coeffs_;
+  GPU_Vector<int> two_layer_gate_moment_indices_;
+  GPU_Vector<float> two_layer_gate_weights_float_;
+  GPU_Vector<int> two_layer_gate_needed_moment_flags_;
+  GPU_Vector<float> two_layer_gate_moment_weights_float_;
+  GPU_Vector<float> two_layer_gate_additive_coeffs_float_;
+  GPU_Vector<int> zbl_atomic_numbers_;
+  GPU_Vector<double> zbl_pair_inner_cutoffs_;
+  GPU_Vector<double> zbl_pair_outer_cutoffs_;
+  GPU_Vector<double> zbl_pair_outer_sq_;
 
   GPU_Vector<int> neighbor_count_;
   GPU_Vector<int> neighbor_atom_;
@@ -143,6 +168,12 @@ private:
   GPU_Vector<double> moment_grads_;
   GPU_Vector<float> moment_vals_float_;
   GPU_Vector<float> moment_grads_float_;
+  GPU_Vector<double> two_layer_gate_basic_grads_;
+  GPU_Vector<double> two_layer_gate_values_;
+  GPU_Vector<double> two_layer_gate_adjoints_;
+  GPU_Vector<float> two_layer_gate_basic_grads_float_;
+  GPU_Vector<float> two_layer_gate_values_float_;
+  GPU_Vector<float> two_layer_gate_adjoints_float_;
   GPU_Vector<float> force_tmp_;
   GPU_Vector<float> force_self_tmp_;
   GPU_Vector<float> virial_tmp_;

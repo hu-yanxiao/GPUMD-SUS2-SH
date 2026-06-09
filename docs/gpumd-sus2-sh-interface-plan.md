@@ -1948,3 +1948,306 @@ l4k5    -29.18%          -22.81%           -9.73%
 Conclusion: adding the single-entry branch and extra device helper changes the
 compiled terminal-dot kernel enough to hurt register/control-flow behavior.
 Do not repeat this specialization in the current compact product kernel.
+
+2026-05-18 next-stage GPUMD plan from GPU-training optimization:
+
+- The GPU trainer's largest confirmed gain came from moment-major workspaces
+  and from avoiding repeated global-memory traffic in the SH product/gradient
+  chain. GPUMD already uses the same broad layout, so the next step should not
+  be another metadata-only tweak.
+- Keep the current compact product path as the formal fallback. It is the
+  correctness reference for the flat `sh_products` graph and has survived the
+  broadest model matrix.
+- Product-v2 should be attempted only if it removes global
+  `moment_vals`/`moment_grads` traffic or a substantial serial per-atom
+  contraction, not if it merely adds a separate grouped forward pass. Prior
+  grouped forward tests were slower because they introduced another global pass
+  and launch.
+- The promising structure is a topology-local schedule inside the existing
+  product phase: repeated `(l1,l2,L)` CG patterns are shared across many `k`
+  instances, terminal dot groups keep their dot-count specializations, and
+  irregular rows fall back to the compact row program.
+- Avoid full per-thread basic caches and large local component vectors. The
+  previous product/basic cache and block-output probes showed that register and
+  local-memory pressure can erase theoretical reuse.
+ - The acceptance rule for a new default remains strict: first-4096 force parity,
+  then 100k and 1M atom 1000-step profiles on `l3_3333`, `l3_3322`,
+  `l4k4_4422`, and `l4k5_4422`. A product-v2 default should target at least
+  about 10% end-to-end speedup, not only a sub-percent product micro-gain.
+
+### 2026-05-27 q-total/full-path and l=5/l=6 Coverage Check
+
+Source-level status after re-reading the active local worktree and the server
+runtime tree:
+
+- Local SH worktree:
+  `/Users/hu-yanxiao/Projects/SUS2MLIP/.codex_tmp/gpumd-sus2-sh-fusion-wt`
+- Server runtime tree:
+  `/work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex`
+- `src/force/sus2_sh.cu` and `src/force/sus2_sh.cuh` match between local and
+  server:
+
+```text
+sus2_sh.cu  f60f2eca293dd09c5ed401c344545b680a2be2783d05796c25c86e8aca772840
+sus2_sh.cuh de7e5e23ae29bfeaea184f661a90f85a0b7d8bac34e4ab6f2f02f27c08a95c0b
+```
+
+The q-total/full-path support is implemented through the explicit graph
+metadata path, not by extending the old legacy pruning rule. The loader first
+generates the historical standard graph and compares it against the saved
+`alpha_index_basic`, `sh_products`, and `alpha_moment_mapping`
+(`standard_sh_graph_matches`). If the generated graph does not match the model,
+`build_explicit_sh_graph_metadata(model, nullptr)` constructs the row program,
+back rows, and layer offsets directly from the saved `sh_products`. This keeps
+the GPU execution tied to the model file's explicit graph and avoids duplicating
+training-side q/k/l pruning semantics in GPUMD. Standard-only tensor-product
+paths are disabled for non-standard graphs, while the compact serial row program
+and terminal scalar/dot machinery remain available.
+
+The l=5/l=6 static-layout extension is present in the same source line:
+
+- `kMaxSHL = 6`, `kMaxSHComponents = 49`;
+- loader accepts `sh_l_max` in `[0,6]`;
+- radial/basic scratch limits are raised to `radial_funcs_count <= 48` and
+  `alpha_index_basic_count <= 320`;
+- `has_static_full_sh_basic_layout` still guards the exact full `(l,k,m)` order
+  and `radial_basis_size = 10`;
+- `launch_sh_compute_basic_static` and `launch_sh_compute_forces_static`
+  dispatch `L=0..6` and `K=1..6`, with generic fallback if the guard fails.
+
+The current smoke/coverage job is queued, not yet runtime-verified:
+
+```text
+job_id=3718475
+queue=gpu-phy-zhangwq
+status=PEND
+runroot=/work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_qtotal_l56_smoke_20260526
+script=run_all.lsf
+binary=/work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/src/gpumd
+build_log=/work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/build_gpumd_qtotal_l56_20260526.log
+```
+
+The q-total test model is a symlink to the active training model, so it tracks
+the requested current model:
+
+```text
+qtotal_current/p.mtp -> /work/phy-weigw/hyx/cu-zr/sus2-sh/l4k3_44443/current.mtp
+sha256=8593bb135b0ced7acf801ed30c72357315ff32191acdf94abb7ffccefccd1359
+```
+
+Model dimensions prepared for the queued smoke:
+
+```text
+case            lmax  kmax  body  body_l_max       basics  products  moments  scalars
+qtotal_current  4     3     6     {4,4,4,4,1}       75      29125     5638     3142
+l5_qtotal       5     2     5     {5,5,1,1}         72      195       142      54
+l6_qtotal       6     1     5     {6,6,1,1}         49      67        67       14
+```
+
+Host-side metadata validation, run on the server without consuming a GPU:
+
+```text
+script=/work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/scripts/validate_sus2_sh_metadata.py
+command=validate_sus2_sh_metadata.py qtotal_current/p.mtp l5_qtotal/p.mtp l6_qtotal/p.mtp
+```
+
+```text
+[qtotal_current]
+  lmax=4 kmax=3 rb=10 basics=75/75 products=29125/29125 moments=5638 scalars=3142/3142
+  static_full_layout_guard=PASS rows=5563 max_layer=3 back_terms=58250
+  product_index_invalid=0 topo_bad=0 mapping_bad=0
+
+[l5_qtotal]
+  lmax=5 kmax=2 rb=10 basics=72/72 products=195/195 moments=142 scalars=54/54
+  static_full_layout_guard=PASS rows=70 max_layer=2 back_terms=390
+  product_index_invalid=0 topo_bad=0 mapping_bad=0
+
+[l6_qtotal]
+  lmax=6 kmax=1 rb=10 basics=49/49 products=67/67 moments=67 scalars=14/14
+  static_full_layout_guard=PASS rows=18 max_layer=2 back_terms=134
+  product_index_invalid=0 topo_bad=0 mapping_bad=0
+```
+
+This check verifies the model-side invariants consumed by
+`build_explicit_sh_graph_metadata` and `has_static_full_sh_basic_layout`: all
+product references are in range, products are topologically ordered, no product
+writes into a basic moment, every scalar mapping points to a defined moment, and
+the full `(l,k,m)` layout guard should enable the static basic/force paths for
+all three prepared smoke cases. It is not a substitute for GPU force/thermo
+parity.
+
+Build status:
+
+```text
+The gpumd executable is successfully compiled.
+Only warning observed in the SH file:
+  validate_standard_sh_graph was declared but never referenced
+```
+
+Queue status on 2026-05-27:
+
+```text
+3718475 phy-weigw PEND gpu-phy-zhangwq gpumd_qtotal_l56
+PENDING REASON:
+Affinity resource requirement cannot be met because there are not enough
+processor units to satisfy the job affinity request: 2 hosts.
+```
+
+The job requests only one CPU slot and one GPU:
+
+```text
+#BSUB -n 1
+#BSUB -gpu "num=1/host"
+LSF combined request: affinity[core(1)*1]
+```
+
+Host-level GPU occupancy at the same check:
+
+```text
+a05u22g: GPU 0-7 all RUN
+b05u08g: GPU 0-7 all RUN
+c04u01g: GPU 0-2 SUSP, GPU 3-7 RUN
+```
+
+So the pending state is caused by the requested queue's occupied A100 hosts, not
+by this smoke script over-requesting CPU cores or GPUs.
+
+Runtime update after job `3718475` ran on `c04u01g`:
+
+```text
+qtotal_current: completed
+l5_qtotal: failed before model load finished
+l6_qtotal: not reached
+```
+
+The q-total/full-path model loaded through explicit graph metadata and ran one
+102400-atom A100 step:
+
+```text
+model: sh_l_max=4 sh_k_max=3 basics=75 products=29125 moments=5638 scalars=3142
+graph metadata: mode=explicit, rows=5563, row_terms=29125, back_terms=26729, layers=3
+static basic: on
+static force: on
+terminal scalar fusion: on
+terminal dot groups: on
+product profile: neighbor=0.439 ms, memset=1.306 ms, basic=1.373 ms,
+                 product=31.973 ms, force=3.272 ms, total=38.387 ms
+speed=2.52823e+06 atom*step/s
+```
+
+The l=5 failure was not a kernel or graph-builder failure. `gpumd.log` stopped
+at:
+
+```text
+Missing token in SUS2-SH model file: shift_coeffs =
+```
+
+Root cause: the l=5/l=6 smoke models were topology-only `init-sh` artifacts.
+They had `alpha_index_basic`, `sh_products`, and `alpha_moment_mapping`, so the
+metadata validator passed, but they did not include the coefficient sections
+required by the GPUMD loader: `shift_coeffs`, `scal_coeffs`, `radial_coeffs`,
+`species_coeffs`, and `moment_coeffs`.
+
+The topology-only files were preserved as:
+
+```text
+l5_qtotal_smoke.mtp.topology_only_20260527
+l6_qtotal_smoke.mtp.topology_only_20260527
+```
+
+The active l=5/l=6 smoke model files now include minimal deterministic
+coefficient sections:
+
+```text
+l5_qtotal: species=2 rb=10 radial_funcs=12 scal_coeffs=96 moment_coeffs=54
+l6_qtotal: species=2 rb=10 radial_funcs=7  scal_coeffs=56 moment_coeffs=14
+```
+
+After this repair, server-side metadata validation still passes for all three
+cases:
+
+```text
+[qtotal_current] static_full_layout_guard=PASS rows=5563 max_layer=3 back_terms=58250
+[l5_qtotal]      static_full_layout_guard=PASS rows=70   max_layer=2 back_terms=390
+[l6_qtotal]      static_full_layout_guard=PASS rows=18   max_layer=2 back_terms=134
+```
+
+Same-queue retry:
+
+```text
+job_id=3719260
+queue=gpu-phy-zhangwq
+script=run_all.lsf
+status_at_submit=PEND
+pending_reason=Affinity resource requirement cannot be met because there are not enough processor units to satisfy the job affinity request.
+```
+
+Interim conclusion before the retry completed: q-total/full-path runtime
+support was proven for the active `l4k3_44443/current.mtp` model. l=5/l=6
+source, build, and host metadata evidence were positive, but runtime
+verification was still pending on retry job `3719260`.
+
+Runtime update after retry job `3719260`:
+
+```text
+job_id=3719260
+queue=gpu-phy-zhangwq
+host=c04u01g
+status=DONE
+runroot=/work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_qtotal_l56_smoke_20260526
+```
+
+All three 102400-atom smoke cases completed with `time_step 0`, `run 1`, and
+profile output:
+
+```text
+case            graph     static_basic  static_force  terminal_fusion  total_ms(second profile line)  speed(atom*step/s)
+qtotal_current  explicit  on            on            on               38.366                         2.52643e6
+l5_qtotal       explicit  on            on            on               36.357                         2.65747e6
+l6_qtotal       standard  on            on            on               48.733                         2.02498e6
+```
+
+Important path evidence:
+
+```text
+qtotal_current: mode=explicit, rows=5563, row_terms=29125, layers=3,
+                product_pattern_rows=on, terminal_dot_groups=on
+l5_qtotal:      mode=explicit, rows=70, row_terms=195, layers=2,
+                lmax=5, kmax=2, static basic/force on
+l6_qtotal:      mode=standard, rows=18, row_terms=67, layers=2,
+                lmax=6, kmax=1, static basic/force on
+```
+
+The l=6 case is standard rather than explicit because its generated graph
+matches the saved topology. That is acceptable and useful: it proves the old
+standard graph path still works for the `l <= 6` extension while q-total/l5
+exercise the saved-explicit-graph path.
+
+Additional correctness job with force dumps:
+
+```text
+job_id=3719318
+queue=gpu-phy-zhangwq
+host=c04u01g
+runroot=/work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_qtotal_l56_correctness_20260527
+model_xyz=/work/phy-weigw/20260321_Test/GPUMD-SUS2-SH-build-codex/codex_bench/cuzr_sh_rowscalar_mathcheck_20260513/model_4096.xyz
+```
+
+This job compared the optimized default path against a deliberately plain
+reference path on the same 4096-atom Cu-Zr structure with `dump_force 1`,
+`dump_thermo 1`, `time_step 0`, and `run 1`. The reference path disabled
+compact serial product, static basic/force, terminal scalar/dot optimizations,
+pattern rows, parallel/packed back rows, const-forward rows, force-gradient
+cache, and selective gradient zeroing.
+
+```text
+qtotal_current: thermo_max_abs=5.514000000403e-03, force_max_abs=3.108382225036e-05, force_rms=7.646372503446e-06
+l5_qtotal:      thermo_max_abs=3.299999943446e-11, force_max_abs=1.559965312481e-08, force_rms=2.589502060756e-09
+l6_qtotal:      thermo_max_abs=2.179999995626e-11, force_max_abs=2.153683453798e-09, force_rms=4.546232825618e-10
+```
+
+The q-total differences are in the same float accumulation-order band as prior
+first-4096 Cu-Zr checks. The l=5/l=6 synthetic smoke models are effectively
+bit-stable at the printed thermo scale and sub-1e-7 in force. This completes
+the GPUMD-SH q-total/full-path load, l=5/l=6 static-path, profile, and
+optimized-vs-reference correctness evidence for the current coverage task.

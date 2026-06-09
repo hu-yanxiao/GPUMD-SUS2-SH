@@ -1,0 +1,4 @@
+2
+pbc="T T T" Lattice="20 0 0 0 20 0 0 0 20" Properties=species:S:1:pos:R:3
+H 5.0 5.0 5.0
+C 7.0 5.0 5.0

@@ -12,6 +12,7 @@ gpumd_root=$2
 required_files=(
   "src/force/sus2_sh.cu"
   "src/force/sus2_sh.cuh"
+  "src/force/sus2_zbl_common.cuh"
   "src/force/force.cu"
   "src/model/read_xyz.cu"
 )

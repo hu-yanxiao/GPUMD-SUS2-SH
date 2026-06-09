@@ -31,6 +31,7 @@ This copies:
 ```text
 src/force/sus2_sh.cu
 src/force/sus2_sh.cuh
+src/force/sus2_zbl_common.cuh
 src/force/force.cu
 src/model/read_xyz.cu
 ```
@@ -79,3 +80,8 @@ potential p.mtp Cu Zr
 
 The first backend supports `RBChebyshev_sss`, `scaling_map = LK`,
 `sh_l_max <= 4`, direct radial recurrence, and float moments by default.
+If the model file contains `zbl_enabled = 1`, GPUMD-SUS2-SH automatically adds
+the same NEP-style universal ZBL term used by the SUS2-SH trainer/LAMMPS
+interface. Pair cutoffs are precomputed from `zbl_atomic_numbers`,
+`zbl_inner`, `zbl_outer`, and optional `zbl_typewise_cutoff_factor` at model
+load time.
