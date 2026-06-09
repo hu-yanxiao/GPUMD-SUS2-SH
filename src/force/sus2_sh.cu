@@ -48,6 +48,11 @@ enum class SHRadialBasisKind {
   LaguerreLog1p = 1
 };
 
+enum class SHFactorPruningMode {
+  Legacy = 0,
+  QTotal = 1
+};
+
 enum SHProfileStage {
   sh_profile_neighbor = 0,
   sh_profile_memset = 1,
@@ -501,6 +506,37 @@ bool parse_sh_radial_direct(const SHHostModel& model, int nopts, const char** op
     }
   }
   return use_direct;
+}
+
+SHFactorPruningMode parse_sh_factor_pruning(const SHHostModel& model, int nopts, const char** opts)
+{
+  std::string mode = "legacy";
+  const char* env = std::getenv("SUS2_SH_GPUMD_FACTOR_PRUNING");
+  if (env == nullptr) {
+    env = std::getenv("SUS2_GPUMD_FACTOR_PRUNING");
+  }
+  if (env != nullptr) {
+    mode = env;
+  }
+  const int begin = std::min(nopts, model.species_count);
+  for (int i = begin; i < nopts; ++i) {
+    const std::string option = opts[i] == nullptr ? "" : opts[i];
+    if (starts_with(option, "sus2_sh_factor_pruning=") ||
+        starts_with(option, "sus2_factor_pruning=") ||
+        starts_with(option, "sh_factor_pruning=")) {
+      const size_t eq = option.find('=');
+      mode = option.substr(eq + 1);
+    }
+  }
+  if (mode == "legacy" || mode == "Legacy" || mode == "LEGACY") {
+    return SHFactorPruningMode::Legacy;
+  }
+  if (mode == "q-total" || mode == "q_total" || mode == "total" ||
+      mode == "QTotal" || mode == "QTOTAL") {
+    return SHFactorPruningMode::QTotal;
+  }
+  sh_input_error(
+    "Invalid SUS2_SH factor pruning mode: " + mode + " (expected legacy or q-total).");
 }
 
 bool parse_sh_force_self_buffer(const SHHostModel& model, int nopts, const char** opts)
@@ -7144,6 +7180,11 @@ SUS2_SH::SUS2_SH(
     profile_ms_[i] = 0.0;
   }
   SHHostModel host_model = load_sh_model(file_potential);
+  const SHFactorPruningMode factor_pruning_mode =
+    parse_sh_factor_pruning(host_model, num_potential_options, potential_options);
+  if (factor_pruning_mode == SHFactorPruningMode::QTotal) {
+    build_explicit_sh_graph_metadata(host_model, nullptr);
+  }
   species_count_ = host_model.species_count;
   sh_l_max_ = host_model.sh_l_max;
   sh_k_max_ = host_model.sh_k_max;
@@ -8569,7 +8610,8 @@ SUS2_SH::SUS2_SH(
     use_tensor_product_parallel_ ? "on" : "off",
     tensor_product_grid_cap_);
   printf(
-    "SUS2-SH graph metadata: mode=%s, tensor_blocks=%d, cg_blocks=%d, cg_terms=%d, cg_rows=%d, cg_row_terms=%d, cg_back_rows=%d, cg_back_terms=%d, layers=%d.\n",
+    "SUS2-SH graph metadata: factor_pruning=%s, mode=%s, tensor_blocks=%d, cg_blocks=%d, cg_terms=%d, cg_rows=%d, cg_row_terms=%d, cg_back_rows=%d, cg_back_terms=%d, layers=%d.\n",
+    factor_pruning_mode == SHFactorPruningMode::QTotal ? "q-total" : "legacy",
     host_model.sh_standard_graph_matched ? "standard" : "explicit",
     host_model.sh_standard_tensor_blocks,
     host_model.sh_standard_cg_blocks,
