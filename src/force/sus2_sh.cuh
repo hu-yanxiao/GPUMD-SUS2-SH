@@ -46,8 +46,12 @@ private:
   int sh_cg_row_term_count_ = 0;
   int sh_cg_row_pattern_count_ = 0;
   int sh_cg_row_pattern_term_count_ = 0;
+  int two_layer_gate_cg_row_count_ = 0;
+  int two_layer_gate_cg_row_term_count_ = 0;
   int sh_cg_back_row_count_ = 0;
   int sh_cg_back_term_count_ = 0;
+  int two_layer_gate_cg_back_row_count_ = 0;
+  int two_layer_gate_cg_back_term_count_ = 0;
   int sh_cg_layer_count_ = 0;
   int sh_terminal_dot_group_count_ = 0;
   int sh_terminal_dot_group_entry_count_ = 0;
@@ -105,7 +109,7 @@ private:
   int profile_interval_ = 50;
   int tensor_product_grid_cap_ = 8192;
   int profile_steps_ = 0;
-  double profile_ms_[8];
+  double profile_ms_[11];
 
   GPU_Vector<double> shift_coeffs_;
   GPU_Vector<double> species_coeffs_;
@@ -127,6 +131,10 @@ private:
   GPU_Vector<double> sh_cg_row_terms_coeff_;
   GPU_Vector<float> sh_cg_row_terms_coeff_float_;
   GPU_Vector<int> sh_cg_row_scalar_index_;
+  GPU_Vector<int> two_layer_gate_cg_rows_int_;
+  GPU_Vector<int> two_layer_gate_cg_row_terms_int_;
+  GPU_Vector<float> two_layer_gate_cg_row_terms_coeff_float_;
+  GPU_Vector<int> two_layer_gate_cg_layer_offsets_;
   GPU_Vector<int> sh_terminal_moment_flags_;
   GPU_Vector<unsigned int> sh_cg_row_dot_u32_;
   GPU_Vector<unsigned int> sh_cg_row_pattern_u32_;
@@ -141,6 +149,10 @@ private:
   GPU_Vector<float> sh_cg_back_terms_coeff_float_;
   GPU_Vector<int> sh_cg_back_layer_offsets_;
   GPU_Vector<unsigned int> sh_cg_back_packed_u32_;
+  GPU_Vector<int> two_layer_gate_cg_back_rows_int_;
+  GPU_Vector<int> two_layer_gate_cg_back_terms_int_;
+  GPU_Vector<float> two_layer_gate_cg_back_terms_coeff_float_;
+  GPU_Vector<int> two_layer_gate_cg_back_layer_offsets_;
   GPU_Vector<int> sh_grad_zero_moments_;
   GPU_Vector<int> active_scalar_moment_;
   GPU_Vector<double> active_scalar_coeff_;
@@ -153,6 +165,7 @@ private:
   GPU_Vector<int> two_layer_gate_moment_indices_;
   GPU_Vector<int> two_layer_gate_scalar_body_ids_;
   GPU_Vector<float> two_layer_gate_weights_float_;
+  GPU_Vector<float> two_layer_gate_weights_transposed_float_;
   GPU_Vector<float> two_layer_gate_body_mix_weights_float_;
   GPU_Vector<int> two_layer_gate_needed_moment_flags_;
   GPU_Vector<float> two_layer_gate_moment_weights_float_;
@@ -180,7 +193,10 @@ private:
   GPU_Vector<float> two_layer_gate_basic_grads_float_;
   GPU_Vector<float> two_layer_gate_moment_vals_float_;
   GPU_Vector<float> two_layer_gate_values_float_;
+  GPU_Vector<float> two_layer_gate_multipliers_float_;
+  GPU_Vector<float> two_layer_gate_derivs_float_;
   GPU_Vector<float> two_layer_gate_adjoints_float_;
+  GPU_Vector<float> two_layer_gate_body_adjoints_float_;
   GPU_Vector<float> force_tmp_;
   GPU_Vector<float> force_self_tmp_;
   GPU_Vector<float> virial_tmp_;

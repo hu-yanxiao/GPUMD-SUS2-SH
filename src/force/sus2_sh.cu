@@ -73,7 +73,10 @@ enum SHProfileStage {
   sh_profile_accumulate = 5,
   sh_profile_product_forward = 6,
   sh_profile_product_back = 7,
-  sh_profile_count = 8
+  sh_profile_gate_main_force = 8,
+  sh_profile_gate_seed_back = 9,
+  sh_profile_gate_first_force = 10,
+  sh_profile_count = 11
 };
 
 struct SHProductHost {
@@ -2596,6 +2599,10 @@ struct SHDeviceModel {
   const double* sh_cg_row_terms_coeff;
   const float* sh_cg_row_terms_coeff_float;
   const int* sh_cg_row_scalar_index;
+  const int* two_layer_gate_cg_rows_int;
+  const int* two_layer_gate_cg_row_terms_int;
+  const float* two_layer_gate_cg_row_terms_coeff_float;
+  const int* two_layer_gate_cg_layer_offsets;
   const int* sh_terminal_moment_flags;
   const unsigned int* sh_cg_row_dot_u32;
   const unsigned int* sh_cg_row_pattern_u32;
@@ -2610,6 +2617,10 @@ struct SHDeviceModel {
   const float* sh_cg_back_terms_coeff_float;
   const int* sh_cg_back_layer_offsets;
   const unsigned int* sh_cg_back_packed_u32;
+  const int* two_layer_gate_cg_back_rows_int;
+  const int* two_layer_gate_cg_back_terms_int;
+  const float* two_layer_gate_cg_back_terms_coeff_float;
+  const int* two_layer_gate_cg_back_layer_offsets;
   const int* active_scalar_moment;
   const double* active_scalar_coeff;
   const float* active_scalar_coeff_float;
@@ -2629,6 +2640,7 @@ struct SHDeviceModel {
   const int* two_layer_gate_moment_indices;
   const int* two_layer_gate_scalar_body_ids;
   const float* two_layer_gate_weights_float;
+  const float* two_layer_gate_weights_transposed_float;
   const float* two_layer_gate_body_mix_weights_float;
   const int* two_layer_gate_needed_moment_flags;
   const float* two_layer_gate_moment_weights_float;
@@ -3805,7 +3817,7 @@ static __global__ void gpu_sh_compute_basic_gate_main_static(
   const double* x,
   const double* y,
   const double* z,
-  const RealT* gate_values,
+  const RealT* gate_multipliers,
   RealT* moments)
 {
   constexpr int Components = (L + 1) * (L + 1);
@@ -3825,7 +3837,6 @@ static __global__ void gpu_sh_compute_basic_gate_main_static(
 
   const int type_i = type[i];
   const int count = neighbor_count[i];
-  const RealT amplitude = static_cast<RealT>(model.two_layer_gate_tanh_amplitude);
   for (int nbr = 0; nbr < count; ++nbr) {
     const size_t edge = static_cast<size_t>(nbr) * N + i;
     const int j = neighbor_atoms[edge];
@@ -3842,8 +3853,8 @@ static __global__ void gpu_sh_compute_basic_gate_main_static(
     const RealT r = sqrt(r2);
     const int type_j = type[j];
     const int pair = type_i * model.species_count + type_j;
-    const RealT* gate_values_j =
-      gate_values + static_cast<size_t>(j) * static_cast<size_t>(RadialFuncs);
+    const RealT* gate_multipliers_j =
+      gate_multipliers + static_cast<size_t>(j) * static_cast<size_t>(RadialFuncs);
     RealT radial_vals[RadialFuncs];
     RealT sh[Components];
     sh_direct_radial_vals_ders_static<RealT, RadialFuncs, RbSize>(
@@ -3856,10 +3867,7 @@ static __global__ void gpu_sh_compute_basic_gate_main_static(
 #pragma unroll
       for (int k = K - 1; k >= 0; --k) {
         const int mu = k * (L + 1) + l;
-        const RealT gate_residual = gate_values_j[mu];
-        const RealT a = sh_gate_additive_coeff<RealT>(model, type_j, mu);
-        const RealT radial =
-          radial_vals[mu] * (static_cast<RealT>(1.0) + amplitude * tanh(a * gate_residual));
+        const RealT radial = radial_vals[mu] * gate_multipliers_j[mu];
         const int ybase = l * l;
 #pragma unroll
         for (int c = 0; c < 2 * l + 1; ++c) {
@@ -4088,7 +4096,7 @@ bool launch_sh_compute_basic_gate_main_static(
   const double* x,
   const double* y,
   const double* z,
-  const RealT* gate_values,
+  const RealT* gate_multipliers,
   RealT* moments)
 {
   if (rb_size != 10 || kmax < 1 || kmax > 6 || lmax < 0 || lmax > kMaxSHL) {
@@ -4102,42 +4110,42 @@ bool launch_sh_compute_basic_gate_main_static(
         gpu_sh_compute_basic_gate_main_static<RealT, LVAL, 1, 10>                         \
           <<<grid_size, kBlockSize>>>(                                                    \
           N, box, cutoff_square, use_cached_displacements, model, type, neighbor_count,   \
-          neighbor_atoms, neighbor_dx, neighbor_dy, neighbor_dz, x, y, z, gate_values,    \
+          neighbor_atoms, neighbor_dx, neighbor_dy, neighbor_dz, x, y, z, gate_multipliers,\
           moments);                                                                       \
         return true;                                                                      \
       case 2:                                                                             \
         gpu_sh_compute_basic_gate_main_static<RealT, LVAL, 2, 10>                         \
           <<<grid_size, kBlockSize>>>(                                                    \
           N, box, cutoff_square, use_cached_displacements, model, type, neighbor_count,   \
-          neighbor_atoms, neighbor_dx, neighbor_dy, neighbor_dz, x, y, z, gate_values,    \
+          neighbor_atoms, neighbor_dx, neighbor_dy, neighbor_dz, x, y, z, gate_multipliers,\
           moments);                                                                       \
         return true;                                                                      \
       case 3:                                                                             \
         gpu_sh_compute_basic_gate_main_static<RealT, LVAL, 3, 10>                         \
           <<<grid_size, kBlockSize>>>(                                                    \
           N, box, cutoff_square, use_cached_displacements, model, type, neighbor_count,   \
-          neighbor_atoms, neighbor_dx, neighbor_dy, neighbor_dz, x, y, z, gate_values,    \
+          neighbor_atoms, neighbor_dx, neighbor_dy, neighbor_dz, x, y, z, gate_multipliers,\
           moments);                                                                       \
         return true;                                                                      \
       case 4:                                                                             \
         gpu_sh_compute_basic_gate_main_static<RealT, LVAL, 4, 10>                         \
           <<<grid_size, kBlockSize>>>(                                                    \
           N, box, cutoff_square, use_cached_displacements, model, type, neighbor_count,   \
-          neighbor_atoms, neighbor_dx, neighbor_dy, neighbor_dz, x, y, z, gate_values,    \
+          neighbor_atoms, neighbor_dx, neighbor_dy, neighbor_dz, x, y, z, gate_multipliers,\
           moments);                                                                       \
         return true;                                                                      \
       case 5:                                                                             \
         gpu_sh_compute_basic_gate_main_static<RealT, LVAL, 5, 10>                         \
           <<<grid_size, kBlockSize>>>(                                                    \
           N, box, cutoff_square, use_cached_displacements, model, type, neighbor_count,   \
-          neighbor_atoms, neighbor_dx, neighbor_dy, neighbor_dz, x, y, z, gate_values,    \
+          neighbor_atoms, neighbor_dx, neighbor_dy, neighbor_dz, x, y, z, gate_multipliers,\
           moments);                                                                       \
         return true;                                                                      \
       case 6:                                                                             \
         gpu_sh_compute_basic_gate_main_static<RealT, LVAL, 6, 10>                         \
           <<<grid_size, kBlockSize>>>(                                                    \
           N, box, cutoff_square, use_cached_displacements, model, type, neighbor_count,   \
-          neighbor_atoms, neighbor_dx, neighbor_dy, neighbor_dz, x, y, z, gate_values,    \
+          neighbor_atoms, neighbor_dx, neighbor_dy, neighbor_dz, x, y, z, gate_multipliers,\
           moments);                                                                       \
         return true;                                                                      \
     }                                                                                     \
@@ -4251,7 +4259,7 @@ static __global__ void gpu_sh_compute_basic_gate_main(
   const double* x,
   const double* y,
   const double* z,
-  const RealT* gate_values,
+  const RealT* gate_multipliers,
   RealT* moments)
 {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -4266,7 +4274,6 @@ static __global__ void gpu_sh_compute_basic_gate_main(
 
   const int type_i = type[i];
   const int count = neighbor_count[i];
-  const RealT amplitude = static_cast<RealT>(model.two_layer_gate_tanh_amplitude);
   for (int nbr = 0; nbr < count; ++nbr) {
     const size_t edge = static_cast<size_t>(nbr) * N + i;
     const int j = neighbor_atoms[edge];
@@ -4283,16 +4290,14 @@ static __global__ void gpu_sh_compute_basic_gate_main(
     const RealT r = sqrt(r2);
     const int type_j = type[j];
     const int pair = type_i * model.species_count + type_j;
-    const RealT* gate_values_j =
-      gate_values + static_cast<size_t>(j) * static_cast<size_t>(model.radial_funcs_count);
+    const RealT* gate_multipliers_j =
+      gate_multipliers + static_cast<size_t>(j) * static_cast<size_t>(model.radial_funcs_count);
     RealT radial_vals[kMaxSHRadialFuncs];
     RealT sh_vals[kMaxSHComponents];
     sh_direct_radial_vals_ders(
       model, model.radial_direct_coeffs, pair, r, radial_vals, static_cast<RealT*>(nullptr));
     for (int mu = 0; mu < model.radial_funcs_count; ++mu) {
-      const RealT gate_residual = gate_values_j[mu];
-      const RealT a = sh_gate_additive_coeff<RealT>(model, type_j, mu);
-      radial_vals[mu] *= static_cast<RealT>(1.0) + amplitude * tanh(a * gate_residual);
+      radial_vals[mu] *= gate_multipliers_j[mu];
     }
     eval_real_sh(dx, dy, dz, r, model.sh_l_max, sh_vals, static_cast<RealT*>(nullptr));
     for (int b = 0; b < model.alpha_basic_count; ++b) {
@@ -4622,11 +4627,39 @@ static __global__ void gpu_sh_gate_values_from_moments_full_mu_parallel(
   RealT h = static_cast<RealT>(0.0);
   for (int q = 0; q < model.two_layer_gate_scalar_count; ++q) {
     const int moment_id = model.two_layer_gate_moment_indices[q];
-    const RealT weight =
-      static_cast<RealT>(model.two_layer_gate_weights_float[weight_base + q]);
+    const RealT weight = model.two_layer_gate_weights_transposed_float != nullptr
+      ? static_cast<RealT>(
+          model.two_layer_gate_weights_transposed_float[
+            static_cast<size_t>(q) * model.radial_funcs_count + mu])
+      : static_cast<RealT>(model.two_layer_gate_weights_float[weight_base + q]);
     h += weight * moments[static_cast<size_t>(moment_id) * N + atom];
   }
   gate_values[idx] = h;
+}
+
+template <typename RealT>
+static __global__ void gpu_sh_gate_precompute_tanh(
+  int N,
+  SHDeviceModel model,
+  const int* type,
+  const RealT* gate_values,
+  RealT* gate_multipliers,
+  RealT* gate_derivs)
+{
+  const size_t total =
+    static_cast<size_t>(N) * static_cast<size_t>(model.radial_funcs_count);
+  const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= total) {
+    return;
+  }
+  const int mu = static_cast<int>(idx % static_cast<size_t>(model.radial_funcs_count));
+  const int atom = static_cast<int>(idx / static_cast<size_t>(model.radial_funcs_count));
+  const int type_i = type[atom];
+  const RealT amplitude = static_cast<RealT>(model.two_layer_gate_tanh_amplitude);
+  const RealT a = sh_gate_additive_coeff<RealT>(model, type_i, mu);
+  const RealT tanh_arg = tanh(a * gate_values[idx]);
+  gate_multipliers[idx] = static_cast<RealT>(1.0) + amplitude * tanh_arg;
+  gate_derivs[idx] = amplitude * a * (static_cast<RealT>(1.0) - tanh_arg * tanh_arg);
 }
 
 template <typename RealT, typename GradT>
@@ -4634,6 +4667,7 @@ static __global__ void gpu_sh_seed_gate_moment_grads_from_mu_adjoints(
   int N,
   SHDeviceModel model,
   const RealT* gate_adjoints,
+  const RealT* gate_body_adjoints,
   GradT* grads)
 {
   const int atom = blockIdx.x * blockDim.x + threadIdx.x;
@@ -4643,19 +4677,27 @@ static __global__ void gpu_sh_seed_gate_moment_grads_from_mu_adjoints(
 
   if (model.two_layer_gate_mode == kSHGateMuBodyLinearCombo) {
     RealT body_adjoints[kMaxSHRadialFuncs];
-    for (int b = 0; b < model.two_layer_gate_body_order_count; ++b) {
-      body_adjoints[b] = static_cast<RealT>(0.0);
-    }
-    for (int mu = 0; mu < model.radial_funcs_count; ++mu) {
-      const RealT adj =
-        gate_adjoints[static_cast<size_t>(atom) * model.radial_funcs_count + mu];
-      if (adj == static_cast<RealT>(0.0)) {
-        continue;
-      }
-      const int body_base = mu * model.two_layer_gate_body_order_count;
+    if (gate_body_adjoints != nullptr) {
       for (int b = 0; b < model.two_layer_gate_body_order_count; ++b) {
-        body_adjoints[b] +=
-          adj * static_cast<RealT>(model.two_layer_gate_body_mix_weights_float[body_base + b]);
+        body_adjoints[b] =
+          gate_body_adjoints[
+            static_cast<size_t>(atom) * model.two_layer_gate_body_order_count + b];
+      }
+    } else {
+      for (int b = 0; b < model.two_layer_gate_body_order_count; ++b) {
+        body_adjoints[b] = static_cast<RealT>(0.0);
+      }
+      for (int mu = 0; mu < model.radial_funcs_count; ++mu) {
+        const RealT adj =
+          gate_adjoints[static_cast<size_t>(atom) * model.radial_funcs_count + mu];
+        if (adj == static_cast<RealT>(0.0)) {
+          continue;
+        }
+        const int body_base = mu * model.two_layer_gate_body_order_count;
+        for (int b = 0; b < model.two_layer_gate_body_order_count; ++b) {
+          body_adjoints[b] +=
+            adj * static_cast<RealT>(model.two_layer_gate_body_mix_weights_float[body_base + b]);
+        }
       }
     }
     for (int q = 0; q < model.two_layer_gate_scalar_count; ++q) {
@@ -4671,14 +4713,87 @@ static __global__ void gpu_sh_seed_gate_moment_grads_from_mu_adjoints(
       for (int mu = 0; mu < model.radial_funcs_count; ++mu) {
         const RealT adj =
           gate_adjoints[static_cast<size_t>(atom) * model.radial_funcs_count + mu];
-        const RealT weight = static_cast<RealT>(
-          model.two_layer_gate_weights_float[mu * model.two_layer_gate_scalar_count + q]);
+        const RealT weight = model.two_layer_gate_weights_transposed_float != nullptr
+          ? static_cast<RealT>(
+              model.two_layer_gate_weights_transposed_float[
+                static_cast<size_t>(q) * model.radial_funcs_count + mu])
+          : static_cast<RealT>(
+              model.two_layer_gate_weights_float[mu * model.two_layer_gate_scalar_count + q]);
         seed += adj * weight;
       }
       const int moment_id = model.two_layer_gate_moment_indices[q];
       grads[static_cast<size_t>(moment_id) * N + atom] += static_cast<GradT>(seed);
     }
   }
+}
+
+template <typename RealT, typename GradT>
+static __global__ void gpu_sh_seed_gate_moment_grads_full_q_parallel(
+  int N,
+  SHDeviceModel model,
+  const RealT* gate_adjoints,
+  GradT* grads)
+{
+  const size_t total =
+    static_cast<size_t>(N) * static_cast<size_t>(model.two_layer_gate_scalar_count);
+  const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= total) {
+    return;
+  }
+  const int atom = static_cast<int>(idx % static_cast<size_t>(N));
+  const int q = static_cast<int>(idx / static_cast<size_t>(N));
+  RealT seed = static_cast<RealT>(0.0);
+  for (int mu = 0; mu < model.radial_funcs_count; ++mu) {
+    const RealT adj =
+      gate_adjoints[static_cast<size_t>(atom) * model.radial_funcs_count + mu];
+    const RealT weight = static_cast<RealT>(
+      model.two_layer_gate_weights_float[
+        static_cast<size_t>(mu) * model.two_layer_gate_scalar_count + q]);
+    seed += adj * weight;
+  }
+  const int moment_id = model.two_layer_gate_moment_indices[q];
+  grads[static_cast<size_t>(moment_id) * N + atom] += static_cast<GradT>(seed);
+}
+
+template <typename RealT, typename GradT, int AtomTile, int QTile>
+static __global__ void gpu_sh_seed_gate_moment_grads_full_atom_q_tile(
+  int N,
+  SHDeviceModel model,
+  const RealT* gate_adjoints,
+  GradT* grads)
+{
+  __shared__ RealT adj_tile[AtomTile][kMaxSHRadialFuncs];
+  const int local_atom = threadIdx.x % AtomTile;
+  const int local_q = threadIdx.x / AtomTile;
+  const int atom_base = blockIdx.x * AtomTile;
+  const int q_base = blockIdx.y * QTile;
+
+  const int mu_count = model.radial_funcs_count;
+  const int adj_total = AtomTile * mu_count;
+  for (int idx = threadIdx.x; idx < adj_total; idx += blockDim.x) {
+    const int a = idx / mu_count;
+    const int mu = idx - a * mu_count;
+    const int atom = atom_base + a;
+    adj_tile[a][mu] = atom < N
+      ? gate_adjoints[static_cast<size_t>(atom) * mu_count + mu]
+      : static_cast<RealT>(0.0);
+  }
+  __syncthreads();
+
+  const int atom = atom_base + local_atom;
+  const int q = q_base + local_q;
+  if (local_q >= QTile || atom >= N || q >= model.two_layer_gate_scalar_count) {
+    return;
+  }
+  RealT seed = static_cast<RealT>(0.0);
+  for (int mu = 0; mu < mu_count; ++mu) {
+    const RealT weight = static_cast<RealT>(
+      model.two_layer_gate_weights_float[
+        static_cast<size_t>(mu) * model.two_layer_gate_scalar_count + q]);
+    seed += adj_tile[local_atom][mu] * weight;
+  }
+  const int moment_id = model.two_layer_gate_moment_indices[q];
+  grads[static_cast<size_t>(moment_id) * N + atom] += static_cast<GradT>(seed);
 }
 
 template <typename RealT, typename GradT>
@@ -4840,6 +4955,44 @@ static __global__ void gpu_sh_tensor_product_rows_forward(
   }
 }
 
+template <typename RealT>
+static __global__ void gpu_sh_tensor_product_rows_forward_gate_compact(
+  int N,
+  int layer,
+  SHDeviceModel model,
+  RealT* moments)
+{
+  const int row_begin = model.two_layer_gate_cg_layer_offsets[layer];
+  const int row_end = model.two_layer_gate_cg_layer_offsets[layer + 1];
+  const size_t row_count = static_cast<size_t>(row_end - row_begin);
+  const size_t total = row_count * static_cast<size_t>(N);
+  const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+  for (size_t task = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       task < total;
+       task += stride) {
+    const int atom = static_cast<int>(task % static_cast<size_t>(N));
+    const int row = row_begin + static_cast<int>(task / static_cast<size_t>(N));
+    const int row_base = row * 5;
+    const int left_base = model.two_layer_gate_cg_rows_int[row_base + 0];
+    const int right_base = model.two_layer_gate_cg_rows_int[row_base + 1];
+    const int target = model.two_layer_gate_cg_rows_int[row_base + 2];
+    const int term_begin = model.two_layer_gate_cg_rows_int[row_base + 3];
+    const int term_count = model.two_layer_gate_cg_rows_int[row_base + 4];
+    RealT sum = static_cast<RealT>(0.0);
+    for (int t = 0; t < term_count; ++t) {
+      const int term = term_begin + t;
+      const int term_base = term * 2;
+      const int left = left_base + model.two_layer_gate_cg_row_terms_int[term_base + 0];
+      const int right = right_base + model.two_layer_gate_cg_row_terms_int[term_base + 1];
+      const RealT coeff =
+        static_cast<RealT>(model.two_layer_gate_cg_row_terms_coeff_float[term]);
+      sum += coeff * moments[static_cast<size_t>(left) * N + atom] *
+             moments[static_cast<size_t>(right) * N + atom];
+    }
+    moments[static_cast<size_t>(target) * N + atom] = sum;
+  }
+}
+
 template <typename RealT, typename GradT>
 static __global__ void gpu_sh_energy_init_from_scalars(
   int N,
@@ -4969,6 +5122,114 @@ static __global__ void gpu_sh_tensor_product_back_rows(
         other = model.sh_cg_back_terms_int[term_base + 1];
         coeff = sh_cg_back_term_coeff<RealT>(model, term);
       }
+      sum += coeff * static_cast<RealT>(grads[static_cast<size_t>(target) * N + atom]) *
+             moments[static_cast<size_t>(other) * N + atom];
+    }
+    grads[static_cast<size_t>(source) * N + atom] += static_cast<GradT>(sum);
+  }
+}
+
+template <typename RealT, typename GradT>
+static __global__ void gpu_sh_tensor_product_back_rows_gate_needed(
+  int N,
+  int layer,
+  SHDeviceModel model,
+  const RealT* moments,
+  GradT* grads)
+{
+  const int row_begin = model.sh_cg_back_layer_offsets[layer];
+  const int row_end = model.sh_cg_back_layer_offsets[layer + 1];
+  const size_t row_count = static_cast<size_t>(row_end - row_begin);
+  const size_t total = row_count * static_cast<size_t>(N);
+  const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+  for (size_t task = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       task < total;
+       task += stride) {
+    const int atom = static_cast<int>(task % static_cast<size_t>(N));
+    const int row = row_begin + static_cast<int>(task / static_cast<size_t>(N));
+    int source;
+    int term_begin;
+    int term_count;
+    if (model.use_packed_back_rows) {
+      const unsigned int* back_u32 =
+        model.use_const_back_rows
+        ? c_sh_forward_u32 + sh_const_back_u32_offset(model)
+        : model.sh_cg_back_packed_u32;
+      const unsigned int row0 = back_u32[static_cast<size_t>(row) * 2 + 0];
+      source = static_cast<int>(row0 & 0xffffu);
+      term_count = static_cast<int>(row0 >> 16);
+      term_begin = static_cast<int>(back_u32[static_cast<size_t>(row) * 2 + 1]);
+    } else {
+      const int row_base = row * 3;
+      source = model.sh_cg_back_rows_int[row_base + 0];
+      term_begin = model.sh_cg_back_rows_int[row_base + 1];
+      term_count = model.sh_cg_back_rows_int[row_base + 2];
+    }
+    if (model.two_layer_gate_needed_moment_flags != nullptr &&
+        model.two_layer_gate_needed_moment_flags[source] == 0) {
+      continue;
+    }
+    RealT sum = static_cast<RealT>(0.0);
+    for (int t = 0; t < term_count; ++t) {
+      const int term = term_begin + t;
+      int target;
+      int other;
+      RealT coeff;
+      if (model.use_packed_back_rows) {
+        const unsigned int* back_u32 =
+          model.use_const_back_rows
+          ? c_sh_forward_u32 + sh_const_back_u32_offset(model)
+          : model.sh_cg_back_packed_u32;
+        const size_t packed_base =
+          static_cast<size_t>(model.sh_cg_back_row_count) * 2 +
+          static_cast<size_t>(term) * 2;
+        const unsigned int meta = back_u32[packed_base + 0];
+        target = static_cast<int>(meta & 0xffffu);
+        other = static_cast<int>(meta >> 16);
+        coeff = sh_const_forward_coeff<RealT>(back_u32[packed_base + 1]);
+      } else {
+        const int term_base = term * 2;
+        target = model.sh_cg_back_terms_int[term_base + 0];
+        other = model.sh_cg_back_terms_int[term_base + 1];
+        coeff = sh_cg_back_term_coeff<RealT>(model, term);
+      }
+      sum += coeff * static_cast<RealT>(grads[static_cast<size_t>(target) * N + atom]) *
+             moments[static_cast<size_t>(other) * N + atom];
+    }
+    grads[static_cast<size_t>(source) * N + atom] += static_cast<GradT>(sum);
+  }
+}
+
+template <typename RealT, typename GradT>
+static __global__ void gpu_sh_tensor_product_back_rows_gate_compact(
+  int N,
+  int layer,
+  SHDeviceModel model,
+  const RealT* moments,
+  GradT* grads)
+{
+  const int row_begin = model.two_layer_gate_cg_back_layer_offsets[layer];
+  const int row_end = model.two_layer_gate_cg_back_layer_offsets[layer + 1];
+  const size_t row_count = static_cast<size_t>(row_end - row_begin);
+  const size_t total = row_count * static_cast<size_t>(N);
+  const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+  for (size_t task = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       task < total;
+       task += stride) {
+    const int atom = static_cast<int>(task % static_cast<size_t>(N));
+    const int row = row_begin + static_cast<int>(task / static_cast<size_t>(N));
+    const int row_base = row * 3;
+    const int source = model.two_layer_gate_cg_back_rows_int[row_base + 0];
+    const int term_begin = model.two_layer_gate_cg_back_rows_int[row_base + 1];
+    const int term_count = model.two_layer_gate_cg_back_rows_int[row_base + 2];
+    RealT sum = static_cast<RealT>(0.0);
+    for (int t = 0; t < term_count; ++t) {
+      const int term = term_begin + t;
+      const int term_base = term * 2;
+      const int target = model.two_layer_gate_cg_back_terms_int[term_base + 0];
+      const int other = model.two_layer_gate_cg_back_terms_int[term_base + 1];
+      const RealT coeff =
+        static_cast<RealT>(model.two_layer_gate_cg_back_terms_coeff_float[term]);
       sum += coeff * static_cast<RealT>(grads[static_cast<size_t>(target) * N + atom]) *
              moments[static_cast<size_t>(other) * N + atom];
     }
@@ -5817,7 +6078,8 @@ __device__ __forceinline__ void compute_sh_edge_derivative_gate_main_cached_grad
   SHDeviceModel model,
   int center_type,
   int neighbor_type,
-  const RealT* gate_values_neighbor,
+  const RealT* gate_multipliers_neighbor,
+  const RealT* gate_derivs_neighbor,
   RealT dx,
   RealT dy,
   RealT dz,
@@ -5831,20 +6093,9 @@ __device__ __forceinline__ void compute_sh_edge_derivative_gate_main_cached_grad
   const int pair = center_type * model.species_count + neighbor_type;
   RealT radial_vals[kMaxSHRadialFuncs];
   RealT radial_ders[kMaxSHRadialFuncs];
-  RealT gate_multipliers[kMaxSHRadialFuncs];
-  RealT gate_derivs[kMaxSHRadialFuncs];
   RealT sh_vals[kMaxSHComponents];
   RealT sh_ders[3 * kMaxSHComponents];
   sh_direct_radial_vals_ders(model, pair, r, radial_vals, radial_ders);
-  const RealT amplitude = static_cast<RealT>(model.two_layer_gate_tanh_amplitude);
-  for (int mu = 0; mu < model.radial_funcs_count; ++mu) {
-    const RealT gate_residual = gate_values_neighbor[mu];
-    const RealT a = sh_gate_additive_coeff<RealT>(model, neighbor_type, mu);
-    const RealT arg = a * gate_residual;
-    const RealT tanh_arg = tanh(arg);
-    gate_multipliers[mu] = static_cast<RealT>(1.0) + amplitude * tanh_arg;
-    gate_derivs[mu] = amplitude * a * (static_cast<RealT>(1.0) - tanh_arg * tanh_arg);
-  }
   eval_real_sh(dx, dy, dz, r, model.sh_l_max, sh_vals, sh_ders);
   const RealT inv_r = static_cast<RealT>(1.0) / r;
   dEx = dEy = dEz = static_cast<RealT>(0.0);
@@ -5861,14 +6112,14 @@ __device__ __forceinline__ void compute_sh_edge_derivative_gate_main_cached_grad
     const RealT radial = radial_vals[mu];
     const RealT radial_der = radial_ders[mu];
     const RealT ylm = sh_vals[yidx];
-    const RealT mult = gate_multipliers[mu];
+    const RealT mult = gate_multipliers_neighbor[mu];
     dEx += adj * mult *
            (radial_der * dx * inv_r * ylm + radial * sh_ders[3 * yidx + 0]);
     dEy += adj * mult *
            (radial_der * dy * inv_r * ylm + radial * sh_ders[3 * yidx + 1]);
     dEz += adj * mult *
            (radial_der * dz * inv_r * ylm + radial * sh_ders[3 * yidx + 2]);
-    gate_adjoints_mu[mu] += adj * radial * ylm * gate_derivs[mu];
+    gate_adjoints_mu[mu] += adj * radial * ylm * gate_derivs_neighbor[mu];
   }
 }
 
@@ -5975,7 +6226,8 @@ __device__ __forceinline__ void compute_sh_edge_derivative_gate_main_static_layo
   SHDeviceModel model,
   int center_type,
   int neighbor_type,
-  const RealT* gate_values_neighbor,
+  const RealT* gate_multipliers_neighbor,
+  const RealT* gate_derivs_neighbor,
   RealT dx,
   RealT dy,
   RealT dz,
@@ -5989,23 +6241,11 @@ __device__ __forceinline__ void compute_sh_edge_derivative_gate_main_static_layo
   constexpr int RadialFuncs = K * (L + 1);
   RealT radial_vals[RadialFuncs];
   RealT radial_ders[RadialFuncs];
-  RealT gate_multipliers[RadialFuncs];
-  RealT gate_derivs[RadialFuncs];
   RealT sh_vals[kMaxSHComponents];
   RealT sh_ders[3 * kMaxSHComponents];
   const int pair = center_type * model.species_count + neighbor_type;
   sh_direct_radial_vals_ders_static<RealT, RadialFuncs, RbSize>(
     model, model.radial_direct_coeffs, pair, r, radial_vals, radial_ders);
-  const RealT amplitude = static_cast<RealT>(model.two_layer_gate_tanh_amplitude);
-#pragma unroll
-  for (int mu = 0; mu < RadialFuncs; ++mu) {
-    const RealT gate_residual = gate_values_neighbor[mu];
-    const RealT a = sh_gate_additive_coeff<RealT>(model, neighbor_type, mu);
-    const RealT arg = a * gate_residual;
-    const RealT tanh_arg = tanh(arg);
-    gate_multipliers[mu] = static_cast<RealT>(1.0) + amplitude * tanh_arg;
-    gate_derivs[mu] = amplitude * a * (static_cast<RealT>(1.0) - tanh_arg * tanh_arg);
-  }
   eval_real_sh(dx, dy, dz, r, L, sh_vals, sh_ders);
 
   const RealT inv_r = static_cast<RealT>(1.0) / r;
@@ -6037,12 +6277,12 @@ __device__ __forceinline__ void compute_sh_edge_derivative_gate_main_static_layo
         projected_dy += adj * sh_ders[3 * yidx + 1];
         projected_dz += adj * sh_ders[3 * yidx + 2];
       }
-      const RealT mult = gate_multipliers[mu];
+      const RealT mult = gate_multipliers_neighbor[mu];
       const RealT radial_projected = mult * radial_der * inv_r * projected_y;
       dEx += radial_projected * dx + mult * radial * projected_dx;
       dEy += radial_projected * dy + mult * radial * projected_dy;
       dEz += radial_projected * dz + mult * radial * projected_dz;
-      gate_adjoints_mu[mu] += radial * gate_derivs[mu] * projected_y;
+      gate_adjoints_mu[mu] += radial * gate_derivs_neighbor[mu] * projected_y;
     }
   }
 }
@@ -6327,9 +6567,11 @@ static __global__ void gpu_sh_compute_forces_gate_main_cached_grads(
   const double* x,
   const double* y,
   const double* z,
-  const RealT* gate_values,
+  const RealT* gate_multipliers,
+  const RealT* gate_derivs,
   const GradT* grads,
   RealT* gate_adjoints,
+  RealT* gate_body_adjoints,
   float* force_tmp,
   float* force_self_tmp,
   float* virial_tmp)
@@ -6379,8 +6621,9 @@ static __global__ void gpu_sh_compute_forces_gate_main_cached_grads(
     RealT dEz;
     RealT gate_adjoints_mu[kMaxSHRadialFuncs];
 	    compute_sh_edge_derivative_gate_main_cached_grads<GradT, RealT>(
-	      model, type_i, type_j,
-        gate_values + static_cast<size_t>(j) * model.radial_funcs_count,
+		      model, type_i, type_j,
+        gate_multipliers + static_cast<size_t>(j) * model.radial_funcs_count,
+        gate_derivs + static_cast<size_t>(j) * model.radial_funcs_count,
         dx, dy, dz, r, grad_cache, dEx, dEy, dEz, gate_adjoints_mu);
 
     fx_self += dEx;
@@ -6389,10 +6632,31 @@ static __global__ void gpu_sh_compute_forces_gate_main_cached_grads(
     atomicAdd(force_tmp + j, static_cast<float>(-dEx));
     atomicAdd(force_tmp + j + N, static_cast<float>(-dEy));
     atomicAdd(force_tmp + j + 2 * N, static_cast<float>(-dEz));
-    for (int mu = 0; mu < model.radial_funcs_count; ++mu) {
-      atomicAdd(
-        gate_adjoints + static_cast<size_t>(j) * model.radial_funcs_count + mu,
-        static_cast<RealT>(gate_adjoints_mu[mu]));
+    if (gate_body_adjoints != nullptr &&
+        model.two_layer_gate_mode == kSHGateMuBodyLinearCombo) {
+      RealT body_adjoints[kMaxSHRadialFuncs];
+      for (int b = 0; b < model.two_layer_gate_body_order_count; ++b) {
+        body_adjoints[b] = static_cast<RealT>(0.0);
+      }
+      for (int mu = 0; mu < model.radial_funcs_count; ++mu) {
+        const RealT adj_mu = gate_adjoints_mu[mu];
+        const int body_base = mu * model.two_layer_gate_body_order_count;
+        for (int b = 0; b < model.two_layer_gate_body_order_count; ++b) {
+          body_adjoints[b] +=
+            adj_mu * static_cast<RealT>(model.two_layer_gate_body_mix_weights_float[body_base + b]);
+        }
+      }
+      for (int b = 0; b < model.two_layer_gate_body_order_count; ++b) {
+        atomicAdd(
+          gate_body_adjoints + static_cast<size_t>(j) * model.two_layer_gate_body_order_count + b,
+          static_cast<RealT>(body_adjoints[b]));
+      }
+    } else {
+      for (int mu = 0; mu < model.radial_funcs_count; ++mu) {
+        atomicAdd(
+          gate_adjoints + static_cast<size_t>(j) * model.radial_funcs_count + mu,
+          static_cast<RealT>(gate_adjoints_mu[mu]));
+      }
     }
 
     s_xx -= dEx * dx;
@@ -6668,9 +6932,11 @@ static __global__ void gpu_sh_compute_forces_gate_main_static_layout(
   const double* x,
   const double* y,
   const double* z,
-  const RealT* gate_values,
+  const RealT* gate_multipliers,
+  const RealT* gate_derivs,
   const GradT* grads,
   RealT* gate_adjoints,
+  RealT* gate_body_adjoints,
   float* force_tmp,
   float* force_self_tmp,
   float* virial_tmp)
@@ -6725,7 +6991,8 @@ static __global__ void gpu_sh_compute_forces_gate_main_static_layout(
     RealT gate_adjoints_mu[RadialFuncs];
     compute_sh_edge_derivative_gate_main_static_layout<GradT, RealT, L, K, RbSize>(
       model, type_i, type_j,
-      gate_values + static_cast<size_t>(j) * static_cast<size_t>(RadialFuncs),
+      gate_multipliers + static_cast<size_t>(j) * static_cast<size_t>(RadialFuncs),
+      gate_derivs + static_cast<size_t>(j) * static_cast<size_t>(RadialFuncs),
       dx, dy, dz, r, grad_cache, dEx, dEy, dEz, gate_adjoints_mu);
 
     fx_self += dEx;
@@ -6734,11 +7001,33 @@ static __global__ void gpu_sh_compute_forces_gate_main_static_layout(
     atomicAdd(force_tmp + j, static_cast<float>(-dEx));
     atomicAdd(force_tmp + j + N, static_cast<float>(-dEy));
     atomicAdd(force_tmp + j + 2 * N, static_cast<float>(-dEz));
+    if (gate_body_adjoints != nullptr &&
+        model.two_layer_gate_mode == kSHGateMuBodyLinearCombo) {
+      RealT body_adjoints[kMaxSHRadialFuncs];
+      for (int b = 0; b < model.two_layer_gate_body_order_count; ++b) {
+        body_adjoints[b] = static_cast<RealT>(0.0);
+      }
 #pragma unroll
-    for (int mu = 0; mu < RadialFuncs; ++mu) {
-      atomicAdd(
-        gate_adjoints + static_cast<size_t>(j) * static_cast<size_t>(RadialFuncs) + mu,
-        static_cast<RealT>(gate_adjoints_mu[mu]));
+      for (int mu = 0; mu < RadialFuncs; ++mu) {
+        const RealT adj_mu = gate_adjoints_mu[mu];
+        const int body_base = mu * model.two_layer_gate_body_order_count;
+        for (int b = 0; b < model.two_layer_gate_body_order_count; ++b) {
+          body_adjoints[b] +=
+            adj_mu * static_cast<RealT>(model.two_layer_gate_body_mix_weights_float[body_base + b]);
+        }
+      }
+      for (int b = 0; b < model.two_layer_gate_body_order_count; ++b) {
+        atomicAdd(
+          gate_body_adjoints + static_cast<size_t>(j) * model.two_layer_gate_body_order_count + b,
+          static_cast<RealT>(body_adjoints[b]));
+      }
+    } else {
+#pragma unroll
+      for (int mu = 0; mu < RadialFuncs; ++mu) {
+        atomicAdd(
+          gate_adjoints + static_cast<size_t>(j) * static_cast<size_t>(RadialFuncs) + mu,
+          static_cast<RealT>(gate_adjoints_mu[mu]));
+      }
     }
 
     s_xx -= dEx * dx;
@@ -7021,9 +7310,11 @@ bool launch_sh_compute_forces_gate_main_static(
   const double* x,
   const double* y,
   const double* z,
-  const RealT* gate_values,
+  const RealT* gate_multipliers,
+  const RealT* gate_derivs,
   const GradT* grads,
   RealT* gate_adjoints,
+  RealT* gate_body_adjoints,
   float* force_tmp,
   float* force_self_tmp,
   float* virial_tmp)
@@ -7038,48 +7329,54 @@ bool launch_sh_compute_forces_gate_main_static(
       gpu_sh_compute_forces_gate_main_static_layout<GradT, RealT, LVAL, 1, 10>            \
         <<<grid_size, kBlockSize>>>(                                                      \
           N, box, cutoff_square, use_cached_displacements, model, type, neighbor_count,   \
-          neighbor_atoms, neighbor_dx, neighbor_dy, neighbor_dz, x, y, z, gate_values,    \
-          grads, gate_adjoints, force_tmp, force_self_tmp, virial_tmp);                   \
+          neighbor_atoms, neighbor_dx, neighbor_dy, neighbor_dz, x, y, z, gate_multipliers,\
+          gate_derivs, grads, gate_adjoints, gate_body_adjoints, force_tmp,                \
+          force_self_tmp, virial_tmp);                                                     \
       return true;                                                                        \
     }                                                                                     \
     if (kmax == 2) {                                                                      \
       gpu_sh_compute_forces_gate_main_static_layout<GradT, RealT, LVAL, 2, 10>            \
         <<<grid_size, kBlockSize>>>(                                                      \
           N, box, cutoff_square, use_cached_displacements, model, type, neighbor_count,   \
-          neighbor_atoms, neighbor_dx, neighbor_dy, neighbor_dz, x, y, z, gate_values,    \
-          grads, gate_adjoints, force_tmp, force_self_tmp, virial_tmp);                   \
+          neighbor_atoms, neighbor_dx, neighbor_dy, neighbor_dz, x, y, z, gate_multipliers,\
+          gate_derivs, grads, gate_adjoints, gate_body_adjoints, force_tmp,                \
+          force_self_tmp, virial_tmp);                                                     \
       return true;                                                                        \
     }                                                                                     \
     if (kmax == 3) {                                                                      \
       gpu_sh_compute_forces_gate_main_static_layout<GradT, RealT, LVAL, 3, 10>            \
         <<<grid_size, kBlockSize>>>(                                                      \
           N, box, cutoff_square, use_cached_displacements, model, type, neighbor_count,   \
-          neighbor_atoms, neighbor_dx, neighbor_dy, neighbor_dz, x, y, z, gate_values,    \
-          grads, gate_adjoints, force_tmp, force_self_tmp, virial_tmp);                   \
+          neighbor_atoms, neighbor_dx, neighbor_dy, neighbor_dz, x, y, z, gate_multipliers,\
+          gate_derivs, grads, gate_adjoints, gate_body_adjoints, force_tmp,                \
+          force_self_tmp, virial_tmp);                                                     \
       return true;                                                                        \
     }                                                                                     \
     if (kmax == 4) {                                                                      \
       gpu_sh_compute_forces_gate_main_static_layout<GradT, RealT, LVAL, 4, 10>            \
         <<<grid_size, kBlockSize>>>(                                                      \
           N, box, cutoff_square, use_cached_displacements, model, type, neighbor_count,   \
-          neighbor_atoms, neighbor_dx, neighbor_dy, neighbor_dz, x, y, z, gate_values,    \
-          grads, gate_adjoints, force_tmp, force_self_tmp, virial_tmp);                   \
+          neighbor_atoms, neighbor_dx, neighbor_dy, neighbor_dz, x, y, z, gate_multipliers,\
+          gate_derivs, grads, gate_adjoints, gate_body_adjoints, force_tmp,                \
+          force_self_tmp, virial_tmp);                                                     \
       return true;                                                                        \
     }                                                                                     \
     if (kmax == 5) {                                                                      \
       gpu_sh_compute_forces_gate_main_static_layout<GradT, RealT, LVAL, 5, 10>            \
         <<<grid_size, kBlockSize>>>(                                                      \
           N, box, cutoff_square, use_cached_displacements, model, type, neighbor_count,   \
-          neighbor_atoms, neighbor_dx, neighbor_dy, neighbor_dz, x, y, z, gate_values,    \
-          grads, gate_adjoints, force_tmp, force_self_tmp, virial_tmp);                   \
+          neighbor_atoms, neighbor_dx, neighbor_dy, neighbor_dz, x, y, z, gate_multipliers,\
+          gate_derivs, grads, gate_adjoints, gate_body_adjoints, force_tmp,                \
+          force_self_tmp, virial_tmp);                                                     \
       return true;                                                                        \
     }                                                                                     \
     if (kmax == 6) {                                                                      \
       gpu_sh_compute_forces_gate_main_static_layout<GradT, RealT, LVAL, 6, 10>            \
         <<<grid_size, kBlockSize>>>(                                                      \
           N, box, cutoff_square, use_cached_displacements, model, type, neighbor_count,   \
-          neighbor_atoms, neighbor_dx, neighbor_dy, neighbor_dz, x, y, z, gate_values,    \
-          grads, gate_adjoints, force_tmp, force_self_tmp, virial_tmp);                   \
+          neighbor_atoms, neighbor_dx, neighbor_dy, neighbor_dz, x, y, z, gate_multipliers,\
+          gate_derivs, grads, gate_adjoints, gate_body_adjoints, force_tmp,                \
+          force_self_tmp, virial_tmp);                                                     \
       return true;                                                                        \
     }                                                                                     \
   } while (0)
@@ -7775,6 +8072,78 @@ SUS2_SH::SUS2_SH(
     if (!cg_row_term_coeffs_f.empty()) {
       sh_cg_row_terms_coeff_float_.copy_from_host(cg_row_term_coeffs_f.data());
     }
+  }
+
+  std::vector<SHCGRowHost> gate_forward_rows;
+  std::vector<SHCGRowTermHost> gate_forward_terms;
+  std::vector<int> gate_forward_layer_offsets(host_model.cg_layer_offsets.size(), 0);
+  if (two_layer_gate_enabled_ && !host_model.two_layer_gate_needed_moment_flags.empty()) {
+    for (int layer = 1; layer <= sh_cg_layer_count_; ++layer) {
+      gate_forward_layer_offsets[layer] =
+        static_cast<int>(gate_forward_rows.size());
+      const int row_begin = host_model.cg_layer_offsets[layer];
+      const int row_end = host_model.cg_layer_offsets[layer + 1];
+      for (int r = row_begin; r < row_end; ++r) {
+        const SHCGRowHost& old_row = host_model.cg_rows[r];
+        if (old_row.target < 0 || old_row.target >= alpha_moments_count_ ||
+            host_model.two_layer_gate_needed_moment_flags[old_row.target] == 0) {
+          continue;
+        }
+        SHCGRowHost new_row;
+        new_row.layer = old_row.layer;
+        new_row.left_base = old_row.left_base;
+        new_row.right_base = old_row.right_base;
+        new_row.target = old_row.target;
+        new_row.term_begin = static_cast<int>(gate_forward_terms.size());
+        new_row.term_count = old_row.term_count;
+        gate_forward_rows.push_back(new_row);
+        for (int t = 0; t < old_row.term_count; ++t) {
+          gate_forward_terms.push_back(host_model.cg_row_terms[old_row.term_begin + t]);
+        }
+      }
+    }
+    if (!gate_forward_layer_offsets.empty()) {
+      gate_forward_layer_offsets[sh_cg_layer_count_ + 1] =
+        static_cast<int>(gate_forward_rows.size());
+    }
+  }
+  two_layer_gate_cg_row_count_ = static_cast<int>(gate_forward_rows.size());
+  two_layer_gate_cg_row_term_count_ = static_cast<int>(gate_forward_terms.size());
+  std::vector<int> gate_forward_row_ints(
+    static_cast<size_t>(two_layer_gate_cg_row_count_) * 5);
+  for (int r = 0; r < two_layer_gate_cg_row_count_; ++r) {
+    const SHCGRowHost& row = gate_forward_rows[r];
+    gate_forward_row_ints[r * 5 + 0] = row.left_base;
+    gate_forward_row_ints[r * 5 + 1] = row.right_base;
+    gate_forward_row_ints[r * 5 + 2] = row.target;
+    gate_forward_row_ints[r * 5 + 3] = row.term_begin;
+    gate_forward_row_ints[r * 5 + 4] = row.term_count;
+  }
+  std::vector<int> gate_forward_term_ints(
+    static_cast<size_t>(two_layer_gate_cg_row_term_count_) * 2);
+  std::vector<float> gate_forward_term_coeffs(
+    static_cast<size_t>(two_layer_gate_cg_row_term_count_));
+  for (int t = 0; t < two_layer_gate_cg_row_term_count_; ++t) {
+    const SHCGRowTermHost& term = gate_forward_terms[t];
+    gate_forward_term_ints[t * 2 + 0] = term.left_component;
+    gate_forward_term_ints[t * 2 + 1] = term.right_component;
+    gate_forward_term_coeffs[t] = static_cast<float>(term.coeff);
+  }
+  two_layer_gate_cg_rows_int_.resize(gate_forward_row_ints.size());
+  if (!gate_forward_row_ints.empty()) {
+    two_layer_gate_cg_rows_int_.copy_from_host(gate_forward_row_ints.data());
+  }
+  two_layer_gate_cg_row_terms_int_.resize(gate_forward_term_ints.size());
+  if (!gate_forward_term_ints.empty()) {
+    two_layer_gate_cg_row_terms_int_.copy_from_host(gate_forward_term_ints.data());
+  }
+  two_layer_gate_cg_row_terms_coeff_float_.resize(gate_forward_term_coeffs.size());
+  if (!gate_forward_term_coeffs.empty()) {
+    two_layer_gate_cg_row_terms_coeff_float_.copy_from_host(gate_forward_term_coeffs.data());
+  }
+  two_layer_gate_cg_layer_offsets_.resize(gate_forward_layer_offsets.size());
+  if (!gate_forward_layer_offsets.empty()) {
+    two_layer_gate_cg_layer_offsets_.copy_from_host(gate_forward_layer_offsets.data());
   }
 
   std::vector<int> terminal_moment_flags(alpha_moments_count_, 0);
@@ -8751,6 +9120,81 @@ SUS2_SH::SUS2_SH(
     sh_cg_back_layer_offsets_.copy_from_host(device_back_layer_offsets.data());
   }
 
+  std::vector<SHCGBackRowHost> gate_back_rows;
+  std::vector<SHCGBackTermHost> gate_back_terms;
+  std::vector<int> gate_back_layer_offsets(device_back_layer_offsets.size(), 0);
+  if (two_layer_gate_enabled_ && !host_model.two_layer_gate_needed_moment_flags.empty()) {
+    for (int layer = 1; layer <= sh_cg_layer_count_; ++layer) {
+      gate_back_layer_offsets[layer] = static_cast<int>(gate_back_rows.size());
+      const int row_begin = device_back_layer_offsets[layer];
+      const int row_end = device_back_layer_offsets[layer + 1];
+      for (int r = row_begin; r < row_end; ++r) {
+        const SHCGBackRowHost& old_row = device_back_rows[r];
+        if (old_row.source < 0 || old_row.source >= alpha_moments_count_ ||
+            host_model.two_layer_gate_needed_moment_flags[old_row.source] == 0) {
+          continue;
+        }
+        SHCGBackRowHost new_row;
+        new_row.layer = old_row.layer;
+        new_row.source = old_row.source;
+        new_row.term_begin = static_cast<int>(gate_back_terms.size());
+        new_row.term_count = 0;
+        for (int t = 0; t < old_row.term_count; ++t) {
+          const SHCGBackTermHost& term = device_back_terms[old_row.term_begin + t];
+          if (term.target < 0 || term.target >= alpha_moments_count_ ||
+              host_model.two_layer_gate_needed_moment_flags[term.target] == 0) {
+            continue;
+          }
+          gate_back_terms.push_back(term);
+          ++new_row.term_count;
+        }
+        if (new_row.term_count > 0) {
+          gate_back_rows.push_back(new_row);
+        }
+      }
+    }
+    if (!gate_back_layer_offsets.empty()) {
+      gate_back_layer_offsets[sh_cg_layer_count_ + 1] =
+        static_cast<int>(gate_back_rows.size());
+    }
+  }
+  two_layer_gate_cg_back_row_count_ = static_cast<int>(gate_back_rows.size());
+  two_layer_gate_cg_back_term_count_ = static_cast<int>(gate_back_terms.size());
+  std::vector<int> gate_back_row_ints(
+    static_cast<size_t>(two_layer_gate_cg_back_row_count_) * 3);
+  for (int r = 0; r < two_layer_gate_cg_back_row_count_; ++r) {
+    const SHCGBackRowHost& row = gate_back_rows[r];
+    gate_back_row_ints[r * 3 + 0] = row.source;
+    gate_back_row_ints[r * 3 + 1] = row.term_begin;
+    gate_back_row_ints[r * 3 + 2] = row.term_count;
+  }
+  std::vector<int> gate_back_term_ints(
+    static_cast<size_t>(two_layer_gate_cg_back_term_count_) * 2);
+  std::vector<float> gate_back_term_coeffs(
+    static_cast<size_t>(two_layer_gate_cg_back_term_count_));
+  for (int t = 0; t < two_layer_gate_cg_back_term_count_; ++t) {
+    const SHCGBackTermHost& term = gate_back_terms[t];
+    gate_back_term_ints[t * 2 + 0] = term.target;
+    gate_back_term_ints[t * 2 + 1] = term.other;
+    gate_back_term_coeffs[t] = static_cast<float>(term.coeff);
+  }
+  two_layer_gate_cg_back_rows_int_.resize(gate_back_row_ints.size());
+  if (!gate_back_row_ints.empty()) {
+    two_layer_gate_cg_back_rows_int_.copy_from_host(gate_back_row_ints.data());
+  }
+  two_layer_gate_cg_back_terms_int_.resize(gate_back_term_ints.size());
+  if (!gate_back_term_ints.empty()) {
+    two_layer_gate_cg_back_terms_int_.copy_from_host(gate_back_term_ints.data());
+  }
+  two_layer_gate_cg_back_terms_coeff_float_.resize(gate_back_term_coeffs.size());
+  if (!gate_back_term_coeffs.empty()) {
+    two_layer_gate_cg_back_terms_coeff_float_.copy_from_host(gate_back_term_coeffs.data());
+  }
+  two_layer_gate_cg_back_layer_offsets_.resize(gate_back_layer_offsets.size());
+  if (!gate_back_layer_offsets.empty()) {
+    two_layer_gate_cg_back_layer_offsets_.copy_from_host(gate_back_layer_offsets.data());
+  }
+
   std::vector<int> grad_zero_moments;
   if (use_selective_grad_zero_) {
     std::vector<unsigned char> needs_zero(alpha_moments_count_, 0);
@@ -8842,6 +9286,19 @@ SUS2_SH::SUS2_SH(
       host_model.two_layer_gate_weights.begin(), host_model.two_layer_gate_weights.end());
     two_layer_gate_weights_float_.resize(gate_weights.size());
     two_layer_gate_weights_float_.copy_from_host(gate_weights.data());
+    if (host_model.two_layer_gate_mode == kSHGateMuScalarFull) {
+      std::vector<float> gate_weights_transposed(gate_weights.size());
+      for (int mu = 0; mu < host_model.radial_funcs_count; ++mu) {
+        for (int q = 0; q < host_model.two_layer_gate_scalar_count; ++q) {
+          gate_weights_transposed[
+            static_cast<size_t>(q) * host_model.radial_funcs_count + mu] =
+            gate_weights[
+              static_cast<size_t>(mu) * host_model.two_layer_gate_scalar_count + q];
+        }
+      }
+      two_layer_gate_weights_transposed_float_.resize(gate_weights_transposed.size());
+      two_layer_gate_weights_transposed_float_.copy_from_host(gate_weights_transposed.data());
+    }
     std::vector<float> body_mix_weights(
       host_model.two_layer_gate_body_mix_weights.begin(),
       host_model.two_layer_gate_body_mix_weights.end());
@@ -8904,7 +9361,7 @@ SUS2_SH::SUS2_SH(
       two_layer_gate_mode_ == kSHGateMuBodyLinearCombo ? "mu-body-linear-combo" :
       two_layer_gate_mode_ == kSHGateMuScalarFull ? "mu-scalar-full" : "legacy";
     printf(
-      "SUS2-SH GPUMD two-layer gate enabled: mode=%s, tanh_amplitude=%g, gate_weights=%d, gate_scalars=%d, gate_body_orders=%d, gate_product_limit=%d/%d, additive_coeffs=%zu.\n",
+      "SUS2-SH GPUMD two-layer gate enabled: mode=%s, tanh_amplitude=%g, gate_weights=%d, gate_scalars=%d, gate_body_orders=%d, gate_product_limit=%d/%d, gate_compact_forward_rows=%d, gate_compact_forward_terms=%d, gate_compact_back_rows=%d, gate_compact_back_terms=%d, additive_coeffs=%zu.\n",
       gate_mode_name,
       two_layer_gate_tanh_amplitude_,
       two_layer_gate_weight_count_,
@@ -8912,6 +9369,10 @@ SUS2_SH::SUS2_SH(
       two_layer_gate_body_order_count_,
       two_layer_gate_product_limit_,
       sh_product_count_,
+      two_layer_gate_cg_row_count_,
+      two_layer_gate_cg_row_term_count_,
+      two_layer_gate_cg_back_row_count_,
+      two_layer_gate_cg_back_term_count_,
       host_model.two_layer_gate_additive_coeffs.size());
   }
 	  printf(
@@ -9032,8 +9493,22 @@ void SUS2_SH::resize_work_buffers(int num_atoms)
       if (two_layer_gate_values_float_.size() != gate_mu_size) {
         two_layer_gate_values_float_.resize(gate_mu_size);
       }
+      if (two_layer_gate_multipliers_float_.size() != gate_mu_size) {
+        two_layer_gate_multipliers_float_.resize(gate_mu_size);
+      }
+      if (two_layer_gate_derivs_float_.size() != gate_mu_size) {
+        two_layer_gate_derivs_float_.resize(gate_mu_size);
+      }
       if (two_layer_gate_adjoints_float_.size() != gate_mu_size) {
         two_layer_gate_adjoints_float_.resize(gate_mu_size);
+      }
+      const size_t gate_body_size =
+        static_cast<size_t>(num_atoms) *
+        static_cast<size_t>(two_layer_gate_body_order_count_ > 0
+                            ? two_layer_gate_body_order_count_ : 1);
+      if (two_layer_gate_mode_ == kSHGateMuBodyLinearCombo &&
+          two_layer_gate_body_adjoints_float_.size() != gate_body_size) {
+        two_layer_gate_body_adjoints_float_.resize(gate_body_size);
       }
     }
 	  } else {
@@ -9269,6 +9744,14 @@ void SUS2_SH::compute(
     sh_cg_row_terms_coeff_.data(),
     use_float_moments_ ? sh_cg_row_terms_coeff_float_.data() : nullptr,
     sh_cg_row_scalar_index_.data(),
+    two_layer_gate_enabled_ && two_layer_gate_cg_row_count_ > 0
+      ? two_layer_gate_cg_rows_int_.data() : nullptr,
+    two_layer_gate_enabled_ && two_layer_gate_cg_row_term_count_ > 0
+      ? two_layer_gate_cg_row_terms_int_.data() : nullptr,
+    two_layer_gate_enabled_ && two_layer_gate_cg_row_term_count_ > 0
+      ? two_layer_gate_cg_row_terms_coeff_float_.data() : nullptr,
+    two_layer_gate_enabled_ && two_layer_gate_cg_layer_offsets_.size() > 0
+      ? two_layer_gate_cg_layer_offsets_.data() : nullptr,
     sh_terminal_moment_flags_.data(),
     use_terminal_dot_rows_ ? sh_cg_row_dot_u32_.data() : nullptr,
     use_product_pattern_rows_ && !use_const_pattern_rows_ ? sh_cg_row_pattern_u32_.data() : nullptr,
@@ -9283,6 +9766,14 @@ void SUS2_SH::compute(
     use_float_moments_ ? sh_cg_back_terms_coeff_float_.data() : nullptr,
     sh_cg_back_layer_offsets_.data(),
     use_packed_back_rows_ ? sh_cg_back_packed_u32_.data() : nullptr,
+    two_layer_gate_enabled_ && two_layer_gate_cg_back_row_count_ > 0
+      ? two_layer_gate_cg_back_rows_int_.data() : nullptr,
+    two_layer_gate_enabled_ && two_layer_gate_cg_back_term_count_ > 0
+      ? two_layer_gate_cg_back_terms_int_.data() : nullptr,
+    two_layer_gate_enabled_ && two_layer_gate_cg_back_term_count_ > 0
+      ? two_layer_gate_cg_back_terms_coeff_float_.data() : nullptr,
+    two_layer_gate_enabled_ && two_layer_gate_cg_back_layer_offsets_.size() > 0
+      ? two_layer_gate_cg_back_layer_offsets_.data() : nullptr,
     active_scalar_moment_.data(),
     active_scalar_coeff_.data(),
     use_float_moments_ ? active_scalar_coeff_float_.data() : nullptr,
@@ -9302,6 +9793,8 @@ void SUS2_SH::compute(
     two_layer_gate_enabled_ ? two_layer_gate_moment_indices_.data() : nullptr,
     two_layer_gate_enabled_ ? two_layer_gate_scalar_body_ids_.data() : nullptr,
     two_layer_gate_enabled_ ? two_layer_gate_weights_float_.data() : nullptr,
+    two_layer_gate_enabled_ && two_layer_gate_weights_transposed_float_.size() > 0
+      ? two_layer_gate_weights_transposed_float_.data() : nullptr,
     two_layer_gate_enabled_ && two_layer_gate_body_mix_weights_float_.size() > 0
       ? two_layer_gate_body_mix_weights_float_.data() : nullptr,
     two_layer_gate_enabled_ ? two_layer_gate_needed_moment_flags_.data() : nullptr,
@@ -9364,17 +9857,24 @@ void SUS2_SH::compute(
     GPU_CHECK_KERNEL
     profile_stop(sh_profile_basic, stage_start);
 
-	    stage_start = profile_start();
+    stage_start = profile_start();
     for (int layer = 1; layer <= sh_cg_layer_count_; ++layer) {
-      gpu_sh_tensor_product_rows_forward<float><<<product_grid_size, kProductBlockSize>>>(
-        num_atoms, layer, model, two_layer_gate_moment_vals_float_.data());
+      if (model.two_layer_gate_cg_layer_offsets != nullptr &&
+          model.two_layer_gate_cg_rows_int != nullptr) {
+        gpu_sh_tensor_product_rows_forward_gate_compact<float>
+          <<<product_grid_size, kProductBlockSize>>>(
+          num_atoms, layer, model, two_layer_gate_moment_vals_float_.data());
+      } else {
+        gpu_sh_tensor_product_rows_forward<float><<<product_grid_size, kProductBlockSize>>>(
+          num_atoms, layer, model, two_layer_gate_moment_vals_float_.data());
+      }
       GPU_CHECK_KERNEL
     }
+    const size_t gate_mu_size =
+      static_cast<size_t>(num_atoms) * static_cast<size_t>(radial_funcs_count_);
+    const int gate_mu_grid_size =
+      static_cast<int>((gate_mu_size + kBlockSize - 1) / kBlockSize);
     if (two_layer_gate_mode_ == kSHGateMuScalarFull) {
-      const size_t gate_mu_size =
-        static_cast<size_t>(num_atoms) * static_cast<size_t>(radial_funcs_count_);
-      const int gate_mu_grid_size =
-        static_cast<int>((gate_mu_size + kBlockSize - 1) / kBlockSize);
       gpu_sh_gate_values_from_moments_full_mu_parallel<float><<<gate_mu_grid_size, kBlockSize>>>(
         num_atoms, model, two_layer_gate_moment_vals_float_.data(),
         two_layer_gate_values_float_.data());
@@ -9384,15 +9884,30 @@ void SUS2_SH::compute(
         two_layer_gate_values_float_.data());
     }
     GPU_CHECK_KERNEL
+    gpu_sh_gate_precompute_tanh<float><<<gate_mu_grid_size, kBlockSize>>>(
+      num_atoms, model, type.data(), two_layer_gate_values_float_.data(),
+      two_layer_gate_multipliers_float_.data(), two_layer_gate_derivs_float_.data());
+    GPU_CHECK_KERNEL
     profile_stop(sh_profile_product, stage_start);
 
     stage_start = profile_start();
     CHECK(gpuMemset(moment_vals_float_.data(), 0, moment_size * sizeof(float)));
     CHECK(gpuMemset(moment_grads_float_.data(), 0, moment_size * sizeof(float)));
-    CHECK(gpuMemset(
-      two_layer_gate_adjoints_float_.data(),
-      0,
-      static_cast<size_t>(num_atoms) * static_cast<size_t>(radial_funcs_count_) * sizeof(float)));
+    float* gate_body_adjoints_ptr =
+      two_layer_gate_mode_ == kSHGateMuBodyLinearCombo
+      ? two_layer_gate_body_adjoints_float_.data() : nullptr;
+    if (gate_body_adjoints_ptr != nullptr) {
+      CHECK(gpuMemset(
+        gate_body_adjoints_ptr,
+        0,
+        static_cast<size_t>(num_atoms) *
+          static_cast<size_t>(two_layer_gate_body_order_count_) * sizeof(float)));
+    } else {
+      CHECK(gpuMemset(
+        two_layer_gate_adjoints_float_.data(),
+        0,
+        static_cast<size_t>(num_atoms) * static_cast<size_t>(radial_funcs_count_) * sizeof(float)));
+    }
     CHECK(gpuMemset(virial_tmp_.data(), 0, virial_size * sizeof(float)));
     const bool launched_gate_main_basic_static =
       use_static_basic_layout_ &&
@@ -9401,7 +9916,7 @@ void SUS2_SH::compute(
         use_cached_neighbor_displacements_, model, type.data(), neighbor_count_.data(),
         neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(), neighbor_dz_.data(),
         position.data(), position.data() + num_atoms, position.data() + 2 * num_atoms,
-        two_layer_gate_values_float_.data(), moment_vals_float_.data());
+        two_layer_gate_multipliers_float_.data(), moment_vals_float_.data());
     if (launched_gate_main_basic_static) {
       GPU_CHECK_KERNEL
     } else if (alpha_basic_count_ <= 64) {
@@ -9409,21 +9924,21 @@ void SUS2_SH::compute(
         num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(),
         neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(),
         neighbor_dz_.data(), position.data(), position.data() + num_atoms,
-        position.data() + 2 * num_atoms, two_layer_gate_values_float_.data(),
+        position.data() + 2 * num_atoms, two_layer_gate_multipliers_float_.data(),
         moment_vals_float_.data());
     } else if (alpha_basic_count_ <= 128) {
       gpu_sh_compute_basic_gate_main<float, 128><<<grid_size, kBlockSize>>>(
         num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(),
         neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(),
         neighbor_dz_.data(), position.data(), position.data() + num_atoms,
-        position.data() + 2 * num_atoms, two_layer_gate_values_float_.data(),
+        position.data() + 2 * num_atoms, two_layer_gate_multipliers_float_.data(),
         moment_vals_float_.data());
     } else {
       gpu_sh_compute_basic_gate_main<float><<<grid_size, kBlockSize>>>(
         num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(),
         neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(),
         neighbor_dz_.data(), position.data(), position.data() + num_atoms,
-        position.data() + 2 * num_atoms, two_layer_gate_values_float_.data(),
+        position.data() + 2 * num_atoms, two_layer_gate_multipliers_float_.data(),
         moment_vals_float_.data());
     }
     GPU_CHECK_KERNEL
@@ -9535,6 +10050,8 @@ void SUS2_SH::compute(
     profile_stop(sh_profile_product, stage_start);
 
 	    stage_start = profile_start();
+    const bool gate_force_detail = profile_enabled_ && profile_product_detail_;
+    const Clock::time_point gate_main_force_start = stage_start;
     const bool launched_gate_main_force_static =
       use_static_force_layout_ &&
       launch_sh_compute_forces_gate_main_static<float, float>(
@@ -9542,9 +10059,9 @@ void SUS2_SH::compute(
         use_cached_neighbor_displacements_, model, type.data(), neighbor_count_.data(),
         neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(), neighbor_dz_.data(),
         position.data(), position.data() + num_atoms, position.data() + 2 * num_atoms,
-        two_layer_gate_values_float_.data(), moment_grads_float_.data(),
-        two_layer_gate_adjoints_float_.data(), force_tmp_.data(), force_self_tmp_ptr,
-        virial_tmp_.data());
+        two_layer_gate_multipliers_float_.data(), two_layer_gate_derivs_float_.data(),
+        moment_grads_float_.data(), two_layer_gate_adjoints_float_.data(),
+        gate_body_adjoints_ptr, force_tmp_.data(), force_self_tmp_ptr, virial_tmp_.data());
     if (launched_gate_main_force_static) {
       GPU_CHECK_KERNEL
     } else if (alpha_basic_count_ <= 48) {
@@ -9552,8 +10069,9 @@ void SUS2_SH::compute(
         num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(),
         neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(),
         neighbor_dz_.data(), position.data(), position.data() + num_atoms,
-        position.data() + 2 * num_atoms, two_layer_gate_values_float_.data(),
-        moment_grads_float_.data(), two_layer_gate_adjoints_float_.data(), force_tmp_.data(),
+        position.data() + 2 * num_atoms, two_layer_gate_multipliers_float_.data(),
+        two_layer_gate_derivs_float_.data(), moment_grads_float_.data(),
+        two_layer_gate_adjoints_float_.data(), gate_body_adjoints_ptr, force_tmp_.data(),
         force_self_tmp_ptr, virial_tmp_.data());
     } else if (alpha_basic_count_ <= kSHForceGradCache64) {
       gpu_sh_compute_forces_gate_main_cached_grads<float, float, kSHForceGradCache64>
@@ -9561,8 +10079,9 @@ void SUS2_SH::compute(
         num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(),
         neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(),
         neighbor_dz_.data(), position.data(), position.data() + num_atoms,
-        position.data() + 2 * num_atoms, two_layer_gate_values_float_.data(),
-        moment_grads_float_.data(), two_layer_gate_adjoints_float_.data(), force_tmp_.data(),
+        position.data() + 2 * num_atoms, two_layer_gate_multipliers_float_.data(),
+        two_layer_gate_derivs_float_.data(), moment_grads_float_.data(),
+        two_layer_gate_adjoints_float_.data(), gate_body_adjoints_ptr, force_tmp_.data(),
         force_self_tmp_ptr, virial_tmp_.data());
     } else if (alpha_basic_count_ <= kSHForceGradCache128) {
       gpu_sh_compute_forces_gate_main_cached_grads<float, float, kSHForceGradCache128>
@@ -9570,8 +10089,9 @@ void SUS2_SH::compute(
         num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(),
         neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(),
         neighbor_dz_.data(), position.data(), position.data() + num_atoms,
-        position.data() + 2 * num_atoms, two_layer_gate_values_float_.data(),
-        moment_grads_float_.data(), two_layer_gate_adjoints_float_.data(), force_tmp_.data(),
+        position.data() + 2 * num_atoms, two_layer_gate_multipliers_float_.data(),
+        two_layer_gate_derivs_float_.data(), moment_grads_float_.data(),
+        two_layer_gate_adjoints_float_.data(), gate_body_adjoints_ptr, force_tmp_.data(),
         force_self_tmp_ptr, virial_tmp_.data());
     } else {
       gpu_sh_compute_forces_gate_main_cached_grads<float, float, kSHForceGradCache256>
@@ -9579,20 +10099,54 @@ void SUS2_SH::compute(
         num_atoms, box, rc * rc, use_cached_neighbor_displacements_, model, type.data(),
         neighbor_count_.data(), neighbor_atom_.data(), neighbor_dx_.data(), neighbor_dy_.data(),
         neighbor_dz_.data(), position.data(), position.data() + num_atoms,
-        position.data() + 2 * num_atoms, two_layer_gate_values_float_.data(),
-        moment_grads_float_.data(), two_layer_gate_adjoints_float_.data(), force_tmp_.data(),
+        position.data() + 2 * num_atoms, two_layer_gate_multipliers_float_.data(),
+        two_layer_gate_derivs_float_.data(), moment_grads_float_.data(),
+        two_layer_gate_adjoints_float_.data(), gate_body_adjoints_ptr, force_tmp_.data(),
         force_self_tmp_ptr, virial_tmp_.data());
 	    }
-	    GPU_CHECK_KERNEL
+    GPU_CHECK_KERNEL
+    Clock::time_point gate_seed_back_start = stage_start;
+    if (gate_force_detail) {
+      profile_stop(sh_profile_gate_main_force, gate_main_force_start);
+      gate_seed_back_start = profile_start();
+    }
     CHECK(gpuMemset(moment_grads_float_.data(), 0, moment_size * sizeof(float)));
-    gpu_sh_seed_gate_moment_grads_from_mu_adjoints<float, float><<<grid_size, kBlockSize>>>(
-      num_atoms, model, two_layer_gate_adjoints_float_.data(), moment_grads_float_.data());
+    if (two_layer_gate_mode_ == kSHGateMuScalarFull) {
+      constexpr int kGateSeedAtomTile = 8;
+      constexpr int kGateSeedQTile = 16;
+      const dim3 gate_seed_grid(
+        static_cast<unsigned int>((num_atoms + kGateSeedAtomTile - 1) / kGateSeedAtomTile),
+        static_cast<unsigned int>(
+          (two_layer_gate_scalar_count_ + kGateSeedQTile - 1) / kGateSeedQTile));
+      gpu_sh_seed_gate_moment_grads_full_atom_q_tile<
+        float, float, kGateSeedAtomTile, kGateSeedQTile>
+        <<<gate_seed_grid, kGateSeedAtomTile * kGateSeedQTile>>>(
+          num_atoms, model, two_layer_gate_adjoints_float_.data(), moment_grads_float_.data());
+    } else {
+      gpu_sh_seed_gate_moment_grads_from_mu_adjoints<float, float><<<grid_size, kBlockSize>>>(
+        num_atoms, model, two_layer_gate_adjoints_float_.data(), gate_body_adjoints_ptr,
+        moment_grads_float_.data());
+    }
     GPU_CHECK_KERNEL
     for (int layer = sh_cg_layer_count_; layer >= 1; --layer) {
-      gpu_sh_tensor_product_back_rows<float, float><<<tensor_grid_size, kBlockSize>>>(
-        num_atoms, layer, model, two_layer_gate_moment_vals_float_.data(),
-        moment_grads_float_.data());
+      if (model.two_layer_gate_cg_back_layer_offsets != nullptr &&
+          model.two_layer_gate_cg_back_rows_int != nullptr) {
+        gpu_sh_tensor_product_back_rows_gate_compact<float, float>
+          <<<tensor_grid_size, kBlockSize>>>(
+          num_atoms, layer, model, two_layer_gate_moment_vals_float_.data(),
+          moment_grads_float_.data());
+      } else {
+        gpu_sh_tensor_product_back_rows_gate_needed<float, float>
+          <<<tensor_grid_size, kBlockSize>>>(
+          num_atoms, layer, model, two_layer_gate_moment_vals_float_.data(),
+          moment_grads_float_.data());
+      }
       GPU_CHECK_KERNEL
+    }
+    Clock::time_point gate_first_force_start = stage_start;
+    if (gate_force_detail) {
+      profile_stop(sh_profile_gate_seed_back, gate_seed_back_start);
+      gate_first_force_start = profile_start();
     }
     const bool launched_gate_first_force_static =
       use_static_force_layout_ &&
@@ -9643,6 +10197,9 @@ void SUS2_SH::compute(
         virial_tmp_.data());
     }
     GPU_CHECK_KERNEL
+    if (gate_force_detail) {
+      profile_stop(sh_profile_gate_first_force, gate_first_force_start);
+    }
     profile_stop(sh_profile_force, stage_start);
 
     if (zbl_enabled_) {
@@ -9678,6 +10235,17 @@ void SUS2_SH::compute(
           "SUS2-SH profile avg over %d steps: neighbor=%.3f ms, memset=%.3f ms, basic=%.3f ms, product=%.3f ms, force=%.3f ms, accumulate=%.3f ms, total=%.3f ms.\n",
           profile_steps_, neighbor_ms, memset_ms, basic_ms, product_ms, force_ms,
           accumulate_ms, total_ms);
+        if (profile_product_detail_) {
+          const double gate_main_force_ms = profile_ms_[sh_profile_gate_main_force] * inv;
+          const double gate_seed_back_ms = profile_ms_[sh_profile_gate_seed_back] * inv;
+          const double gate_first_force_ms = profile_ms_[sh_profile_gate_first_force] * inv;
+          printf(
+            "SUS2-SH gate force detail avg over %d steps: main=%.3f ms, seed_back=%.3f ms, first=%.3f ms.\n",
+            profile_steps_,
+            gate_main_force_ms,
+            gate_seed_back_ms,
+            gate_first_force_ms);
+        }
         profile_steps_ = 0;
         for (int i = 0; i < sh_profile_count; ++i) {
           profile_ms_[i] = 0.0;
